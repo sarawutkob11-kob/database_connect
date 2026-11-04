@@ -1,0 +1,12 @@
+{
+  "example profile": {
+    "db_type": "Oracle",
+    "db_user": "YOUR_USER",
+    "db_password": "YOUR_PASSWORD",
+    "db_host": "your-db-host",
+    "db_port": "1521",
+    "db_name": "your_service_name",
+    "sql_query": "SELECT * FROM Table WHERE Column1 IN ({ACCOUNT_LIST})"
+  },
+  "last_used_profile": "example profile"
+}

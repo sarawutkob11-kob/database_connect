@@ -1,0 +1,9 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportUnusedVariable": "none"
+    },
+    "sourcery.ruleType.refactorings": false,
+    "sourcery.ruleType.suggestions": false,
+    "sourcery.ruleType.comments": false
+}

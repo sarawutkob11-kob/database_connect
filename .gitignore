@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+db_profiles.json
+db_profiles_backup.json
+saved_jobs.json
+
+*.xlsx
+*.log
