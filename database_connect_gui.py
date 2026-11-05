@@ -1,4 +1,5 @@
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 from sqlalchemy import create_engine, inspect, text
 import pandas as pd
@@ -74,29 +75,475 @@ def unprotect_password(stored):
         return ""
 
 
+# ======================================================================
+# UI KIT — Modern Enterprise theme (presentation only, no app logic)
+# ======================================================================
+UI = {
+    'bg': '#F8FAFC', 'navy': '#1E293B',
+    'card': '#FFFFFF', 'border': '#E2E8F0', 'border_strong': '#CBD5E1',
+    'text': '#0F172A', 'muted': '#64748B', 'subtle': '#94A3B8',
+    'surface': '#F8FAFC', 'hover': '#F1F5F9',
+    'primary': '#2563EB', 'primary_hover': '#1D4ED8', 'primary_disabled': '#BFDBFE',
+    'primary_soft': '#EFF6FF',
+    'success': '#16A34A', 'success_hover': '#15803D', 'success_soft': '#F0FDF4',
+    'danger': '#DC2626', 'danger_soft': '#FEF2F2', 'danger_hover': '#FEE2E2',
+    'ok': '#16A34A', 'warn': '#D97706', 'off': '#94A3B8',
+}
+UI_FONT = ('Segoe UI', 10)
+UI_FONT_SM = ('Segoe UI', 9)
+UI_FONT_SEMI = ('Segoe UI Semibold', 10)
+UI_FONT_LABEL = ('Segoe UI Semibold', 9)
+UI_FONT_TITLE = ('Segoe UI Semibold', 13)
+UI_FONT_MONO = ('Consolas', 10)
+
+
+def ui_bind_hover(btn, normal_bg, hover_bg):
+    """Visual hover feedback only — ignored while the button is disabled."""
+    def _enter(_e):
+        if str(btn['state']) != 'disabled':
+            btn.config(bg=hover_bg)
+
+    def _leave(_e):
+        if str(btn['state']) != 'disabled':
+            btn.config(bg=normal_bg)
+
+    btn.bind('<Enter>', _enter, add='+')
+    btn.bind('<Leave>', _leave, add='+')
+
+
+def ui_button_style(kind='secondary', size='md'):
+    """tk.Button option dict for the given visual kind."""
+    pad = {'sm': (10, 3), 'md': (14, 6), 'lg': (22, 8)}[size]
+    font = UI_FONT_SM if size == 'sm' else UI_FONT
+    base = dict(relief='flat', bd=0, highlightthickness=0, cursor='hand2',
+                padx=pad[0], pady=pad[1], font=font)
+    if kind == 'primary':
+        base.update(bg=UI['primary'], fg='#FFFFFF', activebackground=UI['primary_hover'],
+                    activeforeground='#FFFFFF', disabledforeground='#EFF6FF',
+                    font=UI_FONT_LABEL if size == 'sm' else UI_FONT_SEMI)
+    elif kind == 'success':
+        base.update(bg=UI['success'], fg='#FFFFFF', activebackground=UI['success_hover'],
+                    activeforeground='#FFFFFF', disabledforeground='#DCFCE7',
+                    font=UI_FONT_LABEL if size == 'sm' else UI_FONT_SEMI)
+    elif kind == 'danger':
+        base.update(bg=UI['danger_soft'], fg=UI['danger'], activebackground=UI['danger_hover'],
+                    activeforeground=UI['danger'], disabledforeground=UI['subtle'])
+    else:  # secondary
+        base.update(bg=UI['card'], fg=UI['text'], activebackground=UI['hover'],
+                    activeforeground=UI['text'], disabledforeground=UI['subtle'])
+    return base
+
+
+_UI_HOVER = {
+    'primary': ('primary', 'primary_hover'),
+    'success': ('success', 'success_hover'),
+    'danger': ('danger_soft', 'danger_hover'),
+    'secondary': ('card', 'hover'),
+}
+
+
+def ui_button(parent, text, command, kind='secondary', size='md', **options):
+    """Create a themed button. Returns (outer, button): place `outer`, keep `button`.
+
+    Secondary buttons get a 1px light border wrapper; solid buttons are their own outer.
+    """
+    style = ui_button_style(kind, size)
+    style.update(options)
+    if kind == 'secondary':
+        outer = tk.Frame(parent, bg=UI['border_strong'], bd=0, highlightthickness=0)
+        btn = tk.Button(outer, text=text, command=command, **style)
+        btn.pack(padx=1, pady=1)
+    else:
+        btn = tk.Button(parent, text=text, command=command, **style)
+        outer = btn
+    normal, hover = _UI_HOVER[kind]
+    ui_bind_hover(btn, UI[normal], UI[hover])
+    return outer, btn
+
+
+def ui_card(parent):
+    """White card with a subtle 1px border."""
+    return tk.Frame(parent, bg=UI['card'], bd=0, highlightthickness=1,
+                    highlightbackground=UI['border'], highlightcolor=UI['border'])
+
+
+def ui_card_header(card, title, subtitle=None):
+    """Card title row (packed). Returns the header frame; add right-side widgets to it."""
+    header = tk.Frame(card, bg=UI['card'])
+    header.pack(fill='x', padx=16, pady=(12, 10))
+    tk.Label(header, text=title, bg=UI['card'], fg=UI['navy'],
+             font=UI_FONT_TITLE).pack(side='left')
+    if subtitle:
+        tk.Label(header, text="  " + subtitle, bg=UI['card'], fg=UI['muted'],
+                 font=UI_FONT_SM).pack(side='left', pady=(3, 0))
+    tk.Frame(card, bg=UI['border'], height=1).pack(fill='x')
+    return header
+
+
+def ui_field_label(parent, text):
+    return tk.Label(parent, text=text, bg=UI['card'], fg=UI['muted'], font=UI_FONT_LABEL)
+
+
+class DialogTheme:
+    """Applies the Modern Enterprise theme to every dialog/popup (tk.Toplevel).
+
+    Presentation only: it remaps legacy colors/fonts/reliefs of tk widgets
+    after they are created. It never changes text, commands, variables,
+    bindings, layout managers or widget state. The main window is untouched.
+    """
+
+    # Legacy flat-UI button colors → button kind
+    BUTTON_KIND = {
+        '#27ae60': 'success', '#2ecc71': 'success', '#229954': 'success',
+        '#16a085': 'success', '#1abc9c': 'success',
+        '#3498db': 'primary', '#2980b9': 'primary', '#f39c12': 'primary',
+        '#e67e22': 'primary',
+        '#e74c3c': 'danger', '#c0392b': 'danger',
+        '#9b59b6': 'secondary', '#8e44ad': 'secondary', '#95a5a6': 'secondary',
+        '#7f8c8d': 'secondary', '#bdc3c7': 'secondary', '#ecf0f1': 'secondary',
+        '#f0f0f0': 'secondary', 'systembuttonface': 'secondary', '#d9d9d9': 'secondary',
+        '#ffffff': 'secondary', 'white': 'secondary',
+    }
+    # Legacy surface colors → new surface colors
+    BG = {
+        '#f0f0f0': UI['card'], 'systembuttonface': UI['card'], '#d9d9d9': UI['card'],
+        '#ecf0f1': UI['surface'], '#f8f9fa': UI['surface'], '#f5f5f5': UI['surface'],
+        '#e8f4f8': UI['primary_soft'], '#fff3cd': '#FFFBEB',
+        '#2c3e50': UI['navy'], '#34495e': UI['navy'],
+        '#27ae60': UI['success'], '#3498db': UI['primary'], '#e74c3c': UI['danger'],
+    }
+    # Legacy text colors → new text colors
+    FG = {
+        '#2c3e50': UI['text'], '#34495e': UI['text'], 'black': UI['text'],
+        '#000000': UI['text'], 'systembuttontext': UI['text'],
+        '#7f8c8d': UI['muted'], '#95a5a6': UI['muted'], 'gray': UI['muted'],
+        '#27ae60': UI['success'], '#2ecc71': UI['success'],
+        '#e74c3c': UI['danger'], '#c0392b': UI['danger'],
+        '#3498db': UI['primary'], '#2980b9': UI['primary'],
+        '#f39c12': UI['warn'], '#e67e22': UI['warn'],
+        'blue': UI['primary'], '#0000ff': UI['primary'], 'green': UI['success'],
+        '#008000': UI['success'], 'red': UI['danger'], '#ff0000': UI['danger'],
+        'darkgreen': UI['success'], 'darkred': UI['danger'], 'grey': UI['muted'],
+    }
+    SANS = {'arial', 'helvetica', 'ms sans serif', 'tahoma', 'verdana', 'segoe ui'}
+    MONO = {'courier', 'courier new'}
+    ACCENT_TTK_TEXT = {'save', 'confirm', 'insert values', 'apply', 'ok'}
+
+    def __init__(self, root, interval_ms=500):
+        self.root = root
+        self.interval_ms = interval_ms
+        self._font_cache = {}
+        # Theme a dialog as soon as it is shown; the periodic tick catches
+        # widgets that dialogs add later (e.g. refreshed lists, result rows).
+        root.bind_class('Toplevel', '<Map>', self._on_map, add='+')
+        root.after(interval_ms, self._tick)
+
+    def _on_map(self, event):
+        widget = event.widget
+        if isinstance(widget, tk.Toplevel):
+            try:
+                self._walk(widget)
+            except Exception:
+                pass
+
+    # -- scheduling --------------------------------------------------------
+    def _tick(self):
+        try:
+            for top in self._toplevels(self.root):
+                if top.winfo_ismapped():
+                    self._walk(top)
+        except Exception:
+            pass  # theming must never interfere with the application
+        try:
+            self.root.after(self.interval_ms, self._tick)
+        except tk.TclError:
+            pass
+
+    def _toplevels(self, widget):
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                yield child
+            yield from self._toplevels(child)
+
+    def _walk(self, widget):
+        try:
+            self._theme(widget)
+        except tk.TclError:
+            return
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                continue  # handled as its own top-level
+            self._walk(child)
+
+    # -- helpers -------------------------------------------------------------
+    @staticmethod
+    def _get(widget, option):
+        try:
+            return str(widget.cget(option)).lower()
+        except tk.TclError:
+            return None
+
+    def _font(self, widget):
+        try:
+            spec = widget.cget('font')
+        except tk.TclError:
+            return
+        key = str(spec)
+        if key not in self._font_cache:
+            new = None
+            try:
+                actual = tkfont.Font(root=self.root, font=spec).actual()
+                family = actual['family'].lower()
+                size = actual['size']
+                bold = actual['weight'] == 'bold'
+                if family in self.SANS:
+                    new = ('Segoe UI Semibold' if bold else 'Segoe UI', size)
+                    if family == 'segoe ui' and not bold:
+                        new = None  # already themed
+                elif family in self.MONO:
+                    new = ('Consolas', size, 'bold' if bold else 'normal')
+            except Exception:
+                new = None
+            self._font_cache[key] = new
+        if self._font_cache[key]:
+            widget.config(font=self._font_cache[key])
+
+    def _remap(self, widget, option, table):
+        value = self._get(widget, option)
+        if value in table:
+            widget.config(**{option: table[value]})
+
+    # -- per-class theming -------------------------------------------------
+    def _theme(self, w):
+        cls = w.winfo_class()
+        first_time = not getattr(w, '_ui_themed', False)
+
+        if cls == 'Button':
+            bg = self._get(w, 'bg')
+            kind = self.BUTTON_KIND.get(bg)
+            # First pass, or the logic re-applied a legacy color after theming
+            if kind and (first_time or bg != getattr(w, '_ui_bg', None)) and                     bg != UI['hover'].lower():
+                self._style_button(w, kind)
+                w._ui_bg = self._get(w, 'bg')
+            if first_time:
+                self._font(w)
+        elif not first_time:
+            return  # non-button widgets only need one pass
+        elif cls == 'Toplevel':
+            self._remap(w, 'bg', self.BG)
+        elif cls in ('Frame', 'Canvas'):
+            self._remap(w, 'bg', self.BG)
+            if cls == 'Frame':
+                self._soft_border(w)
+        elif cls == 'Label' or cls == 'Message':
+            self._remap(w, 'bg', self.BG)
+            self._remap(w, 'fg', self.FG)
+            self._font(w)
+        elif cls == 'Labelframe':
+            self._remap(w, 'bg', self.BG)
+            self._remap(w, 'fg', self.FG)
+            w.config(relief='flat', bd=0, highlightthickness=1,
+                     highlightbackground=UI['border'], highlightcolor=UI['border'])
+            if self._get(w, 'fg') in (None, UI['text'].lower()):
+                w.config(fg=UI['navy'])
+            self._font(w)
+        elif cls in ('Checkbutton', 'Radiobutton'):
+            self._remap(w, 'bg', self.BG)
+            self._remap(w, 'fg', self.FG)
+            w.config(activebackground=w.cget('bg'), highlightthickness=0, bd=0,
+                     selectcolor='#FFFFFF', cursor='hand2')
+            self._font(w)
+        elif cls in ('Entry', 'Spinbox'):
+            w.config(relief='flat', bd=0, highlightthickness=1,
+                     highlightbackground=UI['border_strong'], highlightcolor=UI['primary'],
+                     selectbackground='#BFDBFE', selectforeground=UI['text'])
+            self._remap(w, 'bg', self.BG)
+            self._font(w)
+        elif cls in ('Text', 'Listbox'):
+            w.config(relief='flat', bd=0, highlightthickness=1,
+                     highlightbackground=UI['border'], highlightcolor=UI['primary'],
+                     selectbackground='#DBEAFE', selectforeground=UI['text'])
+            if cls == 'Listbox':
+                w.config(activestyle='none')
+            self._remap(w, 'bg', self.BG)
+            self._remap(w, 'fg', self.FG)
+            self._font(w)
+        elif cls == 'TLabel':
+            self._font(w)
+        elif cls == 'TButton':
+            text = str(w.cget('text')).strip().lower()
+            if text in self.ACCENT_TTK_TEXT and not str(w.cget('style')):
+                w.config(style='Accent.TButton')
+        w._ui_themed = True
+
+    def _soft_border(self, w):
+        """Replace a dark 3D/solid relief border with a 1px light border."""
+        try:
+            relief = str(w.cget('relief'))
+            bd = int(float(w.cget('bd')))
+        except (tk.TclError, ValueError):
+            return
+        if bd > 0 and relief in ('solid', 'groove', 'ridge', 'raised', 'sunken'):
+            w.config(relief='flat', bd=0, highlightthickness=1,
+                     highlightbackground=UI['border'], highlightcolor=UI['border'])
+
+    def _style_button(self, w, kind):
+        style = ui_button_style(kind)
+        options = {k: style[k] for k in ('bg', 'fg', 'activebackground', 'activeforeground',
+                                          'disabledforeground')}
+        options.update(relief='flat', bd=0, cursor='hand2', overrelief='flat')
+        if kind == 'secondary':
+            options.update(bg=UI['hover'], activebackground=UI['border'])
+        options.update(highlightthickness=0)
+        try:  # give cramped legacy buttons comfortable padding
+            if int(w.cget('padx')) < 10:
+                options['padx'] = 12
+            if int(w.cget('pady')) < 4:
+                options['pady'] = 4
+        except (tk.TclError, ValueError):
+            pass
+        w.config(**options)
+        if not getattr(w, '_ui_hover', False):
+            def _enter(_e, b=w):
+                if str(b['state']) != 'disabled':
+                    b._ui_rest_bg = b.cget('bg')
+                    hover = {UI['primary']: UI['primary_hover'], UI['success']: UI['success_hover'],
+                             UI['danger_soft']: UI['danger_hover'], UI['hover']: UI['border']}
+                    b.config(bg=hover.get(b._ui_rest_bg, b._ui_rest_bg))
+
+            def _leave(_e, b=w):
+                if str(b['state']) != 'disabled' and getattr(b, '_ui_rest_bg', None):
+                    b.config(bg=b._ui_rest_bg)
+
+            w.bind('<Enter>', _enter, add='+')
+            w.bind('<Leave>', _leave, add='+')
+            w._ui_hover = True
+
+
 class DatabaseConnectorGUI:
 
     def __init__(self, root):
         self.root = root
         self.root.title("Database Connector")
         self.root.geometry("1200x900")
-        self.root.configure(bg='#f0f0f0')
-        
+        self.root.configure(bg=UI['bg'])
+
         # Enhanced styling
         self.style = ttk.Style()
         self.style.theme_use('clam')
-        self.style.configure('TFrame', background='#f0f0f0')
-        self.style.configure('TLabelframe', background='#ffffff', relief='flat')
-        self.style.configure('TLabelframe.Label', background='#ffffff', foreground='#2c3e50',
-                           font=('Arial', 11, 'bold'))
-        self.style.configure('TLabel', background='#ffffff', foreground='#2c3e50', font=('Arial', 10))
-        self.style.configure('TButton', font=('Arial', 10, 'bold'), relief='flat',
-                           background='#3498db', foreground='white')
+        # Base ttk styles — used by dialogs/popups (white surfaces)
+        self.style.configure('TFrame', background=UI['card'])
+        self.style.configure('App.TFrame', background=UI['bg'])  # main window canvas
+        self.style.configure('TLabelframe', background=UI['card'], relief='solid',
+                             bordercolor=UI['border'], lightcolor=UI['card'], darkcolor=UI['card'])
+        self.style.configure('TLabelframe.Label', background=UI['card'], foreground=UI['navy'],
+                             font=UI_FONT_SEMI)
+        self.style.configure('TLabel', background=UI['card'], foreground=UI['text'], font=UI_FONT)
+        # Secondary (default) and Accent (primary) ttk buttons
+        self.style.configure('TButton', font=UI_FONT, relief='flat', padding=(10, 4),
+                             background=UI['hover'], foreground=UI['text'],
+                             bordercolor=UI['hover'], lightcolor=UI['hover'],
+                             darkcolor=UI['hover'], focuscolor=UI['hover'])
         self.style.map('TButton',
-                      background=[('active', '#2980b9'), ('disabled', "#3f5462")])
-        self.style.configure('TCombobox', fieldbackground='white', selectbackground='#3498db')
-        self.style.configure('TEntry', fieldbackground='white', selectbackground='#3498db')
-        
+                       background=[('disabled', UI['surface']), ('active', UI['border'])],
+                       foreground=[('disabled', UI['subtle'])],
+                       bordercolor=[('active', UI['border'])],
+                       lightcolor=[('active', UI['border'])],
+                       darkcolor=[('active', UI['border'])])
+        self.style.configure('Accent.TButton', font=UI_FONT_SEMI, padding=(12, 4),
+                             background=UI['primary'],
+                             foreground='#FFFFFF', bordercolor=UI['primary'],
+                             lightcolor=UI['primary'], darkcolor=UI['primary'],
+                             focuscolor=UI['primary'])
+        self.style.map('Accent.TButton',
+                       background=[('disabled', UI['primary_disabled']), ('active', UI['primary_hover'])],
+                       foreground=[('disabled', '#EFF6FF')],
+                       bordercolor=[('active', UI['primary_hover'])],
+                       lightcolor=[('active', UI['primary_hover'])],
+                       darkcolor=[('active', UI['primary_hover'])])
+        self.style.configure('TCombobox', fieldbackground='#FFFFFF', background='#FFFFFF',
+                             foreground=UI['text'], bordercolor=UI['border_strong'],
+                             lightcolor=UI['border_strong'], darkcolor=UI['border_strong'],
+                             arrowcolor=UI['muted'], padding=(6, 4),
+                             selectbackground='#BFDBFE', selectforeground=UI['text'])
+        self.style.map('TCombobox', fieldbackground=[('readonly', '#FFFFFF')],
+                       selectbackground=[('readonly', '#FFFFFF')],
+                       selectforeground=[('readonly', UI['text'])],
+                       bordercolor=[('focus', UI['primary'])])
+        self.style.configure('TEntry', fieldbackground='#FFFFFF', foreground=UI['text'],
+                             bordercolor=UI['border_strong'], lightcolor=UI['border_strong'],
+                             darkcolor=UI['border_strong'], padding=(6, 4),
+                             selectbackground='#BFDBFE', selectforeground=UI['text'])
+        self.style.map('TEntry', bordercolor=[('focus', UI['primary'])],
+                       lightcolor=[('focus', UI['primary'])])
+        self.style.configure('TCheckbutton', background=UI['card'], foreground=UI['text'], font=UI_FONT)
+        self.style.map('TCheckbutton', background=[('active', UI['card'])])
+        self.style.configure('TRadiobutton', background=UI['card'], foreground=UI['text'], font=UI_FONT)
+        self.style.map('TRadiobutton', background=[('active', UI['card'])])
+        self.style.configure('Treeview', font=UI_FONT_SM, rowheight=24, background='#FFFFFF',
+                             fieldbackground='#FFFFFF', foreground=UI['text'],
+                             bordercolor=UI['border'], borderwidth=0)
+        self.style.map('Treeview', background=[('selected', '#DBEAFE')],
+                       foreground=[('selected', UI['text'])])
+        self.style.configure('Treeview.Heading', font=UI_FONT_LABEL, background=UI['surface'],
+                             foreground=UI['muted'], bordercolor=UI['border'], relief='flat',
+                             padding=(6, 4))
+        self.style.map('Treeview.Heading', background=[('active', UI['hover'])])
+        self.style.configure('TNotebook', background=UI['card'], borderwidth=0)
+        self.style.configure('TNotebook.Tab', font=UI_FONT, padding=(12, 5),
+                             background=UI['surface'], foreground=UI['muted'])
+        self.style.map('TNotebook.Tab', background=[('selected', UI['card'])],
+                       foreground=[('selected', UI['primary'])])
+        self.style.configure('Horizontal.TProgressbar', background=UI['primary'],
+                             troughcolor=UI['hover'], bordercolor=UI['hover'],
+                             lightcolor=UI['primary'], darkcolor=UI['primary'])
+        self.style.configure('TScrollbar', background=UI['hover'], troughcolor=UI['card'],
+                             bordercolor=UI['card'], arrowcolor=UI['muted'],
+                             lightcolor=UI['hover'], darkcolor=UI['hover'])
+        self.style.map('TScrollbar', background=[('active', UI['border_strong'])])
+
+        # Modern Enterprise theme styles (main window only)
+        self.style.configure('Fluent.TEntry', fieldbackground='#FFFFFF', foreground=UI['text'],
+                             bordercolor=UI['border_strong'], lightcolor=UI['border_strong'],
+                             darkcolor=UI['border_strong'], padding=(8, 5),
+                             selectbackground='#BFDBFE', selectforeground=UI['text'])
+        self.style.map('Fluent.TEntry',
+                       bordercolor=[('focus', UI['primary'])],
+                       lightcolor=[('focus', UI['primary'])],
+                       darkcolor=[('focus', UI['primary'])])
+        self.style.configure('Fluent.TCombobox', fieldbackground='#FFFFFF', background='#FFFFFF',
+                             foreground=UI['text'], bordercolor=UI['border_strong'],
+                             lightcolor=UI['border_strong'], darkcolor=UI['border_strong'],
+                             arrowcolor=UI['muted'], padding=(8, 5),
+                             selectbackground='#FFFFFF', selectforeground=UI['text'])
+        self.style.map('Fluent.TCombobox',
+                       fieldbackground=[('readonly', '#FFFFFF')],
+                       selectbackground=[('readonly', '#FFFFFF')],
+                       selectforeground=[('readonly', UI['text'])],
+                       bordercolor=[('focus', UI['primary'])],
+                       lightcolor=[('focus', UI['primary'])],
+                       darkcolor=[('focus', UI['primary'])])
+        self.style.configure('Fluent.TNotebook', background=UI['card'], borderwidth=0,
+                             tabmargins=(16, 8, 16, 0))
+        self.style.configure('Fluent.TNotebook.Tab', font=UI_FONT, padding=(14, 6),
+                             background=UI['surface'], foreground=UI['muted'],
+                             bordercolor=UI['border'], lightcolor=UI['surface'])
+        self.style.map('Fluent.TNotebook.Tab',
+                       background=[('selected', UI['card'])],
+                       foreground=[('selected', UI['primary'])],
+                       lightcolor=[('selected', UI['card'])],
+                       expand=[('selected', (0, 0, 0, 0))])
+        self.style.configure('Fluent.Treeview', font=UI_FONT_SM, rowheight=24,
+                             background='#FFFFFF', fieldbackground='#FFFFFF',
+                             foreground=UI['text'], bordercolor=UI['border'], borderwidth=0)
+        self.style.map('Fluent.Treeview',
+                       background=[('selected', '#DBEAFE')],
+                       foreground=[('selected', UI['text'])])
+        self.style.configure('Fluent.Treeview.Heading', font=UI_FONT_LABEL,
+                             background=UI['surface'], foreground=UI['muted'],
+                             bordercolor=UI['border'], relief='flat', padding=(6, 4))
+        self.style.map('Fluent.Treeview.Heading', background=[('active', UI['hover'])])
+
         self.engine = None
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_profiles.json")
         self.jobs_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_jobs.json")
@@ -120,6 +567,7 @@ class DatabaseConnectorGUI:
         self.sql_template = None
         self._excel_parameterized_sql = None
         self._excel_parameter_values = {}
+        self._checked_job_ids = set()  # id() of jobs ticked in Saved Jobs list
 
         self.load_table_mappings()
         
@@ -127,7 +575,7 @@ class DatabaseConnectorGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         # Create canvas with scrollbar for main window
-        self.canvas = tk.Canvas(root, bg='#f0f0f0', highlightthickness=0)
+        self.canvas = tk.Canvas(root, bg=UI['bg'], highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # Add vertical scrollbar
@@ -140,7 +588,7 @@ class DatabaseConnectorGUI:
         root.rowconfigure(0, weight=1)
         
         # Create main container inside canvas
-        main_frame = ttk.Frame(self.canvas, padding="10")
+        main_frame = ttk.Frame(self.canvas, padding=(16, 14), style='App.TFrame')
         self.canvas_window = self.canvas.create_window((0, 0), window=main_frame, anchor=tk.NW)
         
         # Configure main_frame
@@ -165,90 +613,104 @@ class DatabaseConnectorGUI:
         self._main_mousewheel = on_mousewheel
         self.canvas.bind_all("<MouseWheel>", on_mousewheel)
         
-        # Connection Settings Section
-        settings_frame = ttk.LabelFrame(main_frame, text="🔌 Connection Settings", padding="15")
-        settings_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        settings_frame.columnconfigure(1, weight=1)
-                
-        # Profile Selection Section
-        profile_frame = ttk.Frame(settings_frame)
-        profile_frame.grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky=(tk.W, tk.E))
-        
-        ttk.Label(profile_frame, text="📁 Profile:", font=('Arial', 10, 'bold')).pack(side=tk.LEFT, padx=(0, 5))
-        self.profile_combo = ttk.Combobox(profile_frame, width=25, state="readonly", font=('Arial', 10))
-        self.profile_combo.pack(side=tk.LEFT, padx=5)
+        # ==================================================================
+        # Section 1 — Connection Settings (card)
+        # [Header] / [Profile bar + actions] / [2-column form] / [Connect + badge]
+        # ==================================================================
+        settings_frame = ui_card(main_frame)
+        settings_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 14))
+        ui_card_header(settings_frame, "Connection Settings", "Profile & database credentials")
+
+        # Profile bar
+        profile_frame = tk.Frame(settings_frame, bg=UI['card'])
+        profile_frame.pack(fill='x', padx=16, pady=(12, 4))
+
+        ui_field_label(profile_frame, "PROFILE").pack(side=tk.LEFT, padx=(0, 8))
+        self.profile_combo = ttk.Combobox(profile_frame, width=28, state="readonly",
+                                          font=UI_FONT, style='Fluent.TCombobox')
+        self.profile_combo.pack(side=tk.LEFT, padx=(0, 10))
         self.update_profile_list()
         self.profile_combo.bind('<<ComboboxSelected>>', self.on_profile_selected)
-    
-        self.delete_btn = tk.Button(profile_frame, text="🗑️ Delete", command=self.delete_profile,
-                                   bg='#e74c3c', fg='white', font=('Arial', 9, 'bold'),
-                                   relief='flat', padx=15, pady=5, cursor='hand2')
-        self.delete_btn.pack(side=tk.LEFT, padx=5)
 
-        tk.Button(profile_frame, text="💾 Save", command=self.save_profile_dialog,
-                 bg='#27ae60', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2').pack(side=tk.LEFT, padx=5)
+        profile_save_outer, _ = ui_button(profile_frame, "💾 Save", self.save_profile_dialog,
+                                          kind='primary', size='sm')
+        profile_save_outer.pack(side=tk.LEFT, padx=(0, 6))
 
-        tk.Button(profile_frame, text="📁 Location", command=self.show_config_file_location,
-                bg='#95a5a6', fg='white', font=('Arial', 9, 'bold'),
-                relief='flat', padx=15, pady=5, cursor='hand2').pack(side=tk.LEFT, padx=5)
-        
-        # NEW: Import/Export buttons
-        tk.Button(profile_frame, text="📥 Import", command=self.import_profiles_dialog,
-                 bg='#3498db', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2').pack(side=tk.LEFT, padx=5)
-        
-        tk.Button(profile_frame, text="📤 Export", command=self.export_profiles_dialog,
-                 bg='#9b59b6', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2').pack(side=tk.LEFT, padx=5)
-        
+        _delete_outer, self.delete_btn = ui_button(profile_frame, "🗑️ Delete", self.delete_profile,
+                                                   kind='danger', size='sm')
+        _delete_outer.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Frame(profile_frame, bg=UI['border'], width=1, height=22).pack(side=tk.LEFT, padx=8)
+
+        for _text, _cmd in (("📁 Location", self.show_config_file_location),
+                            ("📥 Import", self.import_profiles_dialog),
+                            ("📤 Export", self.export_profiles_dialog)):
+            _outer, _ = ui_button(profile_frame, _text, _cmd, kind='secondary', size='sm')
+            _outer.pack(side=tk.LEFT, padx=(0, 6))
+
+        # 2-column credentials grid
+        form = tk.Frame(settings_frame, bg=UI['card'])
+        form.pack(fill='x', padx=16, pady=(8, 4))
+        form.columnconfigure(0, weight=1, uniform='conn')
+        form.columnconfigure(1, weight=1, uniform='conn')
+
+        def _field(row, col, label):
+            cell = tk.Frame(form, bg=UI['card'])
+            cell.grid(row=row, column=col, sticky='ew',
+                      padx=(0, 12) if col == 0 else (12, 0), pady=(0, 10))
+            cell.columnconfigure(0, weight=1)
+            ui_field_label(cell, label).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 4))
+            return cell
+
         # Database Type
-        ttk.Label(settings_frame, text="📦 Database Type:", font=('Arial', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.db_type = ttk.Combobox(settings_frame, width=38, state="readonly", font=('Arial', 10))
-        self.db_type.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        _cell = _field(0, 0, "DATABASE TYPE")
+        self.db_type = ttk.Combobox(_cell, width=38, state="readonly", font=UI_FONT,
+                                    style='Fluent.TCombobox')
+        self.db_type.grid(row=1, column=0, sticky=(tk.W, tk.E))
         self.db_type['values'] = ('PostgreSQL', 'MySQL', 'Microsoft SQL Server', 'Oracle')
         self.db_type.current(0)
         self.db_type.bind('<<ComboboxSelected>>', self.on_db_type_change)
-        
-        # Database User
-        ttk.Label(settings_frame, text="👤 User:", font=('Arial', 10, 'bold')).grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.db_user = ttk.Entry(settings_frame, width=40, font=('Arial', 10))
-        self.db_user.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-        self.db_user.insert(0, "test")
-        
-        # Database Password
-        ttk.Label(settings_frame, text="🔒 Password:", font=('Arial', 10, 'bold')).grid(row=3, column=0, sticky=tk.W, pady=5)
-        password_frame = ttk.Frame(settings_frame)
-        password_frame.grid(row=3, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
-        password_frame.columnconfigure(0, weight=1)
-        
-        self.db_password = ttk.Entry(password_frame, width=35, show="*", font=('Arial', 10))
-        self.db_password.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        self.db_password.insert(0, "test")
-        
-        self.password_visible = False
-        self.toggle_password_btn = tk.Button(password_frame, text="👁️", width=3,
-                                            command=self.toggle_password_visibility,
-                                            bg='#ecf0f1', fg='#2c3e50', font=('Arial', 12, 'bold'),
-                                            relief='raised', cursor='hand2', bd=2)
-        self.toggle_password_btn.grid(row=0, column=1, padx=(5, 0))
-        
+
         # Database Host
-        ttk.Label(settings_frame, text="🌐 Host:", font=('Arial', 10, 'bold')).grid(row=4, column=0, sticky=tk.W, pady=5)
-        self.db_host = ttk.Entry(settings_frame, width=40, font=('Arial', 10))
-        self.db_host.grid(row=4, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        _cell = _field(0, 1, "HOST")
+        self.db_host = ttk.Entry(_cell, width=40, font=UI_FONT, style='Fluent.TEntry')
+        self.db_host.grid(row=1, column=0, sticky=(tk.W, tk.E))
         self.db_host.insert(0, "test.com")
-        
+
+        # Database User
+        _cell = _field(1, 0, "USER")
+        self.db_user = ttk.Entry(_cell, width=40, font=UI_FONT, style='Fluent.TEntry')
+        self.db_user.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        self.db_user.insert(0, "test")
+
         # Database Port
-        ttk.Label(settings_frame, text="🚪 Port:", font=('Arial', 10, 'bold')).grid(row=5, column=0, sticky=tk.W, pady=5)
-        self.db_port = ttk.Entry(settings_frame, width=40, font=('Arial', 10))
-        self.db_port.grid(row=5, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        _cell = _field(1, 1, "PORT")
+        self.db_port = ttk.Entry(_cell, width=40, font=UI_FONT, style='Fluent.TEntry')
+        self.db_port.grid(row=1, column=0, sticky=(tk.W, tk.E))
         self.db_port.insert(0, "5432")
-        
+
+        # Database Password (with visibility toggle)
+        password_frame = _field(2, 0, "PASSWORD")
+        self.db_password = ttk.Entry(password_frame, width=35, show="*", font=UI_FONT,
+                                     style='Fluent.TEntry')
+        self.db_password.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        self.db_password.insert(0, "test")
+
+        self.password_visible = False
+        _toggle_outer = tk.Frame(password_frame, bg=UI['border_strong'])
+        _toggle_outer.grid(row=1, column=1, padx=(6, 0), sticky='ns')
+        self.toggle_password_btn = tk.Button(_toggle_outer, text="👁️", width=3,
+                                            command=self.toggle_password_visibility,
+                                            bg=UI['card'], fg=UI['text'], font=('Segoe UI', 10),
+                                            activebackground=UI['hover'],
+                                            relief='flat', cursor='hand2', bd=0,
+                                            highlightthickness=0)
+        self.toggle_password_btn.pack(fill='both', expand=True, padx=1, pady=1)
+
         # Database Name
-        ttk.Label(settings_frame, text="📊 Database:", font=('Arial', 10, 'bold')).grid(row=6, column=0, sticky=tk.W, pady=5)
-        self.db_name = ttk.Entry(settings_frame, width=40, font=('Arial', 10))
-        self.db_name.grid(row=6, column=1, sticky=(tk.W, tk.E), padx=5, pady=5)
+        _cell = _field(2, 1, "DATABASE (OPTIONAL)")
+        self.db_name = ttk.Entry(_cell, width=40, font=UI_FONT, style='Fluent.TEntry')
+        self.db_name.grid(row=1, column=0, sticky=(tk.W, tk.E))
         self.db_name.insert(0, "test")
 
         def _entry_ctrl_key(e):
@@ -288,36 +750,167 @@ class DatabaseConnectorGUI:
         for _ew in (self.db_user, self.db_password, self.db_host, self.db_port, self.db_name):
             _ew.bind('<Control-KeyPress>', _entry_ctrl_key)
 
-        # Connect Button
-        connect_frame = ttk.Frame(settings_frame)
-        connect_frame.grid(row=7, column=0, columnspan=2, pady=10)
-        
+        # Connect button + live status badge
+        tk.Frame(settings_frame, bg=UI['border'], height=1).pack(fill='x', pady=(6, 0))
+        connect_frame = tk.Frame(settings_frame, bg=UI['surface'])
+        connect_frame.pack(fill='x')
+
         self.connect_btn = tk.Button(connect_frame, text="🔌 Connect", command=self.connect_database,
-                                    bg='#3498db', fg='white', font=('Arial', 11, 'bold'),
-                                    relief='flat', padx=30, pady=8, cursor='hand2')
-        self.connect_btn.pack()
-        
-        # Connection Status
+                                    **ui_button_style('primary', 'lg'))
+        self.connect_btn.pack(side=tk.LEFT, padx=16, pady=10)
+        ui_bind_hover(self.connect_btn, UI['primary'], UI['primary_hover'])
+
+        conn_badge = tk.Frame(connect_frame, bg=UI['danger_soft'])
+        conn_badge.pack(side=tk.LEFT, pady=10)
+        conn_badge_dot = tk.Label(conn_badge, text="●", bg=UI['danger_soft'], fg=UI['danger'],
+                                  font=('Segoe UI', 9))
+        conn_badge_dot.pack(side=tk.LEFT, padx=(10, 4), pady=3)
+        conn_badge_text = tk.Label(conn_badge, text="Not Connected", bg=UI['danger_soft'],
+                                   fg=UI['danger'], font=UI_FONT_LABEL)
+        conn_badge_text.pack(side=tk.LEFT, padx=(0, 12), pady=3)
+
+        # Connection Status — logic still writes here (text/foreground); the badge mirrors it.
         self.status_label = tk.Label(settings_frame, text="❌ Not Connected", foreground="#e74c3c",
                                     font=('Arial', 10, 'bold'), bg='#ffffff')
-        self.status_label.grid(row=8, column=0, columnspan=2)
-        
-        # SQL Query Section
-        query_frame = ttk.LabelFrame(main_frame, text="📝 SQL Query", padding="15")
-        query_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+
+        def _refresh_conn_badge():
+            """Read-only mirror of self.status_label → badge (🟢 Connected / 🔴 Not Connected)."""
+            try:
+                if not conn_badge.winfo_exists():
+                    return
+                raw = str(self.status_label.cget('text'))
+                if raw.startswith("✅"):
+                    detail = raw[raw.find("(") + 1:raw.rfind(")")] if "(" in raw else ""
+                    text = "Connected" + (f" · {detail}" if detail else "")
+                    bg, fg = UI['success_soft'], UI['success']
+                else:
+                    text = raw.replace("❌", "").strip() or "Not Connected"
+                    bg, fg = UI['danger_soft'], UI['danger']
+                if conn_badge_text.cget('text') != text:
+                    conn_badge.config(bg=bg)
+                    conn_badge_dot.config(bg=bg, fg=fg)
+                    conn_badge_text.config(text=text, bg=bg, fg=fg)
+            except tk.TclError:
+                return
+            conn_badge.after(300, _refresh_conn_badge)
+
+        _refresh_conn_badge()
+
+        # ==================================================================
+        # Section 2 — SQL Query Editor (card)
+        # Layout: [Header: title | List Tables] / [Editor + line numbers] /
+        #         [Quick Actions] / [Status bar]
+        # ==================================================================
+        FL = UI
+
+        # Secondary (white) and primary (#2563EB) button styles
+        secondary_btn_style = ui_button_style('secondary')
+        primary_btn_style = ui_button_style('primary')
+        primary_btn_style.update(padx=18)
+
+        def _bordered(parent, color):
+            """1px border wrapper (reliable light border for tk.Button on Windows)."""
+            return tk.Frame(parent, bg=color, bd=0, highlightthickness=0)
+
+        _bind_hover = ui_bind_hover
+
+        # Card container (replaces the former LabelFrame)
+        query_frame = tk.Frame(main_frame, bg=FL['card'],
+                               highlightthickness=1, highlightbackground=FL['border'],
+                               highlightcolor=FL['border'], bd=0)
+        query_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 14))
         query_frame.columnconfigure(0, weight=1)
-        query_frame.rowconfigure(0, weight=1)
+        query_frame.rowconfigure(2, weight=1)
         main_frame.rowconfigure(1, weight=1)
-        
-        # SQL Context Text Area
-        self.sql_context = scrolledtext.ScrolledText(query_frame, height=8, width=70, font=('Arial', 10), undo=True, maxundo=-1)
-        self.sql_context.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+
+        # --- Header: "SQL Query" (left) | List Tables (right) -------------
+        query_header = tk.Frame(query_frame, bg=FL['card'])
+        query_header.grid(row=0, column=0, sticky='ew', padx=16, pady=(12, 10))
+        query_header.columnconfigure(0, weight=1)
+
+        query_title_box = tk.Frame(query_header, bg=FL['card'])
+        query_title_box.grid(row=0, column=0, sticky='w')
+        tk.Label(query_title_box, text="SQL Query", bg=FL['card'], fg=FL['text'],
+                 font=('Segoe UI Semibold', 13)).pack(side='left')
+        tk.Label(query_title_box, text="  Editor", bg=FL['card'], fg=FL['muted'],
+                 font=('Segoe UI', 9)).pack(side='left', pady=(3, 0))
+
+        inspect_border = _bordered(query_header, FL['border_strong'])
+        inspect_border.grid(row=0, column=1, sticky='e')
+
+        tk.Frame(query_frame, bg=FL['border'], height=1).grid(row=1, column=0, sticky='ew')
+
+        # --- SQL Editor (main workspace) -----------------------------------
+        editor_wrap = tk.Frame(query_frame, bg=FL['card'])
+        editor_wrap.grid(row=2, column=0, sticky='nsew', padx=16, pady=(12, 0))
+        editor_wrap.columnconfigure(0, weight=1)
+        editor_wrap.rowconfigure(0, weight=1)
+
+        editor_border = tk.Frame(editor_wrap, bg=FL['border_strong'], bd=0)
+        editor_border.grid(row=0, column=0, sticky='nsew')
+        editor_border.columnconfigure(1, weight=1)
+        editor_border.rowconfigure(0, weight=1)
+
+        # Line-number gutter (display only)
+        line_gutter = tk.Canvas(editor_border, width=46, bg=FL['surface'],
+                                highlightthickness=0, bd=0)
+        line_gutter.grid(row=0, column=0, sticky='ns', padx=(1, 0), pady=1)
+
+        # SQL Context Text Area (same widget/reference, restyled & enlarged)
+        self.sql_context = scrolledtext.ScrolledText(
+            editor_border, height=18, width=70, font=('Consolas', 11),
+            undo=True, maxundo=-1,
+            bg='#FFFFFF', fg=FL['text'], insertbackground=FL['text'],
+            selectbackground='#BFDBFE', selectforeground=FL['text'],
+            relief='flat', bd=0, highlightthickness=0, padx=10, pady=8
+        )
+        self.sql_context.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 1), pady=1)
         self.sql_context.insert(
                 1.0,
                 "SELECT * FROM Table WHERE Column1 IN ({ACCOUNT_LIST})"
                 )
         # Defer edit_reset so it runs after widget is fully ready — clears undo stack to fresh start
         self.sql_context.after(200, self.sql_context.edit_reset)
+
+        _gutter_state = {'sig': None}
+
+        def _draw_line_numbers():
+            """Redraw gutter numbers for the visible lines (read-only on the editor)."""
+            line_gutter.delete('all')
+            gutter_width = int(line_gutter.cget('width'))
+            line_gutter.create_line(gutter_width - 1, 0, gutter_width - 1, 10000,
+                                    fill=FL['border'])
+            current_line = self.sql_context.index(tk.INSERT).split('.')[0]
+            index = self.sql_context.index('@0,0')
+            while True:
+                info = self.sql_context.dlineinfo(index)
+                if info is None:
+                    break
+                line_no = index.split('.')[0]
+                line_gutter.create_text(
+                    gutter_width - 10, info[1] + info[4] // 2, anchor='e', text=line_no,
+                    font=UI_FONT_MONO,
+                    fill=FL['text'] if line_no == current_line else FL['subtle'])
+                next_index = self.sql_context.index(f'{index}+1line')
+                if next_index == index:
+                    break
+                index = next_index
+
+        def _poll_line_numbers():
+            try:
+                if not line_gutter.winfo_exists():
+                    return
+                sig = (self.sql_context.yview(), self.sql_context.index('end'),
+                       self.sql_context.index(tk.INSERT), self.sql_context.winfo_height(),
+                       self.sql_context.winfo_width())
+                if sig != _gutter_state['sig']:
+                    _gutter_state['sig'] = sig
+                    _draw_line_numbers()
+            except tk.TclError:
+                return
+            line_gutter.after(80, _poll_line_numbers)
+
+        _poll_line_numbers()
 
         def _text_ctrl_key(e):
             """Handle Ctrl+Z/Y/C/X/V for Text/ScrolledText by Windows keycode — works with any keyboard layout (Thai/EN)."""
@@ -361,141 +954,202 @@ class DatabaseConnectorGUI:
 
         self.sql_context.bind('<Control-KeyPress>', _text_ctrl_key)
                 
-        # Query Buttons Frame - REDESIGNED for better UX/UI
-        query_buttons = ttk.Frame(query_frame)
-        query_buttons.grid(row=1, column=0, pady=10)
-        
-        # Add subtle background and padding
-        query_buttons_inner = tk.Frame(query_buttons, bg='#ecf0f1', relief='flat', bd=0)
-        query_buttons_inner.pack(padx=5, pady=5)
-        
-        # Row 0 - Primary Actions (Data Management)
-        primary_label = tk.Label(query_buttons_inner, text="📊 Data Operations",
-                                 font=('Arial', 9, 'bold'), bg='#ecf0f1', fg='#34495e')
-        primary_label.grid(row=0, column=0, columnspan=3, pady=(5, 8), sticky='w', padx=10)
-        
-        # Load Table Data - First position
+        # --- Header right: List Tables (same widget/command, restyled) ----
+        self.inspect_btn = tk.Button(inspect_border,
+                                     text="📊 List Tables",
+                                     command=self.list_tables,
+                                     state="disabled",
+                                     **secondary_btn_style)
+        self.inspect_btn.pack(padx=1, pady=1)
+        _bind_hover(self.inspect_btn, FL['card'], FL['hover'])
+
+        # --- Quick Actions: Load Excel → Execute → Save Job → Reset --------
+        quick_actions = tk.Frame(query_frame, bg=FL['card'])
+        quick_actions.grid(row=3, column=0, sticky='ew', padx=16, pady=(12, 14))
+        quick_actions.columnconfigure(1, weight=1)
+
+        tk.Label(quick_actions, text="QUICK ACTIONS", bg=FL['card'], fg=FL['muted'],
+                 font=('Segoe UI Semibold', 8)).grid(row=0, column=0, columnspan=2,
+                                                      sticky='w', pady=(0, 6))
+
+        query_buttons_inner = tk.Frame(quick_actions, bg=FL['card'])
+        query_buttons_inner.grid(row=1, column=0, sticky='w')
+
+        # 1) Load Excel — secondary
+        load_excel_border = _bordered(query_buttons_inner, FL['border_strong'])
+        load_excel_border.pack(side='left', padx=(0, 8))
         self.load_excel_btn = tk.Button(
-            query_buttons_inner,
+            load_excel_border,
             text="📗 Load Excel",
             command=self.load_excel_template_dialog,
-            bg='#2ecc71',
-            fg='white',
-            font=('Arial', 10, 'bold'),
-            relief='raised',
-            bd=2,
-            padx=20,
-            pady=8,
-            cursor='hand2'
+            **secondary_btn_style
         )
-        self.load_excel_btn.grid(row=1, column=1, padx=5, pady=2)
+        self.load_excel_btn.pack(padx=1, pady=1)
+        _bind_hover(self.load_excel_btn, FL['card'], FL['hover'])
 
-        self.reset_sql_template_btn = tk.Button(
-            query_buttons_inner,
-            text="↩ Reset SQL Template",
-            command=self.show_reset_parameter_dialog,
-            bg="#7f8c8d",
-            fg="white",
-            font=("Arial", 9, "bold"),
-            relief="raised",
-            bd=2,
-            padx=10,
-            pady=8,
-            cursor="hand2"
-        )
-        self.reset_sql_template_btn.grid(row=1, column=4, padx=5, pady=2)
-        # Execute Query - Second position
+        # 2) Execute — PRIMARY action (#2563EB)
         self.execute_btn = tk.Button(query_buttons_inner,
                                      text="▶️ Execute",
                                      command=self.execute_query,
                                      state="disabled",
-                                     bg='#27ae60', fg='white',
-                                     font=('Arial', 10, 'bold'),
-                                     relief='raised', bd=2,
-                                     padx=20, pady=8,
-                                     cursor='hand2',
-                                     activebackground='#229954',
-                                     activeforeground='white')
-        self.execute_btn.grid(row=1, column=2, padx=5, pady=2)
-        
-        # Save Job - Third position
-        self.save_job_btn = tk.Button(query_buttons_inner,
+                                     **primary_btn_style)
+        self.execute_btn.pack(side='left', padx=(0, 8), ipady=1)
+        _bind_hover(self.execute_btn, FL['primary'], FL['primary_hover'])
+
+        # 3) Save Job — secondary
+        save_job_border = _bordered(query_buttons_inner, FL['border_strong'])
+        save_job_border.pack(side='left', padx=(0, 8))
+        self.save_job_btn = tk.Button(save_job_border,
                                       text="💾 Save Job",
                                       command=self.save_job_dialog,
-                                      bg='#f39c12', fg='white',
-                                      font=('Arial', 10, 'bold'),
-                                      relief='raised', bd=2,
-                                      padx=20, pady=8,
-                                      cursor='hand2',
-                                      activebackground='#e67e22',
-                                      activeforeground='white')
-        self.save_job_btn.grid(row=1, column=3, padx=5, pady=2)
-        
-        # Separator line
-        separator1 = tk.Frame(query_buttons_inner, height=2, bg='#bdc3c7')
-        separator1.grid(row=2, column=0, columnspan=3, sticky='ew', padx=10, pady=8)
-        
-        # Row 3 - Secondary Actions (Database Tools)
-        secondary_label = tk.Label(query_buttons_inner, text="🔧 Database Tools",
-                                   font=('Arial', 9, 'bold'), bg='#ecf0f1', fg='#34495e')
-        secondary_label.grid(row=3, column=0, columnspan=3, pady=(5, 8), sticky='w', padx=10)
-        
-        # List Tables - Centered and wider (spans 2 columns)
-        self.inspect_btn = tk.Button(query_buttons_inner,
-                                     text="📊 List Tables",
-                                     command=self.list_tables,
-                                     state="disabled",
-                                     bg='#8e44ad', fg='white',
-                                     font=('Arial', 10, 'bold'),
-                                     relief='raised', bd=2,
-                                     padx=40, pady=8,  # Wider padding
-                                     cursor='hand2',
-                                     activebackground='#7d3c98',
-                                     activeforeground='white')
-        self.inspect_btn.grid(row=4, column=0, columnspan=3, padx=5, pady=2)  # Span all columns
-        
+                                      **secondary_btn_style)
+        self.save_job_btn.pack(padx=1, pady=1)
+        _bind_hover(self.save_job_btn, FL['card'], FL['hover'])
+
+        # 4) Reset SQL Template — secondary
+        reset_border = _bordered(query_buttons_inner, FL['border_strong'])
+        reset_border.pack(side='left')
+        self.reset_sql_template_btn = tk.Button(
+            reset_border,
+            text="↩ Reset SQL Template",
+            command=self.show_reset_parameter_dialog,
+            **secondary_btn_style
+        )
+        self.reset_sql_template_btn.pack(padx=1, pady=1)
+        _bind_hover(self.reset_sql_template_btn, FL['card'], FL['hover'])
+
+        tk.Label(quick_actions, text="Ctrl+Enter to execute", bg=FL['card'],
+                 fg=FL['subtle'], font=('Segoe UI', 9)).grid(row=1, column=1, sticky='e')
+
+        # --- Status bar (read-only view of existing state) -----------------
+        tk.Frame(query_frame, bg=FL['border'], height=1).grid(row=4, column=0, sticky='ew')
+        query_status_bar = tk.Frame(query_frame, bg=FL['surface'])
+        query_status_bar.grid(row=5, column=0, sticky='ew')
+
+        def _status_item(parent, first=False):
+            if not first:
+                tk.Label(parent, text="|", bg=FL['surface'], fg=FL['border_strong'],
+                         font=('Segoe UI', 9)).pack(side='left', padx=8)
+            dot = tk.Label(parent, text="●", bg=FL['surface'], fg=FL['off'],
+                           font=('Segoe UI', 8))
+            dot.pack(side='left', padx=(0, 4))
+            lbl = tk.Label(parent, text="", bg=FL['surface'], fg=FL['muted'],
+                           font=('Segoe UI', 9))
+            lbl.pack(side='left')
+            return dot, lbl
+
+        status_inner = tk.Frame(query_status_bar, bg=FL['surface'])
+        status_inner.pack(side='left', padx=16, pady=5)
+        _sb_activity = _status_item(status_inner, first=True)
+        _sb_conn = _status_item(status_inner)
+        _sb_excel = _status_item(status_inner)
+
+        def _refresh_query_status_bar():
+            """Poll-only: reads existing widgets/attributes; never mutates app state."""
+            try:
+                if not query_status_bar.winfo_exists():
+                    return
+                busy = any(
+                    "Loading" in str(b.cget('text'))
+                    for b in (self.execute_btn, self.inspect_btn)
+                )
+                _sb_activity[0].config(fg=FL['warn'] if busy else FL['ok'])
+                _sb_activity[1].config(text="Running…" if busy else "Ready")
+
+                connected = str(self.status_label.cget('text')).startswith("✅")
+                _sb_conn[0].config(fg=FL['ok'] if connected else FL['off'])
+                _sb_conn[1].config(text="Connected" if connected else "Not Connected")
+
+                excel_loaded = getattr(self, 'loaded_excel_data', None) is not None
+                _sb_excel[0].config(fg=FL['primary'] if excel_loaded else FL['off'])
+                _sb_excel[1].config(text="Excel Loaded" if excel_loaded else "No Excel Loaded")
+
+                # Keep primary button visually consistent with its (logic-driven) state
+                if str(self.execute_btn['state']) == 'disabled':
+                    if self.execute_btn.cget('bg') != FL['primary_disabled']:
+                        self.execute_btn.config(bg=FL['primary_disabled'])
+                elif self.execute_btn.cget('bg') == FL['primary_disabled']:
+                    self.execute_btn.config(bg=FL['primary'])
+            except tk.TclError:
+                return
+            query_status_bar.after(400, _refresh_query_status_bar)
+
+        _refresh_query_status_bar()
+
         # Keyboard shortcut binding
         self.sql_context.bind('<Control-Return>', lambda _event: self.execute_query() if self.execute_btn['state'] != 'disabled' else None)
         
-        # Jobs Section - REDESIGNED with inline action buttons
-        jobs_frame = ttk.LabelFrame(main_frame, text="📋 Saved Jobs & Presets", padding="15")
-        jobs_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        jobs_frame.columnconfigure(0, weight=1)
-        jobs_frame.rowconfigure(1, weight=1)
-        
-        # Top controls - Add job and preset management
-        controls_frame = tk.Frame(jobs_frame, bg='#ffffff')
-        controls_frame.pack(fill='both', pady=(0, 10))
-        
-        tk.Button(controls_frame, text="➕ New Job", command=self.save_job_dialog,
-                 bg='#27ae60', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2').pack(side='left', padx=(0, 5))
-        
-        tk.Button(controls_frame, text="💾 Save as Preset", command=self.save_preset_dialog,
-                 bg='#3498db', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2').pack(side='left', padx=5)
-        
-        tk.Button(controls_frame, text="📂 Load Preset", command=self.load_preset_dialog,
-                 bg='#9b59b6', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2').pack(side='left', padx=5)
-        
-        self.export_excel_btn = tk.Button(controls_frame, text="📤 Export Excel", command=self.export_jobs_to_excel,
-                 bg='#16a085', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2')
-        self.export_excel_btn.pack(side='left', padx=5)
+        # ==================================================================
+        # Section 3 — Saved Jobs & Presets (card)
+        # [Header] / [Action bar] / [Select All] / [Job cards]
+        # ==================================================================
+        jobs_card = ui_card(main_frame)
+        jobs_card.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 14))
+        ui_card_header(jobs_card, "Saved Jobs & Presets", "Reusable queries for this profile")
 
-        tk.Button(controls_frame, text="▶️ Run All Jobs", command=self.run_selected_job,
-                 bg='#e67e22', fg='white', font=('Arial', 9, 'bold'),
-                 relief='flat', padx=15, pady=5, cursor='hand2').pack(side='right')
-        
+        jobs_frame = tk.Frame(jobs_card, bg=UI['card'])
+        jobs_frame.pack(fill='both', expand=True, padx=16, pady=(12, 14))
+
+        # Top controls - Add job and preset management
+        controls_frame = tk.Frame(jobs_frame, bg=UI['card'])
+        controls_frame.pack(fill='both', pady=(0, 10))
+
+        _outer, _ = ui_button(controls_frame, "+ New Job", self.save_job_dialog, kind='primary', size='sm')
+        _outer.pack(side='left', padx=(0, 6))
+
+        _outer, _ = ui_button(controls_frame, "💾 Save Preset", self.save_preset_dialog, size='sm')
+        _outer.pack(side='left', padx=(0, 6))
+
+        _outer, _ = ui_button(controls_frame, "📂 Load Preset", self.load_preset_dialog, size='sm')
+        _outer.pack(side='left', padx=(0, 6))
+
+        _outer, self.export_excel_btn = ui_button(controls_frame, "📤 Export Excel",
+                                                  self.export_jobs_to_excel, size='sm')
+        _outer.pack(side='left', padx=(0, 6))
+
+        self.run_all_btn = tk.Button(controls_frame, text="▶️ Run All Jobs", command=self.run_selected_job,
+                                     **ui_button_style('success', 'sm'))
+        self.run_all_btn.pack(side='right')
+        ui_bind_hover(self.run_all_btn, UI['success'], UI['success_hover'])
+
+        # Shown only while at least one job is ticked (packed by _refresh_job_selection_ui)
+        self.delete_selected_btn = tk.Button(controls_frame, text="🗑 Delete Selected",
+                                             command=self.delete_selected_jobs,
+                                             **ui_button_style('danger', 'sm'))
+        ui_bind_hover(self.delete_selected_btn, UI['danger_soft'], UI['danger_hover'])
+
+        # Select All checkbox for the job list
+        select_frame = tk.Frame(jobs_frame, bg=UI['card'])
+        select_frame.pack(fill='x', pady=(0, 6))
+        self.select_all_jobs_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            select_frame,
+            text="Select All",
+            variable=self.select_all_jobs_var,
+            command=self.toggle_select_all_jobs,
+            bg=UI['card'],
+            activebackground=UI['card'],
+            fg=UI['text'],
+            selectcolor='#FFFFFF',
+            font=UI_FONT_LABEL,
+            bd=0,
+            highlightthickness=0,
+            cursor='hand2'
+        ).pack(side='left')
+        self.selected_jobs_label = tk.Label(
+            select_frame, text="", bg=UI['card'], fg=UI['primary'], font=UI_FONT_SM
+        )
+        self.selected_jobs_label.pack(side='left', padx=8)
+
         # Jobs list frame with scrollbar
-        jobs_list_frame = tk.Frame(jobs_frame, bg='#ffffff', relief='solid', bd=1)
+        jobs_list_frame = tk.Frame(jobs_frame, bg=UI['surface'], bd=0, highlightthickness=1,
+                                   highlightbackground=UI['border'], highlightcolor=UI['border'])
         jobs_list_frame.pack(fill='both', expand=True)
-        
+
         # Canvas for scrollable job list
-        jobs_canvas = tk.Canvas(jobs_list_frame, bg='#ffffff', highlightthickness=0, height=250)
+        jobs_canvas = tk.Canvas(jobs_list_frame, bg=UI['surface'], highlightthickness=0, height=250)
         jobs_scrollbar = ttk.Scrollbar(jobs_list_frame, orient='vertical', command=jobs_canvas.yview)
-        self.jobs_container = tk.Frame(jobs_canvas, bg='#ffffff')
+        self.jobs_container = tk.Frame(jobs_canvas, bg=UI['surface'])
         
         jobs_canvas.configure(yscrollcommand=jobs_scrollbar.set)
         jobs_scrollbar.pack(side='right', fill='y')
@@ -554,14 +1208,44 @@ class DatabaseConnectorGUI:
         # Update jobs list
         self.update_jobs_list()
         
-        # Results Section
-        results_frame = ttk.LabelFrame(main_frame, text="📊 Results", padding="15")
-        results_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        # ==================================================================
+        # Section 4 — Results Drawer (card with tabs)
+        # 📊 Results Grid | 📋 Execution Logs | 🐛 Error & Debug
+        # ==================================================================
+        results_card = ui_card(main_frame)
+        results_card.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        ui_card_header(results_card, "Results", "Query output, logs and diagnostics")
+
+        self.results_notebook = ttk.Notebook(results_card, style='Fluent.TNotebook')
+        self.results_notebook.pack(fill='both', expand=True)
+
+        # --- Tab 1: Results Grid (in-window viewer; popup windows still open as before)
+        grid_tab = tk.Frame(self.results_notebook, bg=UI['card'])
+        self._build_results_grid_tab(grid_tab)
+
+        # --- Tab 2: Execution Logs (the existing results_text widget)
+        results_frame = tk.Frame(self.results_notebook, bg=UI['card'])
         results_frame.columnconfigure(0, weight=1)
-        
+        results_frame.rowconfigure(0, weight=1)
+
         # Results Text Area
-        self.results_text = scrolledtext.ScrolledText(results_frame, height=30, width=140, font=('Arial', 10), wrap=tk.NONE)
-        self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        self.results_text = scrolledtext.ScrolledText(
+            results_frame, height=24, width=140, font=UI_FONT_MONO, wrap=tk.NONE,
+            bg='#FFFFFF', fg=UI['text'], insertbackground=UI['text'],
+            selectbackground='#BFDBFE', selectforeground=UI['text'],
+            relief='flat', bd=0, highlightthickness=1,
+            highlightbackground=UI['border'], highlightcolor=UI['border'], padx=10, pady=8
+        )
+        self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=16, pady=(12, 16))
+
+        # --- Tab 3: Error & Debug
+        debug_tab = tk.Frame(self.results_notebook, bg=UI['card'])
+        self._build_error_debug_tab(debug_tab)
+
+        self.results_notebook.add(grid_tab, text="📊 Results Grid")
+        self.results_notebook.add(results_frame, text="📋 Execution Logs")
+        self.results_notebook.add(debug_tab, text="🐛 Error & Debug")
+        self.results_notebook.select(results_frame)
 
         # Scoped mouse wheel: scroll results text when hovering, restore main scroll when leaving
         def _on_results_enter(_event):
@@ -573,6 +1257,9 @@ class DatabaseConnectorGUI:
         self.results_text.bind("<Enter>", _on_results_enter)
         self.results_text.bind("<Leave>", _on_results_leave)
         self.results_text.bind('<Control-KeyPress>', _text_ctrl_key)
+
+        # Apply the Modern Enterprise theme to every dialog/popup (presentation only)
+        self._dialog_theme = DialogTheme(self.root)
 
         # Auto-load last used profile
         self.auto_load_last_profile()
@@ -929,7 +1616,7 @@ class DatabaseConnectorGUI:
         """Show where the config file is/should be located - Helper function"""
         dialog = tk.Toplevel(self.root)
         dialog.title("📁 Config File Location")
-        dialog.geometry("600x550")
+        dialog.geometry("600x600")
         dialog.configure(bg='#f0f0f0')
         dialog.transient(self.root)
         dialog.grab_set()
@@ -1051,43 +1738,158 @@ class DatabaseConnectorGUI:
             ) == current_profile
         ]
 
+        # Forget ticks of jobs that were deleted
+        existing_ids = {id(job) for job in self.saved_jobs}
+        self._checked_job_ids &= existing_ids
+
+        if not filtered_jobs:
+            tk.Label(
+                self.jobs_container,
+                text="No saved jobs for this profile yet — write a query and click “+ New Job”.",
+                bg=UI['surface'], fg=UI['muted'], font=UI_FONT_SM
+            ).pack(fill=tk.X, pady=24)
+
         for idx, job in enumerate(filtered_jobs, 1):
 
             real_idx = self.saved_jobs.index(job)
+            is_checked = id(job) in self._checked_job_ids
 
-            job_frame = ttk.Frame(self.jobs_container)
-            job_frame.pack(fill=tk.X, pady=2)
+            # Job card
+            job_frame = tk.Frame(
+                self.jobs_container, bg=UI['card'], bd=0, highlightthickness=1,
+                highlightbackground=UI['primary'] if is_checked else UI['border'],
+                highlightcolor=UI['border']
+            )
+            job_frame.pack(fill=tk.X, padx=8, pady=(8 if idx == 1 else 0, 6))
 
             job_name = job.get('name', f'Job {idx}')
 
-            ttk.Label(
+            check_var = tk.BooleanVar(value=is_checked)
+            tk.Checkbutton(
                 job_frame,
-                text=f"{idx}. {job_name}",
-                font=('Arial', 9)
-            ).pack(side=tk.LEFT)
+                variable=check_var,
+                command=lambda j=job, v=check_var, f=job_frame: (
+                    self.toggle_job_checked(j, v.get()),
+                    f.config(highlightbackground=UI['primary'] if v.get() else UI['border'])),
+                bg=UI['card'], activebackground=UI['card'], selectcolor='#FFFFFF',
+                bd=0, highlightthickness=0, cursor='hand2'
+            ).pack(side=tk.LEFT, padx=(10, 4), pady=8)
 
-            ttk.Button(
-                job_frame,
-                text="▶ Run",
-                width=8,
-                command=lambda j=job: self.run_job(j)
-            ).pack(side=tk.RIGHT, padx=1)
+            tk.Label(
+                job_frame, text=f"{idx:02d}", bg=UI['hover'], fg=UI['muted'],
+                font=UI_FONT_LABEL, padx=6
+            ).pack(side=tk.LEFT, padx=(0, 10))
 
-            ttk.Button(
-                job_frame,
-                text="✏ Edit",
-                width=8,
-                command=lambda i=real_idx: self.edit_job(i)
-            ).pack(side=tk.RIGHT, padx=1)
+            text_box = tk.Frame(job_frame, bg=UI['card'])  # packed after the buttons
+            tk.Label(
+                text_box, text=job_name, bg=UI['card'], fg=UI['text'],
+                font=UI_FONT_SEMI, anchor='w'
+            ).pack(fill=tk.X)
+            query_preview = " ".join(str(job.get('query', '')).split())
+            if len(query_preview) > 110:
+                query_preview = query_preview[:107] + "…"
+            if query_preview:
+                tk.Label(
+                    text_box, text=query_preview, bg=UI['card'], fg=UI['subtle'],
+                    font=('Consolas', 9), anchor='w'
+                ).pack(fill=tk.X)
 
-            ttk.Button(
-                job_frame,
-                text="🗑 Delete",
-                width=8,
-                command=lambda i=real_idx, n=job_name:
-                    self.delete_job(i, n)
-            ).pack(side=tk.RIGHT, padx=1)
-    
+            _outer, _ = ui_button(job_frame, "▶ Run", lambda j=job: self.run_job(j),
+                                  kind='primary', size='sm')
+            _outer.pack(side=tk.RIGHT, padx=(4, 10))
+
+            _outer, _ = ui_button(job_frame, "✏ Edit", lambda i=real_idx: self.edit_job(i),
+                                  size='sm')
+            _outer.pack(side=tk.RIGHT, padx=4)
+
+            _outer, _ = ui_button(job_frame, "🗑 Delete",
+                                  lambda i=real_idx, n=job_name: self.delete_job(i, n),
+                                  kind='danger', size='sm')
+            _outer.pack(side=tk.RIGHT, padx=4)
+
+            # Packed last so the action buttons always keep their space
+            text_box.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=6)
+
+        self._refresh_job_selection_ui()
+
+    def _current_profile_jobs(self):
+        current_profile = self.profile_combo.get()
+        return [
+            job for job in self.saved_jobs
+            if job.get("profile", current_profile) == current_profile
+        ]
+
+    def get_jobs_to_run(self):
+        """Checked jobs of the current profile, or all of them if none checked."""
+        profile_jobs = self._current_profile_jobs()
+        checked = [job for job in profile_jobs if id(job) in self._checked_job_ids]
+        return checked or profile_jobs
+
+    def toggle_job_checked(self, job, checked):
+        if checked:
+            self._checked_job_ids.add(id(job))
+        else:
+            self._checked_job_ids.discard(id(job))
+        self._refresh_job_selection_ui()
+
+    def toggle_select_all_jobs(self):
+        profile_ids = {id(job) for job in self._current_profile_jobs()}
+        if self.select_all_jobs_var.get():
+            self._checked_job_ids |= profile_ids
+        else:
+            self._checked_job_ids -= profile_ids
+        self.update_jobs_list()
+
+    def _refresh_job_selection_ui(self):
+        if not hasattr(self, "selected_jobs_label"):
+            return
+        profile_jobs = self._current_profile_jobs()
+        checked_count = sum(id(job) in self._checked_job_ids for job in profile_jobs)
+        self.select_all_jobs_var.set(bool(profile_jobs) and checked_count == len(profile_jobs))
+        if checked_count:
+            self.selected_jobs_label.config(text=f"{checked_count} / {len(profile_jobs)} selected")
+            self.run_all_btn.config(text=f"▶️ Run Selected ({checked_count})")
+            delete_text = (
+                "🗑 Delete All" if checked_count == len(profile_jobs)
+                else f"🗑 Delete Selected ({checked_count})"
+            )
+            self.delete_selected_btn.config(text=delete_text)
+            if not self.delete_selected_btn.winfo_ismapped():
+                self.delete_selected_btn.pack(side='right', padx=5)
+        else:
+            self.selected_jobs_label.config(text="")
+            self.run_all_btn.config(text="▶️ Run All Jobs")
+            self.delete_selected_btn.pack_forget()
+
+    def delete_selected_jobs(self):
+        """Delete every ticked job of the current profile after confirmation."""
+        selected = [
+            job for job in self._current_profile_jobs()
+            if id(job) in self._checked_job_ids
+        ]
+        if not selected:
+            return
+
+        names = "\n".join(f"• {job.get('name', '')}" for job in selected[:10])
+        if len(selected) > 10:
+            names += f"\n... and {len(selected) - 10} more"
+        if not messagebox.askyesno(
+            "Confirm Delete",
+            f"Delete {len(selected)} selected job(s)?\n\n{names}\n\nThis cannot be undone."
+        ):
+            return
+
+        selected_ids = {id(job) for job in selected}
+        self.saved_jobs = [job for job in self.saved_jobs if id(job) not in selected_ids]
+        self._checked_job_ids -= selected_ids
+        self.save_jobs()
+        self.update_jobs_list()
+
+        self.results_text.delete("1.0", tk.END)
+        self.results_text.insert(tk.END, f"🗑️ Deleted {len(selected)} job(s)\n")
+        self.results_text.insert(tk.END, f"📊 Remaining: {len(self.saved_jobs)} jobs\n")
+        self.results_text.see(tk.END)
+
     def run_single_job(self, job):
         """Run one saved job using the shared Results format."""
         self.run_job(job)
@@ -1096,7 +1898,8 @@ class DatabaseConnectorGUI:
         """Load job to SQL editor - CLEAN output"""
         self.sql_context.delete(1.0, tk.END)
         self.sql_context.insert(1.0, job['query'])
-        
+        self._apply_job_excel_state(job)
+
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert(tk.END, f"📝 Loaded: {job['name']}\n")
         self.results_text.insert(tk.END, f"📊 Database: {job.get('database', 'N/A')}\n")
@@ -1113,14 +1916,14 @@ class DatabaseConnectorGUI:
         dialog = tk.Toplevel(self.root)
 
         dialog.title("✏️ Edit Job")
-        dialog.geometry("700x550")
+        dialog.geometry("700x610")
         dialog.configure(bg='#f0f0f0')
         dialog.transient(self.root)
         dialog.grab_set()
 
         x = (self.root.winfo_screenwidth() - 700) // 2
         y = (self.root.winfo_screenheight() - 550) // 2
-        dialog.geometry(f"700x550+{x}+{y}")
+        dialog.geometry(f"700x610+{x}+{y}")
 
         content = tk.Frame(
             dialog,
@@ -1245,10 +2048,11 @@ class DatabaseConnectorGUI:
 
         excel_button_frame = ttk.Frame(tool_frame)
         excel_button_frame.pack(fill="x")
+        job_template, job_values, job_rendered = self._excel_state_from_job(job)
         edit_excel_state = {
-            "template": job["query"],
-            "values": {},
-            "rendered": None
+            "template": job_template,
+            "values": job_values,
+            "rendered": job_rendered
         }
 
         def sync_edit_parameter_state():
@@ -1364,8 +2168,17 @@ class DatabaseConnectorGUI:
                 )
                 return
 
-            self.saved_jobs[job_idx]['name'] = new_name
-            self.saved_jobs[job_idx]['query'] = new_query
+            saved_job = self.saved_jobs[job_idx]
+            saved_job['name'] = new_name
+            saved_job['query'] = new_query
+            saved_job.pop('sql_template', None)
+            saved_job.pop('excel_parameters', None)
+            saved_job.update(self._excel_state_for_job(
+                new_query,
+                edit_excel_state["template"],
+                edit_excel_state["values"],
+                edit_excel_state["rendered"]
+            ))
 
             self.save_jobs()
             self.update_jobs_list()
@@ -1777,11 +2590,11 @@ class DatabaseConnectorGUI:
         """Toggle password visibility"""
         if self.password_visible:
             self.db_password.config(show="*")
-            self.toggle_password_btn.config(text="👁️", bg='#ecf0f1', fg='#2c3e50')
+            self.toggle_password_btn.config(text="👁️", bg=UI['card'], fg=UI['text'])
             self.password_visible = False
         else:
             self.db_password.config(show="")
-            self.toggle_password_btn.config(text="🙈", bg='#f39c12', fg='#2c3e50')
+            self.toggle_password_btn.config(text="🙈", bg=UI['primary_soft'], fg=UI['primary'])
             self.password_visible = True
     
     def on_db_type_change(self, event):
@@ -2662,6 +3475,14 @@ class DatabaseConnectorGUI:
         details_label = tk.Label(content_frame, text="Please wait...",
                                 font=('Arial', 9), bg='#ffffff', fg='#7f8c8d')
         details_label.pack(pady=5)
+
+        # UI: compact preview of the SQL being executed
+        _sql_preview = " ".join(str(sql_query).split())
+        if len(_sql_preview) > 90:
+            _sql_preview = _sql_preview[:87] + "…"
+        tk.Label(content_frame, text=_sql_preview, font=('Consolas', 9), bg=UI['surface'],
+                 fg=UI['muted'], wraplength=330, justify='left', padx=8, pady=6
+                 ).pack(fill='x', padx=16, pady=(4, 10))
         
         # Button frame (initially hidden)
         button_frame = tk.Frame(content_frame, bg='#ffffff')
@@ -2874,7 +3695,7 @@ class DatabaseConnectorGUI:
         traceback_scroll = tk.Scrollbar(traceback_frame)
         traceback_scroll.pack(side='right', fill='y')
         
-        traceback_text = tk.Text(traceback_frame, font=('Courier', 8),
+        traceback_text = tk.Text(traceback_frame, font=('Courier', 8), height=14,
                                 bg='#f8f9fa', wrap=tk.WORD,
                                 yscrollcommand=traceback_scroll.set)
         traceback_text.pack(side='left', fill='both', expand=True, padx=10, pady=10)
@@ -3761,7 +4582,10 @@ class DatabaseConnectorGUI:
             
             # Re-enable execute button
             self.execute_btn.config(state="normal", text="▶️ Execute Query")
-            
+
+            # UI: also mirror the result into the Results Grid tab
+            self._show_results_grid(df, sql_query)
+
             # Show results in popup table window
             self.show_table_popup(
                 df,
@@ -3792,6 +4616,226 @@ class DatabaseConnectorGUI:
         
         messagebox.showerror("Query Error", f"Failed to execute query:\n\n{str(error)}")
     
+    # ------------------------------------------------------------------
+    # Results Drawer UI (presentation only — reuses export_to_csv,
+    # export_to_excel_result, copy_selected_rows, _show_error_details_dialog)
+    # ------------------------------------------------------------------
+    RESULTS_GRID_PAGE_SIZE = 1000
+
+    def _build_results_grid_tab(self, tab):
+        # sets: list of (name, df, sql) — one for Execute Query, many for Run All Jobs
+        self._results_grid_state = {'df': None, 'sql': None, 'name': None, 'page': 0, 'sets': []}
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        toolbar = tk.Frame(tab, bg=UI['card'])
+        toolbar.grid(row=0, column=0, sticky='ew', padx=16, pady=(12, 8))
+
+        # Result-set picker (shown only when Run All Jobs produced several results)
+        self._rg_set_box = tk.Frame(toolbar, bg=UI['card'])
+        ui_field_label(self._rg_set_box, "RESULT").pack(side='left', padx=(0, 6))
+        self._rg_set_combo = ttk.Combobox(self._rg_set_box, state='readonly', width=42,
+                                          font=UI_FONT_SM, style='Fluent.TCombobox')
+        self._rg_set_combo.pack(side='left')
+        self._rg_set_combo.bind('<<ComboboxSelected>>',
+                                lambda _e: self._select_results_grid_set(
+                                    self._rg_set_combo.current()))
+
+        self._rg_info = tk.Label(toolbar, text="No results yet — run a query (Ctrl+Enter)",
+                                 bg=UI['card'], fg=UI['muted'], font=UI_FONT_SM)
+        self._rg_info.pack(side='left')
+
+        _outer, self._rg_export_xlsx_btn = ui_button(
+            toolbar, "📗 Export Excel",
+            lambda: self._results_grid_state['df'] is not None and self.export_to_excel_result(
+                self._results_grid_state['df'], self._results_grid_state['sql'],
+                job_name=self._results_grid_state['name']),
+            size='sm', state='disabled')
+        _outer.pack(side='right')
+        _outer, self._rg_export_csv_btn = ui_button(
+            toolbar, "📄 Export CSV",
+            lambda: self._results_grid_state['df'] is not None and self.export_to_csv(
+                self._results_grid_state['df']),
+            size='sm', state='disabled')
+        _outer.pack(side='right', padx=(0, 6))
+
+        tk.Frame(toolbar, bg=UI['border'], width=1, height=22).pack(side='right', padx=10)
+
+        _outer, self._rg_next_btn = ui_button(
+            toolbar, "Next ▶", lambda: self._render_results_grid_page(
+                self._results_grid_state['page'] + 1), size='sm', state='disabled')
+        _outer.pack(side='right')
+        self._rg_page_label = tk.Label(toolbar, text="Page 1 / 1", bg=UI['card'],
+                                       fg=UI['text'], font=UI_FONT_SM)
+        self._rg_page_label.pack(side='right', padx=8)
+        _outer, self._rg_prev_btn = ui_button(
+            toolbar, "◀ Prev", lambda: self._render_results_grid_page(
+                self._results_grid_state['page'] - 1), size='sm', state='disabled')
+        _outer.pack(side='right')
+
+        tree_wrap = tk.Frame(tab, bg=UI['card'], highlightthickness=1,
+                             highlightbackground=UI['border'], highlightcolor=UI['border'])
+        tree_wrap.grid(row=1, column=0, sticky='nsew', padx=16, pady=(0, 16))
+        tree_wrap.columnconfigure(0, weight=1)
+        tree_wrap.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(tree_wrap, show='headings', height=18, style='Fluent.Treeview')
+        vsb = ttk.Scrollbar(tree_wrap, orient='vertical', command=tree.yview)
+        hsb = ttk.Scrollbar(tree_wrap, orient='horizontal', command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        hsb.grid(row=1, column=0, sticky='ew')
+        tree.tag_configure('odd', background=UI['surface'])
+        self._rg_tree = tree
+
+        def _tree_wheel(ev):
+            tree.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+        tree.bind("<Enter>", lambda _e: tree.bind_all("<MouseWheel>", _tree_wheel))
+        tree.bind("<Leave>", lambda _e: tree.bind_all("<MouseWheel>", self._main_mousewheel))
+        # Ctrl+C (any keyboard layout) → existing copy_selected_rows
+        tree.bind('<Control-KeyPress>',
+                  lambda e: (self.copy_selected_rows(tree), 'break')[1] if e.keycode == 67 else None)
+
+    def _show_results_grid(self, df, sql_query):
+        """Mirror a SELECT result into the Results Grid tab."""
+        self._show_results_grid_sets([(None, df, sql_query)])
+
+    def _show_results_grid_sets(self, result_sets):
+        """Show one or more (name, df, sql) results; several → picker to switch."""
+        if not hasattr(self, '_rg_tree') or not result_sets:
+            return
+        state = self._results_grid_state
+        state['sets'] = list(result_sets)
+        if len(result_sets) > 1:
+            self._rg_set_combo['values'] = [
+                f"{i}. {name or 'Result'}  ({len(df):,} rows)"
+                for i, (name, df, _sql) in enumerate(result_sets, 1)
+            ]
+            if not self._rg_set_box.winfo_ismapped():
+                self._rg_set_box.pack(side='left', padx=(0, 14), before=self._rg_info)
+        else:
+            self._rg_set_box.pack_forget()
+        self._select_results_grid_set(0)
+        self.results_notebook.select(0)
+
+    def _select_results_grid_set(self, index):
+        sets = self._results_grid_state['sets']
+        if not sets or index < 0 or index >= len(sets):
+            return
+        name, df, sql_query = sets[index]
+        self._results_grid_state.update(df=df, sql=sql_query, name=name, page=0)
+        if len(sets) > 1 and self._rg_set_combo.current() != index:
+            self._rg_set_combo.current(index)
+        self._render_results_grid_page(0)
+
+    def _render_results_grid_page(self, page):
+        state = self._results_grid_state
+        df = state['df']
+        if df is None:
+            return
+        size = self.RESULTS_GRID_PAGE_SIZE
+        total_pages = max(1, (len(df) + size - 1) // size)
+        page = max(0, min(page, total_pages - 1))
+        state['page'] = page
+
+        tree = self._rg_tree
+        tree.delete(*tree.get_children())
+        columns = [str(c) for c in df.columns]
+        tree['columns'] = columns
+        start = page * size
+        sample = df.iloc[start:start + 50]
+        for pos, col in enumerate(columns):
+            longest_value = max([0] + [len(str(v)) for v in sample.iloc[:, pos]])
+            width = max(len(col) * 10, longest_value * 8) + 24
+            tree.heading(col, text=col, anchor='w')
+            tree.column(col, width=min(360, max(90, width)), anchor='w', stretch=False)
+
+        for i, row in enumerate(df.iloc[start:start + size].itertuples(index=False, name=None)):
+            values = ["" if v is None or (isinstance(v, float) and v != v) else str(v) for v in row]
+            tree.insert('', 'end', values=values, tags=('odd',) if i % 2 else ())
+
+        end = min(start + size, len(df))
+        self._rg_info.config(
+            text=f"{len(df):,} rows × {df.shape[1]} columns"
+                 + (f"   ·   showing {start + 1:,}–{end:,}" if len(df) else ""),
+            fg=UI['text'])
+        self._rg_page_label.config(text=f"Page {page + 1} / {total_pages}")
+        self._rg_prev_btn.config(state='normal' if page > 0 else 'disabled')
+        self._rg_next_btn.config(state='normal' if page < total_pages - 1 else 'disabled')
+        self._rg_export_csv_btn.config(state='normal')
+        self._rg_export_xlsx_btn.config(state='normal')
+
+    def _build_error_debug_tab(self, tab):
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        toolbar = tk.Frame(tab, bg=UI['card'])
+        toolbar.grid(row=0, column=0, sticky='ew', padx=16, pady=(12, 8))
+
+        tk.Checkbutton(toolbar, text="Debug mode (console logging)", variable=self.debug_mode,
+                       bg=UI['card'], activebackground=UI['card'], fg=UI['text'],
+                       selectcolor='#FFFFFF', font=UI_FONT_SM, bd=0, highlightthickness=0,
+                       cursor='hand2').pack(side='left')
+
+        _outer, self._dbg_details_btn = ui_button(
+            toolbar, "🔍 Full Error Details",
+            lambda: self.last_error_details and self._show_error_details_dialog(self.last_error_details),
+            size='sm', state='disabled')
+        _outer.pack(side='right')
+
+        debug_text = scrolledtext.ScrolledText(
+            tab, height=18, font=UI_FONT_MONO, wrap=tk.WORD,
+            bg='#FFFFFF', fg=UI['text'], relief='flat', bd=0, highlightthickness=1,
+            highlightbackground=UI['border'], highlightcolor=UI['border'], padx=10, pady=8)
+        debug_text.grid(row=1, column=0, sticky='nsew', padx=16, pady=(0, 16))
+        debug_text.tag_configure('h', font=UI_FONT_LABEL, foreground=UI['muted'])
+        debug_text.tag_configure('err', foreground=UI['danger'], font=UI_FONT_SEMI)
+        debug_text.insert('1.0', "No errors recorded in this session.")
+        debug_text.config(state='disabled')
+
+        def _wheel(ev):
+            debug_text.yview_scroll(int(-1 * (ev.delta / 120)), "units")
+        debug_text.bind("<Enter>", lambda _e: debug_text.bind_all("<MouseWheel>", _wheel))
+        debug_text.bind("<Leave>", lambda _e: debug_text.bind_all("<MouseWheel>", self._main_mousewheel))
+
+        shown = {'details': None}
+
+        def _poll_last_error():
+            """Read-only: render self.last_error_details when it changes."""
+            try:
+                if not debug_text.winfo_exists():
+                    return
+                details = self.last_error_details
+                if details is not None and details is not shown['details']:
+                    shown['details'] = details
+                    debug_text.config(state='normal')
+                    debug_text.delete('1.0', tk.END)
+                    debug_text.insert(tk.END, "LAST QUERY ERROR\n", 'h')
+                    debug_text.insert(tk.END, f"{details.get('type', 'Error')}: "
+                                              f"{details.get('message', '')}\n\n", 'err')
+                    debug_text.insert(tk.END, "QUERY\n", 'h')
+                    debug_text.insert(tk.END, f"{details.get('query', '')}\n\n")
+                    debug_text.insert(tk.END, "TRACEBACK\n", 'h')
+                    debug_text.insert(tk.END, details.get('traceback', ''))
+                    debug_text.config(state='disabled')
+                    self._dbg_details_btn.config(state='normal')
+                    if self.results_notebook.select() != str(tab):
+                        self.results_notebook.tab(tab, text="🐛 Error & Debug  ●")
+            except tk.TclError:
+                return
+            debug_text.after(500, _poll_last_error)
+
+        def _on_tab_changed(_e):
+            try:
+                if self.results_notebook.select() == str(tab):
+                    self.results_notebook.tab(tab, text="🐛 Error & Debug")
+            except tk.TclError:
+                pass
+
+        self.results_notebook.bind('<<NotebookTabChanged>>', _on_tab_changed, add='+')
+        _poll_last_error()
+
     def show_table_popup(
         self,
         df,
@@ -4438,7 +5482,13 @@ class DatabaseConnectorGUI:
                 'db_type': self.db_type.get(),
                 'created': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
             }
-            
+            job.update(self._excel_state_for_job(
+                sql_query,
+                self.sql_template,
+                self._excel_parameter_values,
+                self._excel_parameterized_sql
+            ))
+
             self.saved_jobs.append(job)
             self.save_jobs()
             self.update_jobs_list()
@@ -4597,17 +5647,15 @@ class DatabaseConnectorGUI:
         threading.Thread(target=run_in_background, daemon=True).start()
 
     def run_selected_job(self):
-        """Run profile jobs sequentially and append each result to Results."""
-        current_profile = self.profile_combo.get()
+        """Run checked jobs (or all profile jobs) sequentially into Results."""
+        profile_jobs = self.get_jobs_to_run()
+        list_numbers = {
+            id(job): number
+            for number, job in enumerate(self._current_profile_jobs(), start=1)
+        }
 
-        profile_jobs = [
-            job
-            for job in self.saved_jobs
-            if job.get("profile") == current_profile
-        ]
-        
-        for index, job in enumerate(profile_jobs, start=1):
-            job["run_index"] = index
+        for job in profile_jobs:
+            job["run_index"] = list_numbers.get(id(job), 1)
 
         if not profile_jobs:
             messagebox.showwarning(
@@ -4636,17 +5684,6 @@ class DatabaseConnectorGUI:
                 success_count = 0
                 error_count = 0
                 
-                current_profile = self.profile_combo.get()
-
-                profile_jobs = [
-                    job
-                    for job in self.saved_jobs
-                    if job.get("profile") == current_profile
-                ]
-                
-                for index, job in enumerate(profile_jobs, start=1):
-                    job["run_index"] = index
-
                 for idx, job in enumerate(profile_jobs, 1):
                     start_time = time_module.time()
                     self.root.after(0, lambda i=idx, j=job: self.update_job_status(i, j, "running"))
@@ -4877,49 +5914,48 @@ class DatabaseConnectorGUI:
         if not job_results:
             return
 
-        # One summary window for the whole run (instead of one popup per job).
-        # Double-click a row to open that job's full result.
-        summary_df = pd.DataFrame([
-            {k: v for k, v in r.items() if not k.startswith('_')}
-            for r in job_results
-        ])
-        results_by_num = {str(r['Job #']): r for r in job_results}
+        # Same behaviour as Execute Query, for every job that succeeded:
+        # SELECT jobs open their result window and fill the Results Grid;
+        # data-modification jobs are reported in the log only.
+        # Failed jobs are skipped (they are listed in the log below).
+        select_results = [
+            r for r in job_results
+            if r['_error'] is None and r['_query_type'] == 'select'
+        ]
+        failed_results = [r for r in job_results if r['_error'] is not None]
 
-        def open_job_result(values):
-            result = results_by_num.get(str(values[0]))
-            if not result:
-                return
-            job = result['_job']
-            if result['_error'] is not None:
-                popup_data = pd.DataFrame({"Error": [str(result['_error'])]})
-            elif result['_query_type'] != 'select':
-                popup_data = pd.DataFrame({"Rows affected": [result['_data']]})
-            else:
-                popup_data = result['_data']
-            popup = self.show_table_popup(
-                popup_data,
-                job["query"],
-                job_name=job["name"]
+        if failed_results:
+            self.results_text.insert(
+                tk.END,
+                f"⚠️ Not shown ({len(failed_results)} failed): "
+                + ", ".join(r['Name'] for r in failed_results) + "\n"
             )
-            popup.transient(self.root)
-            popup.lift()
-            popup.focus_force()
 
-        self.results_text.insert(
-            tk.END,
-            "💡 Double-click a job in the summary window to open its result\n"
-        )
+        if select_results:
+            self.results_text.insert(
+                tk.END,
+                f"📊 Opening {len(select_results)} result window(s) — "
+                "also available in the Results Grid tab\n"
+            )
+            self._show_results_grid_sets([
+                (r['Name'], r['_data'], r['_job']['query'])
+                for r in select_results
+            ])
+
+            last_popup = None
+            for r in select_results:
+                job = r['_job']
+                last_popup = self.show_table_popup(
+                    r['_data'],
+                    job["query"],
+                    job_name=job["name"]
+                )
+                last_popup.transient(self.root)
+            if last_popup is not None:
+                last_popup.lift()
+                last_popup.focus_force()
+
         self.results_text.see(tk.END)
-
-        summary_popup = self.show_table_popup(
-            summary_df,
-            "Run All Jobs - Summary",
-            on_double_click=open_job_result,
-            job_name="Run All Jobs Summary"
-        )
-        summary_popup.transient(self.root)
-        summary_popup.lift()
-        summary_popup.focus_force()
 
     def export_jobs_to_excel(self, jobs_override=None):
         """Export ผลลัพธ์ของทุก Job ลง Excel - 1 Job = 1 Sheet (ชื่อ Sheet = ชื่อ Job)"""
@@ -4952,13 +5988,7 @@ class DatabaseConnectorGUI:
         if not file_path:
             return  # User cancelled
 
-        current_profile = self.profile_combo.get()
-
-        jobs = jobs_override if jobs_override is not None else [
-            job
-            for job in self.saved_jobs
-            if job.get("profile") == current_profile
-        ]
+        jobs = jobs_override if jobs_override is not None else self.get_jobs_to_run()
 
         # ---- เขียน log เริ่มต้นลง Results ----
         self.results_text.delete("1.0", tk.END)
@@ -5367,7 +6397,8 @@ class DatabaseConnectorGUI:
         # Load query to editor
         self.sql_context.delete(1.0, tk.END)
         self.sql_context.insert(1.0, job['query'])
-        
+        self._apply_job_excel_state(job)
+
         self.results_text.insert(tk.END, f"📝 Loaded job: {job['name']}\n")
         self.results_text.insert(tk.END, f"   Database: {job.get('database', 'N/A')}\n")
         self.results_text.insert(tk.END, f"   Created: {job.get('created', 'N/A')}\n\n")
@@ -5495,11 +6526,58 @@ class DatabaseConnectorGUI:
 
         self.update_jobs_list()
     
+    def _reset_profile_session_state(self):
+        """Profile load/switch: return Excel + connection indicators to startup defaults.
+
+        Default status bar afterwards: Ready | Not Connected | No Excel Loaded
+        """
+        # Excel session (cached file + parameter state) — same values as __init__
+        self.loaded_excel_data = None
+        self._excel_parameter_values.clear()
+        self._excel_parameterized_sql = None
+        self.sql_template = None
+        self._excel_selected_values = []
+
+        # Connection session
+        self._reset_profile_connection_state(self.engine)
+
+    def _reset_profile_connection_state(self, engine_at_switch):
+        """Clear the previous profile's connection; waits if a query/job is still running."""
+        if self.engine is not engine_at_switch:
+            return  # user already reconnected after the switch — keep the new connection
+
+        busy = any(
+            "Loading" in str(b.cget('text'))
+            for b in (self.execute_btn, self.inspect_btn)
+        ) or (
+            self.engine is not None and
+            str(self.execute_btn['state']) == 'disabled'
+        )
+        if busy:
+            self.root.after(
+                500, lambda: self._reset_profile_connection_state(engine_at_switch)
+            )
+            return
+
+        engine, self.engine = self.engine, None
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+        self.status_label.config(text="❌ Not Connected", foreground="#e74c3c")
+        self.execute_btn.config(state="disabled")
+        self.inspect_btn.config(state="disabled")
+
     def load_profile_data(self, profile_name):
         """โหลดข้อมูลจาก profile"""
         try:
             config = self.saved_profiles[profile_name]
-            
+
+            # Fresh session for this profile: Ready | Not Connected | No Excel Loaded
+            self._reset_profile_session_state()
+
             # Update UI fields
             if "db_type" in config:
                 self.db_type.set(config["db_type"])
@@ -5643,6 +6721,43 @@ class DatabaseConnectorGUI:
             
             messagebox.showinfo("Success", f"ลบ Profile '{profile_name}' เรียบร้อย")
     
+    @staticmethod
+    def _excel_state_for_job(query, template, values, rendered):
+        """Return job fields that keep the Excel parameter state of a query."""
+        query = (query or "").strip()
+        if (
+            values and template is not None and rendered is not None
+            and query == rendered.strip()
+        ):
+            return {
+                "sql_template": template,
+                "excel_parameters": {
+                    key: list(data) for key, data in values.items()
+                },
+            }
+        return {}
+
+    @staticmethod
+    def _excel_state_from_job(job):
+        """Return (template, values, rendered) stored on a job."""
+        query = job.get("query", "")
+        template = job.get("sql_template")
+        stored = job.get("excel_parameters") or {}
+        values = {
+            key: tuple(data) for key, data in stored.items()
+            if isinstance(data, (list, tuple)) and len(data) == 2
+        }
+        if template is None or not values:
+            return query, {}, None
+        return template, values, query
+
+    def _apply_job_excel_state(self, job):
+        """Restore Excel parameter state in the main editor for a loaded job."""
+        template, values, rendered = self._excel_state_from_job(job)
+        self.sql_template = template
+        self._excel_parameter_values = values
+        self._excel_parameterized_sql = rendered
+
     def _capture_sql_template(self, current_sql):
         current_sql = current_sql.rstrip("\n")
         has_rendered_sql = self._excel_parameterized_sql is not None
@@ -5697,12 +6812,47 @@ class DatabaseConnectorGUI:
 
         return ", ".join(formatted_values)
 
-    def _render_sql_template(self):
+    # Marker stored as the "parameter" of an auto WHERE condition built from
+    # an Excel column name (key = "WHERE <column>")
+    AUTO_WHERE_PARAMETER = "__AUTO_WHERE__"
+
+    @staticmethod
+    def _sql_column_identifier(column_name):
+        """Excel header -> SQL column (quoted only if it is not a plain name)."""
+        column_name = str(column_name).strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$#]*(\.[A-Za-z_][A-Za-z0-9_$#]*)*", column_name):
+            return column_name
+        return '"' + column_name.replace('"', '""') + '"'
+
+    @staticmethod
+    def _append_where_conditions(sql, conditions):
+        """Add WHERE (or AND when the SQL already has WHERE) conditions."""
+        if not conditions:
+            return sql
+        body = sql.rstrip()
+        semicolon = ""
+        if body.endswith(";"):
+            body, semicolon = body[:-1].rstrip(), ";"
+        keyword = "AND" if re.search(r"\bWHERE\b", body, flags=re.IGNORECASE) else "WHERE"
+        lines = []
+        for column, sql_values in conditions:
+            lines.append(f"{keyword} {column} IN ({sql_values})")
+            keyword = "AND"
+        return body + "\n" + "\n".join(lines) + semicolon
+
+    def _render_sql_template(self, parameter_values=None):
         import re
 
+        if parameter_values is None:
+            parameter_values = self._excel_parameter_values
+
         rendered_sql = self.sql_template
-        for parameter_key, parameter_data in self._excel_parameter_values.items():
+        where_conditions = []
+        for parameter_key, parameter_data in parameter_values.items():
             parameter, sql_values = parameter_data
+            if parameter == self.AUTO_WHERE_PARAMETER:
+                where_conditions.append((parameter_key[len("WHERE "):], sql_values))
+                continue
             if parameter_key == "__FIRST_IN_LIST__":
                 rendered_sql, replacements = re.subn(
                     r"(\bIN\s*\()\s*[^)]*(\))",
@@ -5733,7 +6883,7 @@ class DatabaseConnectorGUI:
             if not replacements:
                 raise ValueError(f"Parameter {parameter} is not present in the SQL template")
 
-        return rendered_sql
+        return self._append_where_conditions(rendered_sql, where_conditions)
         
     def reset_single_parameter(self, parameter_key):
         if parameter_key not in self._excel_parameter_values:
@@ -5748,7 +6898,7 @@ class DatabaseConnectorGUI:
             )
         except Exception as error:
             self._excel_parameter_values[parameter_key] = previous_value
-            messagebox.showerror("Reset Error", str(error))
+            messagebox.showerror("Reset Error", str(error), parent=self.root)
             return
 
         self.sql_context.delete("1.0", tk.END)
@@ -5768,33 +6918,50 @@ class DatabaseConnectorGUI:
             print("[Excel Parameter Debug] All parameters reset to SQL template")
         messagebox.showinfo(
             "Reset SQL Template",
-            "All parameters have been reset."
+            "All parameters have been reset.",
+            parent=self.root
         )
 
     def show_reset_parameter_dialog(self, close_after_selected=False, wait=False):
         if not self._excel_parameter_values:
-            messagebox.showwarning("Reset Parameter", "No parameter loaded")
+            messagebox.showwarning("Reset Parameter", "No parameter loaded", parent=self.root)
             return
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Reset Parameter")
         dialog.geometry("550x450")
+        dialog.configure(bg=UI['card'])
         dialog.transient(self.root)
         dialog.grab_set()
 
+        # Header
+        header = tk.Frame(dialog, bg=UI['card'])
+        header.pack(fill="x", padx=20, pady=(16, 10))
         ttk.Label(
-            dialog,
+            header,
             text="Select parameter to reset",
-            font=("Arial", 11, "bold")
-        ).pack(pady=(10, 5))
+            font=UI_FONT_TITLE
+        ).pack(anchor="w")
+        tk.Label(
+            header,
+            text="Restore a replaced Excel parameter back to its placeholder in the SQL template.",
+            bg=UI['card'], fg=UI['muted'], font=UI_FONT_SM, wraplength=500, justify="left"
+        ).pack(anchor="w", pady=(2, 0))
+        tk.Frame(dialog, bg=UI['border'], height=1).pack(fill="x")
+
+        tk.Label(dialog, text="LOADED PARAMETERS", bg=UI['card'], fg=UI['muted'],
+                 font=UI_FONT_LABEL).pack(anchor="w", padx=20, pady=(12, 4))
 
         parameter_list = tk.Listbox(
             dialog,
-            font=("Arial", 10),
+            font=UI_FONT_MONO,
             selectmode=tk.SINGLE,
-            exportselection=False
+            exportselection=False,
+            bg='#FFFFFF', fg=UI['text'], relief='flat', bd=0, activestyle='none',
+            highlightthickness=1, highlightbackground=UI['border'], highlightcolor=UI['primary'],
+            selectbackground='#DBEAFE', selectforeground=UI['text']
         )
-        parameter_list.pack(fill="both", expand=True, padx=10, pady=10)
+        parameter_list.pack(fill="both", expand=True, padx=20, pady=(0, 12))
 
         def refresh_parameter_list():
             parameter_list.delete(0, tk.END)
@@ -5821,34 +6988,102 @@ class DatabaseConnectorGUI:
             self.reset_all_parameters()
             dialog.destroy()
 
-        button_frame = ttk.Frame(dialog)
-        button_frame.pack(pady=10)
+        # Footer actions: [Reset All Parameters]            [Close] [Reset Selected]
+        tk.Frame(dialog, bg=UI['border'], height=1).pack(fill="x")
+        button_frame = tk.Frame(dialog, bg=UI['surface'])
+        button_frame.pack(fill="x")
+        _outer, _ = ui_button(button_frame, "Reset All Parameters", reset_all, kind='danger')
+        _outer.pack(side="left", padx=(20, 0), pady=12)
         ttk.Button(
             button_frame,
             text="Reset Selected",
-            command=reset_selected
-        ).pack(side="left", padx=5)
+            command=reset_selected,
+            style='Accent.TButton'
+        ).pack(side="right", padx=(6, 20), pady=12)
         ttk.Button(
             button_frame,
-            text="Reset All Parameters",
-            command=reset_all
-        ).pack(side="left", padx=5)
+            text="Close",
+            command=dialog.destroy
+        ).pack(side="right", pady=12)
 
         refresh_parameter_list()
 
         if wait:
             dialog.wait_window()
 
+    @staticmethod
+    def _read_file_bytes_shared(file_path):
+        """Read a file even while it is open in Excel.
+
+        Python's open() does not allow FILE_SHARE_DELETE, so it fails with
+        PermissionError when Excel holds the workbook. On Windows, fall back to
+        CreateFileW with full sharing (read-only, the file is never modified).
+        """
+        try:
+            with open(file_path, "rb") as file:
+                return file.read()
+        except PermissionError:
+            if os.name != "nt":
+                raise
+
+        from ctypes import wintypes
+
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_ALL = 0x1 | 0x2 | 0x4  # READ | WRITE | DELETE
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.ReadFile.argtypes = [
+            wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p
+        ]
+        kernel32.ReadFile.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        handle = kernel32.CreateFileW(
+            os.path.abspath(file_path), GENERIC_READ, FILE_SHARE_ALL, None,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None
+        )
+        if handle is None or handle == INVALID_HANDLE_VALUE:
+            error_code = ctypes.get_last_error()
+            raise PermissionError(
+                f"Cannot read '{file_path}' (Windows error {error_code}). "
+                "Close the file in Excel and try again."
+            )
+        try:
+            chunks = []
+            buffer = ctypes.create_string_buffer(1024 * 1024)
+            bytes_read = wintypes.DWORD(0)
+            while True:
+                if not kernel32.ReadFile(handle, buffer, len(buffer), ctypes.byref(bytes_read), None):
+                    raise OSError(f"ReadFile failed (Windows error {ctypes.get_last_error()})")
+                if bytes_read.value == 0:
+                    break
+                chunks.append(buffer.raw[:bytes_read.value])
+            return b"".join(chunks)
+        finally:
+            kernel32.CloseHandle(handle)
+
     def load_excel_template_dialog(self, wait=False):
         file_path = filedialog.askopenfilename(
             title="Select Excel File",
-            filetypes=[("Excel Files", "*.xlsx *.xls")]
+            filetypes=[("Excel Files", "*.xlsx *.xls")],
+            parent=self.root
         )
         if not file_path:
             return
 
         try:
-            with pd.ExcelFile(file_path) as workbook:
+            import io
+            excel_bytes = self._read_file_bytes_shared(file_path)
+            with pd.ExcelFile(io.BytesIO(excel_bytes)) as workbook:
                 sheet_names = workbook.sheet_names
             if not sheet_names:
                 raise ValueError("Workbook has no worksheets")
@@ -5856,121 +7091,296 @@ class DatabaseConnectorGUI:
                 self.sql_context.get("1.0", tk.END)
             )
         except Exception as error:
-            messagebox.showerror("Excel Import Error", str(error))
+            messagebox.showerror("Excel Import Error", str(error), parent=self.root)
             return
 
         import re
 
         placeholder_pattern = r"\{\{?\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}?|:[A-Za-z_][A-Za-z0-9_]*"
         placeholders = list(dict.fromkeys(re.findall(placeholder_pattern, sql_template)))
-        parameter_choices = placeholders or ["First IN (...) list"]
+        auto_where_choice = "Auto WHERE (Excel column)"
+        if placeholders:
+            parameter_choices = placeholders + [auto_where_choice]
+        elif re.search(r"\bIN\s*\(", sql_template, flags=re.IGNORECASE):
+            parameter_choices = ["First IN (...) list", auto_where_choice]
+        else:
+            parameter_choices = [auto_where_choice]
         parameter_var = tk.StringVar(value=parameter_choices[0])
         sheet_var = tk.StringVar(value=sheet_names[0])
         sheet_data = {"dataframe": None}
         column_lookup = {}
+        column_var = tk.StringVar()
         self._excel_selected_values = []
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Load Excel SQL Parameters")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.geometry("540x260")
+        dialog.geometry("1150x680")
+        dialog.minsize(900, 560)
 
         content = ttk.Frame(dialog, padding=16)
         content.pack(fill="both", expand=True)
-        content.columnconfigure(1, weight=1)
+        content.columnconfigure(0, weight=1, uniform="panel")
+        content.columnconfigure(1, weight=1, uniform="panel")
+        content.columnconfigure(2, weight=1, uniform="panel")
+        content.rowconfigure(2, weight=1)
 
-        ttk.Label(content, text="Worksheet").grid(row=0, column=0, sticky="w", pady=6)
+        # ---- Top: Worksheet / SQL parameter ----
+        top_frame = ttk.Frame(content)
+        top_frame.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+        ttk.Label(top_frame, text="Worksheet").pack(side="left", padx=(0, 6))
         sheet_combo = ttk.Combobox(
-            content,
+            top_frame,
             textvariable=sheet_var,
             values=sheet_names,
-            state="readonly"
+            state="readonly",
+            width=30
         )
-        sheet_combo.grid(row=0, column=1, sticky="ew", pady=6)
+        sheet_combo.pack(side="left", padx=(0, 20))
 
-        ttk.Label(content, text="Value column").grid(row=1, column=0, sticky="w", pady=6)
-        column_var = tk.StringVar()
-        column_combo = ttk.Combobox(content, textvariable=column_var, state="readonly")
-        column_combo.grid(
-            row=1,
-            column=1,
-            sticky="ew",
-            pady=6
-        )
-
-        ttk.Label(content, text="SQL parameter").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Label(top_frame, text="SQL parameter").pack(side="left", padx=(0, 6))
         parameter_combo = ttk.Combobox(
-            content,
+            top_frame,
             textvariable=parameter_var,
             values=parameter_choices,
-            state="readonly"
+            state="readonly",
+            width=30
         )
-        parameter_combo.grid(row=2, column=1, sticky="ew", pady=6)
+        parameter_combo.pack(side="left")
 
-        def update_columns(_event=None):
+        # ---- Panel titles ----
+        ttk.Label(content, text="Column", font=("Arial", 10, "bold")).grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=(0, 4)
+        )
+        ttk.Label(content, text="ข้อมูลใน Column", font=("Arial", 10, "bold")).grid(
+            row=1, column=1, sticky="w", padx=10, pady=(0, 4)
+        )
+        selected_title = ttk.Label(
+            content, text="ข้อมูลที่เลือกจาก ข้อมูลใน Column", font=("Arial", 10, "bold")
+        )
+        selected_title.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(0, 4))
 
+        # ---- Panel 1: Column list ----
+        column_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
+        column_panel.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
+        column_scroll = ttk.Scrollbar(column_panel, orient="vertical")
+        column_list = tk.Listbox(
+            column_panel,
+            font=("Arial", 10),
+            selectmode=tk.SINGLE,
+            exportselection=False,
+            bd=0,
+            highlightthickness=0,
+            yscrollcommand=column_scroll.set
+        )
+        column_scroll.config(command=column_list.yview)
+        column_scroll.pack(side="right", fill="y")
+        column_list.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+
+        # ---- Panel 2: Values of the column (checkboxes) ----
+        values_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
+        values_panel.grid(row=2, column=1, sticky="nsew", padx=10)
+
+        values_buttons = ttk.Frame(values_panel)
+        values_buttons.pack(side="bottom", pady=8)
+
+        values_area = tk.Frame(values_panel, bg="#ffffff")
+        values_area.pack(side="top", fill="both", expand=True, padx=6, pady=6)
+        values_canvas = tk.Canvas(values_area, bg="#ffffff", highlightthickness=0)
+        values_scroll = ttk.Scrollbar(values_area, orient="vertical", command=values_canvas.yview)
+        values_inner = tk.Frame(values_canvas, bg="#ffffff")
+        values_inner.bind(
+            "<Configure>",
+            lambda _e: values_canvas.configure(scrollregion=values_canvas.bbox("all"))
+        )
+        values_canvas.create_window((0, 0), window=values_inner, anchor="nw")
+        values_canvas.configure(yscrollcommand=values_scroll.set)
+        values_scroll.pack(side="right", fill="y")
+        values_canvas.pack(side="left", fill="both", expand=True)
+
+        def _on_values_wheel(event):
+            values_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        values_canvas.bind("<Enter>", lambda _e: values_canvas.bind_all("<MouseWheel>", _on_values_wheel))
+        values_canvas.bind("<Leave>", lambda _e: values_canvas.unbind_all("<MouseWheel>"))
+
+        # ---- Panel 3: Selected values ----
+        selected_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
+        selected_panel.grid(row=2, column=2, sticky="nsew", padx=(10, 0))
+
+        selected_buttons = ttk.Frame(selected_panel)
+        selected_buttons.pack(side="bottom", pady=8)
+
+        selected_area = tk.Frame(selected_panel, bg="#ffffff")
+        selected_area.pack(side="top", fill="both", expand=True, padx=6, pady=6)
+        selected_scroll = ttk.Scrollbar(selected_area, orient="vertical")
+        selected_list = tk.Listbox(
+            selected_area,
+            font=("Arial", 10),
+            bd=0,
+            highlightthickness=0,
+            activestyle="none",
+            yscrollcommand=selected_scroll.set
+        )
+        selected_scroll.config(command=selected_list.yview)
+        selected_scroll.pack(side="right", fill="y")
+        selected_list.pack(side="left", fill="both", expand=True)
+
+        # ---- Bottom: SQL ----
+        sql_preview = scrolledtext.ScrolledText(
+            content,
+            height=6,
+            font=("Courier", 9),
+            wrap=tk.WORD
+        )
+        sql_preview.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(14, 0))
+
+        # Ticked values are kept per column, so several columns can be chosen
+        column_values = {}      # column -> unique value strings, in Excel order
+        column_selected = {}    # column -> set of ticked value strings
+        value_vars = {}         # value string -> BooleanVar of the shown column
+
+        def is_auto_where():
+            return parameter_var.get() == auto_where_choice
+
+        def selected_of(column_name):
+            chosen = column_selected.get(column_name, set())
+            return [value for value in column_values.get(column_name, []) if value in chosen]
+
+        def columns_with_selection():
+            return [column for column in column_lookup if selected_of(column)]
+
+        def build_pending_values():
+            """Parameter entries that Confirm would add, from the current ticks."""
+            pending = {}
+            if is_auto_where():
+                for column in columns_with_selection():
+                    sql_values = self._format_excel_sql_values(selected_of(column))
+                    if sql_values:
+                        sql_column = self._sql_column_identifier(column)
+                        pending[f"WHERE {sql_column}"] = (self.AUTO_WHERE_PARAMETER, sql_values)
+                return pending
+
+            sql_values = self._format_excel_sql_values(selected_of(column_var.get()))
+            if not sql_values:
+                return pending
+            parameter = parameter_var.get()
+            if parameter == "First IN (...) list":
+                pending["__FIRST_IN_LIST__"] = (parameter, sql_values)
+            else:
+                pending[parameter.lstrip(":").strip("{}").strip().upper()] = (parameter, sql_values)
+            return pending
+
+        def refresh_sql_preview():
+            preview_values = dict(self._excel_parameter_values)
+            preview_values.update(build_pending_values())
             try:
+                preview_sql = self._render_sql_template(preview_values)
+            except ValueError as error:
+                preview_sql = f"{sql_template}\n\n-- {error}"
+            sql_preview.config(state="normal")
+            sql_preview.delete("1.0", tk.END)
+            sql_preview.insert("1.0", preview_sql)
+            sql_preview.config(state="disabled")
 
-                dataframe = pd.read_excel(
-                    file_path,
-                    sheet_name=sheet_var.get()
+        def refresh_selected_list():
+            selected_list.delete(0, tk.END)
+            if is_auto_where():
+                total = 0
+                for column in columns_with_selection():
+                    values = selected_of(column)
+                    total += len(values)
+                    selected_list.insert(tk.END, f"[{column}]")
+                    selected_list.itemconfig(tk.END, fg="#2c3e50")
+                    for value in values:
+                        selected_list.insert(tk.END, f"    {value}")
+                selected_title.config(
+                    text=f"ข้อมูลที่เลือกจาก ข้อมูลใน Column ({total})"
                 )
-
-                sheet_data["dataframe"] = dataframe
-
-                column_lookup.clear()
-
-                column_lookup.update({
-                    str(column): column
-                    for column in dataframe.columns
-                })
-
-                column_names = list(column_lookup.keys())
-
-                column_combo["values"] = column_names
-                if column_names:
-                    column_var.set(column_names[0])
-                else:
-                    column_var.set("")
-
-            except Exception as error:
-
-                messagebox.showerror(
-                    "Excel Import Error",
-                    str(error),
-                    parent=dialog
+            else:
+                values = selected_of(column_var.get())
+                for value in values:
+                    selected_list.insert(tk.END, value)
+                selected_title.config(
+                    text=f"ข้อมูลที่เลือกจาก ข้อมูลใน Column ({len(values)} / {len(value_vars)})"
                 )
+            refresh_sql_preview()
 
-        def preview_excel_column(_event=None):
+        def on_value_toggled(value_str, var):
+            chosen = column_selected.setdefault(column_var.get(), set())
+            if var.get():
+                chosen.add(value_str)
+            else:
+                chosen.discard(value_str)
+            refresh_selected_list()
+
+        def show_column_values(_event=None):
+            for widget in values_inner.winfo_children():
+                widget.destroy()
+            value_vars.clear()
 
             dataframe = sheet_data["dataframe"]
+            selection = column_list.curselection()
+            if dataframe is not None and selection:
+                column_name = column_list.get(selection[0])
+                column_var.set(column_name)
+                if column_name not in column_values:
+                    unique_values = []
+                    for value in dataframe[column_lookup[column_name]].dropna().tolist():
+                        value_str = str(value)
+                        if value_str not in unique_values:
+                            unique_values.append(value_str)
+                    column_values[column_name] = unique_values
+                chosen = column_selected.get(column_name, set())
+                for value_str in column_values[column_name]:
+                    var = tk.BooleanVar(value=value_str in chosen)
+                    value_vars[value_str] = var
+                    tk.Checkbutton(
+                        values_inner,
+                        text=value_str,
+                        variable=var,
+                        anchor="w",
+                        bg="#ffffff",
+                        command=lambda v=value_str, b=var: on_value_toggled(v, b)
+                    ).pack(fill="x", anchor="w")
+            else:
+                column_var.set("")
 
-            column_name = column_var.get()
+            values_canvas.yview_moveto(0)
+            refresh_selected_list()
 
-            if (
-                dataframe is None
-                or
-                column_name not in column_lookup
-            ):
-                return
+        def update_columns(_event=None):
+            column_values.clear()
+            column_selected.clear()
+            try:
+                dataframe = pd.read_excel(io.BytesIO(excel_bytes), sheet_name=sheet_var.get())
+                sheet_data["dataframe"] = dataframe
+                column_lookup.clear()
+                column_lookup.update({str(column): column for column in dataframe.columns})
+            except Exception as error:
+                sheet_data["dataframe"] = None
+                column_lookup.clear()
+                messagebox.showerror("Excel Import Error", str(error), parent=dialog)
 
-            values = (
-                dataframe[
-                    column_lookup[column_name]
-                ]
-                .dropna()
-                .tolist()
-            )
+            column_list.delete(0, tk.END)
+            for column_name in column_lookup:
+                column_list.insert(tk.END, column_name)
+            if column_lookup:
+                column_list.selection_set(0)
+            show_column_values()
 
-            selected_values = self.show_excel_value_selector(
-                column_name,
-                values
-            )
+        def set_all_values(checked):
+            chosen = column_selected.setdefault(column_var.get(), set())
+            for value_str, var in value_vars.items():
+                var.set(checked)
+                if checked:
+                    chosen.add(value_str)
+                else:
+                    chosen.discard(value_str)
+            refresh_selected_list()
 
-            if selected_values:
-                self._excel_selected_values = selected_values
-        
         def apply_parameters():
             dataframe = sheet_data["dataframe"]
             column_name = column_var.get()
@@ -5978,34 +7388,36 @@ class DatabaseConnectorGUI:
                 messagebox.showwarning("Excel Import", "Select a value column", parent=dialog)
                 return
 
-            values = self._excel_selected_values
+            if is_auto_where():
+                used_columns = columns_with_selection()
+                values = [value for column in used_columns for value in selected_of(column)]
+            else:
+                used_columns = [column_name]
+                values = selected_of(column_name)
+            self._excel_selected_values = values
 
             if not values:
-
                 messagebox.showwarning(
                     "Excel Import",
                     "Please select values first",
                     parent=dialog
                 )
-
                 return
-            sql_values = self._format_excel_sql_values(values)
-            if not sql_values:
+
+            pending = build_pending_values()
+            if not pending:
                 messagebox.showwarning("Excel Import", "Selected column has no values", parent=dialog)
                 return
 
             parameter = parameter_var.get()
-            if parameter == "First IN (...) list":
-                parameter_key = "__FIRST_IN_LIST__"
-                self._excel_parameter_values[parameter_key] = (parameter, sql_values)
-            else:
-                parameter_key = parameter.lstrip(":").strip("{}").strip().upper()
-                self._excel_parameter_values[parameter_key] = (parameter, sql_values)
+            previous_values = dict(self._excel_parameter_values)
+            self._excel_parameter_values.update(pending)
 
             try:
                 rendered_sql = self._render_sql_template()
             except ValueError as error:
-                self._excel_parameter_values.pop(parameter_key, None)
+                self._excel_parameter_values.clear()
+                self._excel_parameter_values.update(previous_values)
                 messagebox.showwarning("SQL Parameter Not Found", str(error), parent=dialog)
                 return
 
@@ -6016,36 +7428,39 @@ class DatabaseConnectorGUI:
             if self.debug_mode.get():
                 print(
                     f"[Excel Parameter Debug] file={os.path.basename(file_path)!r}, "
-                    f"sheet={sheet_var.get()!r}, column={column_name!r}, "
+                    f"sheet={sheet_var.get()!r}, columns={used_columns!r}, "
                     f"parameter={parameter!r}, values={len(values)}, "
                     f"replaced_parameters={list(self._excel_parameter_values)}"
                 )
+            if is_auto_where():
+                target = "WHERE " + " AND ".join(used_columns)
+            else:
+                target = parameter
             messagebox.showinfo(
                 "Excel Parameters Loaded",
-                f"Loaded {len(values)} values from {column_name} into {parameter}.",
+                f"Loaded {len(values)} values from {', '.join(used_columns)} into {target}.",
                 parent=dialog
             )
             dialog.destroy()
 
-        sheet_combo.bind(
-            "<<ComboboxSelected>>",
-            update_columns
-        )
+        ttk.Button(values_buttons, text="Cancel", command=lambda: set_all_values(False)).pack(side="left", padx=4)
+        ttk.Button(values_buttons, text="Select All", command=lambda: set_all_values(True)).pack(side="left", padx=4)
+        ttk.Button(selected_buttons, text="Cancel", command=dialog.destroy).pack(side="left", padx=4)
+        ttk.Button(selected_buttons, text="Confirm", command=apply_parameters).pack(side="left", padx=4)
 
-        column_combo.bind(
-            "<<ComboboxSelected>>",
-            preview_excel_column
+        sheet_combo.bind("<<ComboboxSelected>>", update_columns)
+        column_list.bind("<<ListboxSelect>>", show_column_values)
+        parameter_combo.bind("<<ComboboxSelected>>", lambda _e: refresh_selected_list())
+        dialog.bind(
+            "<Destroy>",
+            lambda e: values_canvas.unbind_all("<MouseWheel>") if e.widget is dialog else None
         )
 
         update_columns()
-        button_frame = ttk.Frame(content)
-        button_frame.grid(row=3, column=0, columnspan=2, sticky="e", pady=(16, 0))
-        ttk.Button(button_frame, text="Replace Parameter", command=apply_parameters).pack(side="left", padx=4)
-        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side="left", padx=4)
 
         if wait:
             dialog.wait_window()
-    
+
     def show_excel_value_selector(self, column_name, values):
 
         dialog = tk.Toplevel(self.root)
