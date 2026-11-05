@@ -11,6 +11,98 @@ import traceback
 import sys
 import base64
 import ctypes
+import datetime as _dt
+import decimal
+
+
+# ===================================================
+# Show query results the same way DBeaver does
+# (column names as the database returns them, exact numbers,
+#  [NULL] for nulls, DBeaver's default date/time formats)
+# ===================================================
+
+DB_NULL_TEXT = "[NULL]"
+DB_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"   # shown as yyyy-MM-dd HH:mm:ss.SSS
+DB_DATE_FORMAT = "%Y-%m-%d"
+DB_TIME_FORMAT = "%H:%M:%S"
+
+
+def format_db_value(value, null_text=DB_NULL_TEXT):
+    """Text for one result cell, matching DBeaver's grid."""
+    if value is None or value is pd.NaT:
+        return null_text
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return null_text
+        if value.is_integer() and abs(value) < 1e16:
+            return str(int(value))
+        return format(decimal.Decimal(repr(value)), "f")
+    if isinstance(value, decimal.Decimal):
+        if value.is_nan():
+            return null_text
+        return format(value, "f")
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (_dt.datetime, pd.Timestamp)):
+        return value.strftime(DB_TIMESTAMP_FORMAT)[:-3]  # milliseconds
+    if isinstance(value, _dt.date):
+        return value.strftime(DB_DATE_FORMAT)
+    if isinstance(value, _dt.time):
+        return value.strftime(DB_TIME_FORMAT)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex().upper()
+    return str(value)
+
+
+EXCEL_MAX_EXACT_DIGITS = 15  # Excel keeps only 15 significant digits
+
+
+def excel_db_value(value):
+    """Value for an export cell: numbers and dates keep their real type.
+
+    NULL becomes [NULL]. Numbers longer than Excel can store exactly
+    (more than 15 digits, e.g. long account numbers) are written as text
+    so no digit is lost.
+    """
+    if value is None or value is pd.NaT:
+        return DB_NULL_TEXT
+    if isinstance(value, bool):
+        return format_db_value(value)
+    if isinstance(value, float):
+        if value != value:
+            return DB_NULL_TEXT
+        return int(value) if value.is_integer() and abs(value) < 1e15 else value
+    if isinstance(value, (int, decimal.Decimal)):
+        number = decimal.Decimal(value)
+        if not number.is_finite():
+            return DB_NULL_TEXT
+        if len(number.as_tuple().digits) > EXCEL_MAX_EXACT_DIGITS:
+            return format_db_value(value)
+        return int(number) if number == number.to_integral_value() else float(number)
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, _dt.datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, (_dt.date, _dt.time)):
+        return value
+    return format_db_value(value)
+
+
+def excel_number_format(value):
+    """Excel display format for a cell written from excel_db_value()."""
+    if isinstance(value, _dt.datetime):
+        return "yyyy-mm-dd hh:mm:ss.000"
+    if isinstance(value, _dt.date):
+        return "yyyy-mm-dd"
+    if isinstance(value, _dt.time):
+        return "hh:mm:ss"
+    if isinstance(value, bool):
+        return "@"
+    if isinstance(value, int):
+        return "0"
+    if isinstance(value, float):
+        return "General"
+    return "@"
 
 
 # ===================================================
@@ -422,6 +514,9 @@ class DialogTheme:
 
 class DatabaseConnectorGUI:
 
+    # Starter query shown in the SQL editor (app start, new / empty profiles)
+    DEFAULT_SQL_QUERY = "SELECT * FROM Table WHERE Column1 IN ({ACCOUNT_LIST})"
+
     def __init__(self, root):
         self.root = root
         self.root.title("Database Connector")
@@ -632,6 +727,10 @@ class DatabaseConnectorGUI:
         self.update_profile_list()
         self.profile_combo.bind('<<ComboboxSelected>>', self.on_profile_selected)
 
+        profile_new_outer, _ = ui_button(profile_frame, "➕ New", self.new_profile_dialog,
+                                         kind='primary', size='sm')
+        profile_new_outer.pack(side=tk.LEFT, padx=(0, 6))
+
         profile_save_outer, _ = ui_button(profile_frame, "💾 Save", self.save_profile_dialog,
                                           kind='primary', size='sm')
         profile_save_outer.pack(side=tk.LEFT, padx=(0, 6))
@@ -648,9 +747,21 @@ class DatabaseConnectorGUI:
             _outer, _ = ui_button(profile_frame, _text, _cmd, kind='secondary', size='sm')
             _outer.pack(side=tk.LEFT, padx=(0, 6))
 
+        # Collapsible toggle for the credentials grid (hidden by default)
+        creds_toggle_row = tk.Frame(settings_frame, bg=UI['card'])
+        creds_toggle_row.pack(fill='x', padx=16, pady=(8, 4))
+        self.creds_toggle_btn = tk.Button(creds_toggle_row, text="▸ Show connection details",
+                                          bg=UI['card'], fg=UI['primary'], font=UI_FONT_LABEL,
+                                          activebackground=UI['card'], activeforeground=UI['primary_hover'],
+                                          relief='flat', bd=0, highlightthickness=0, cursor='hand2')
+        self.creds_toggle_btn.pack(side=tk.LEFT)
+        creds_summary = tk.Label(creds_toggle_row, text="", bg=UI['card'], fg=UI['subtle'],
+                                 font=UI_FONT_SM)
+        creds_summary.pack(side=tk.LEFT, padx=(10, 0))
+
         # 2-column credentials grid
         form = tk.Frame(settings_frame, bg=UI['card'])
-        form.pack(fill='x', padx=16, pady=(8, 4))
+        self.creds_expanded = False
         form.columnconfigure(0, weight=1, uniform='conn')
         form.columnconfigure(1, weight=1, uniform='conn')
 
@@ -708,7 +819,7 @@ class DatabaseConnectorGUI:
         self.toggle_password_btn.pack(fill='both', expand=True, padx=1, pady=1)
 
         # Database Name
-        _cell = _field(2, 1, "DATABASE (OPTIONAL)")
+        _cell = _field(2, 1, "DATABASE")
         self.db_name = ttk.Entry(_cell, width=40, font=UI_FONT, style='Fluent.TEntry')
         self.db_name.grid(row=1, column=0, sticky=(tk.W, tk.E))
         self.db_name.insert(0, "test")
@@ -749,6 +860,33 @@ class DatabaseConnectorGUI:
 
         for _ew in (self.db_user, self.db_password, self.db_host, self.db_port, self.db_name):
             _ew.bind('<Control-KeyPress>', _entry_ctrl_key)
+
+        def _refresh_creds_summary():
+            try:
+                if self.creds_expanded:
+                    creds_summary.config(text="")
+                else:
+                    host = self.db_host.get().strip()
+                    port = self.db_port.get().strip()
+                    user = self.db_user.get().strip()
+                    dbn = self.db_name.get().strip()
+                    target = f"{user}@{host}" + (f":{port}" if port else "") + (f"/{dbn}" if dbn else "")
+                    creds_summary.config(text=f"{self.db_type.get()} · {target}")
+            except tk.TclError:
+                return
+            self.root.after(500, _refresh_creds_summary)
+
+        def _toggle_creds():
+            self.creds_expanded = not self.creds_expanded
+            if self.creds_expanded:
+                form.pack(fill='x', padx=16, pady=(4, 4), after=creds_toggle_row)
+                self.creds_toggle_btn.config(text="▾ Hide connection details")
+            else:
+                form.pack_forget()
+                self.creds_toggle_btn.config(text="▸ Show connection details")
+
+        self.creds_toggle_btn.config(command=_toggle_creds)
+        _refresh_creds_summary()
 
         # Connect button + live status badge
         tk.Frame(settings_frame, bg=UI['border'], height=1).pack(fill='x', pady=(6, 0))
@@ -865,10 +1003,7 @@ class DatabaseConnectorGUI:
             relief='flat', bd=0, highlightthickness=0, padx=10, pady=8
         )
         self.sql_context.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 1), pady=1)
-        self.sql_context.insert(
-                1.0,
-                "SELECT * FROM Table WHERE Column1 IN ({ACCOUNT_LIST})"
-                )
+        self.sql_context.insert(1.0, self.DEFAULT_SQL_QUERY)
         # Defer edit_reset so it runs after widget is fully ready — clears undo stack to fresh start
         self.sql_context.after(200, self.sql_context.edit_reset)
 
@@ -3524,7 +3659,7 @@ class DatabaseConnectorGUI:
                         print("🔍 DEBUG: Detected SELECT query")
                     
                     # Execute SELECT query and get results
-                    df = pd.read_sql_query(sql_query, self.engine)
+                    df = self.read_sql_dataframe(sql_query)
                     
                     if self.debug_mode.get():
                         print(f"✅ DEBUG: Query successful - {len(df)} rows, {df.shape[1]} columns")
@@ -4490,6 +4625,60 @@ class DatabaseConnectorGUI:
             self.results_text.see(tk.END)
             messagebox.showerror("Connection Error", str(error))
     
+    def read_sql_dataframe(self, sql_query):
+        """Run a SELECT through the driver cursor and keep values as returned.
+
+        Unlike pd.read_sql_query this keeps column names exactly as the
+        database sends them (Oracle: upper case), fetches Oracle NUMBER as
+        Decimal (no float rounding of long numbers), reads LOBs as text and
+        keeps NULL as None — so the result matches DBeaver.
+        """
+        sql = sql_query.strip()
+        # DBeaver accepts a trailing ';' or '/', the driver does not
+        while sql.endswith(";") or (sql.endswith("/") and not sql.endswith("*/")):
+            sql = sql[:-1].rstrip()
+
+        raw_connection = self.engine.raw_connection()
+        try:
+            dbapi_connection = getattr(raw_connection, "driver_connection", None) or raw_connection
+            cursor = raw_connection.cursor()
+            try:
+                if self.engine.dialect.name == "oracle":
+                    import oracledb
+
+                    def _output_type_handler(cur, metadata):
+                        type_code = metadata.type_code
+                        if type_code is oracledb.DB_TYPE_NUMBER:
+                            return cur.var(decimal.Decimal, arraysize=cur.arraysize)
+                        if type_code is oracledb.DB_TYPE_CLOB:
+                            return cur.var(oracledb.DB_TYPE_LONG, arraysize=cur.arraysize)
+                        if type_code is oracledb.DB_TYPE_NCLOB:
+                            return cur.var(oracledb.DB_TYPE_LONG_NVARCHAR, arraysize=cur.arraysize)
+                        if type_code is oracledb.DB_TYPE_BLOB:
+                            return cur.var(oracledb.DB_TYPE_LONG_RAW, arraysize=cur.arraysize)
+                        return None
+
+                    driver_cursor = getattr(cursor, "cursor", cursor)
+                    try:
+                        driver_cursor.outputtypehandler = _output_type_handler
+                    except AttributeError:
+                        dbapi_connection.outputtypehandler = _output_type_handler
+                    driver_cursor.arraysize = 1000
+
+                cursor.execute(sql)
+                if cursor.description is None:
+                    return pd.DataFrame()
+                columns = [str(column[0]) for column in cursor.description]
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+        finally:
+            raw_connection.close()
+
+        df = pd.DataFrame(list(rows), columns=columns, dtype=object) if rows else \
+            pd.DataFrame(columns=columns, dtype=object)
+        return df
+
     def is_select_query(self, query):
         """Check if query is a SELECT statement"""
         query_upper = query.strip().upper()
@@ -4746,13 +4935,13 @@ class DatabaseConnectorGUI:
         start = page * size
         sample = df.iloc[start:start + 50]
         for pos, col in enumerate(columns):
-            longest_value = max([0] + [len(str(v)) for v in sample.iloc[:, pos]])
+            longest_value = max([0] + [len(format_db_value(v)) for v in sample.iloc[:, pos]])
             width = max(len(col) * 10, longest_value * 8) + 24
             tree.heading(col, text=col, anchor='w')
             tree.column(col, width=min(360, max(90, width)), anchor='w', stretch=False)
 
         for i, row in enumerate(df.iloc[start:start + size].itertuples(index=False, name=None)):
-            values = ["" if v is None or (isinstance(v, float) and v != v) else str(v) for v in row]
+            values = [format_db_value(v) for v in row]
             tree.insert('', 'end', values=values, tags=('odd',) if i % 2 else ())
 
         end = min(start + size, len(df))
@@ -4954,7 +5143,7 @@ class DatabaseConnectorGUI:
             # Insert data for current page
             for idx in range(start_row, end_row):
                 row = df.iloc[idx]
-                values = [str(val) if pd.notna(val) else '' for val in row]
+                values = [format_db_value(val) for val in row]
                 tree.insert('', tk.END, values=values)
 
             # Update page info
@@ -5060,7 +5249,9 @@ class DatabaseConnectorGUI:
                 filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
             )
             if file_path:
-                df.to_csv(file_path, index=False, encoding='utf-8-sig')
+                # Same text as the result grid (DBeaver style), NULL → [NULL]
+                df.apply(lambda col: col.map(format_db_value)).to_csv(
+                    file_path, index=False, encoding='utf-8-sig')
                 messagebox.showinfo("Success", f"Data exported successfully!\n\nFile: {file_path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export: {str(e)}")
@@ -5614,6 +5805,11 @@ class DatabaseConnectorGUI:
             )
             if status == "success":
                 self._finish_job_result_report(1, 1, 0)
+                # Same as Execute Query: mirror SELECT results into the Results Grid tab
+                if query_type == "select" and result_data is not None:
+                    self._show_results_grid_sets([
+                        (job.get("name"), result_data, sql_query)
+                    ])
             else:
                 self._finish_job_result_report(1, 0, 1)
 
@@ -5622,7 +5818,7 @@ class DatabaseConnectorGUI:
             start_time = time.perf_counter()
             try:
                 if self.is_select_query(sql_query):
-                    result_data = pd.read_sql_query(sql_query, self.engine)
+                    result_data = self.read_sql_dataframe(sql_query)
                     query_type = "select"
                 else:
                     with self.engine.connect() as conn:
@@ -5667,9 +5863,26 @@ class DatabaseConnectorGUI:
         if not self.engine:
             messagebox.showerror("Error", "Please connect to database first")
             return
-        
+
+        # Ignore extra clicks while a run is in progress (each click would
+        # otherwise start another run and open another set of popups)
+        if getattr(self, "_batch_running", False):
+            return
+        self._batch_running = True
+        self.run_all_btn.config(state="disabled")
+
+        # Close result windows left over from the previous Run Selected/All,
+        # so only the jobs of this run are shown
+        for old_popup in getattr(self, "_batch_popups", []):
+            try:
+                if old_popup.winfo_exists():
+                    old_popup.destroy()
+            except tk.TclError:
+                pass
+        self._batch_popups = []
+
         self._start_job_result_report()
-        
+
         # Disable buttons during execution
         self.execute_btn.config(state="disabled")
         self.inspect_btn.config(state="disabled")
@@ -5693,7 +5906,7 @@ class DatabaseConnectorGUI:
                         # Check if it's a SELECT query or data modification
                         if self.is_select_query(job['query']):
                             # Execute SELECT query
-                            df = pd.read_sql_query(job['query'], self.engine)
+                            df = self.read_sql_dataframe(job['query'])
                             elapsed_time = time_module.time() - start_time
                             
                             # Store result
@@ -5905,6 +6118,8 @@ class DatabaseConnectorGUI:
         self.execute_btn.config(state="normal")
         self.inspect_btn.config(state="normal")
         self.save_job_btn.config(state="normal")
+        self._batch_running = False
+        self.run_all_btn.config(state="normal")
         self._finish_job_result_report(
             success_count + error_count,
             success_count,
@@ -5951,6 +6166,7 @@ class DatabaseConnectorGUI:
                     job_name=job["name"]
                 )
                 last_popup.transient(self.root)
+                self._batch_popups.append(last_popup)
             if last_popup is not None:
                 last_popup.lift()
                 last_popup.focus_force()
@@ -6085,7 +6301,7 @@ class DatabaseConnectorGUI:
                             df = (
                                 preloaded_df.copy()
                                 if preloaded_df is not None
-                                else pd.read_sql_query(query, self.engine)
+                                else self.read_sql_dataframe(query)
                             )
                             query_elapsed = (
                                 time_module.time()
@@ -6125,9 +6341,6 @@ class DatabaseConnectorGUI:
                                 continue
                             def clean_value(x):
 
-                                if pd.isna(x):
-                                    return ""
-
                                 if isinstance(x, bytes):
 
                                     try:
@@ -6141,16 +6354,21 @@ class DatabaseConnectorGUI:
                                         except Exception:
                                             x = str(x)
 
-                                value = str(x)
-
-                                value = value.replace("\x00", "")
+                                # Numbers / dates stay real Excel numbers / dates
+                                # (like DBeaver); NULL becomes [NULL]
+                                typed = excel_db_value(x)
+                                if not isinstance(typed, str):
+                                    return typed
+                                value = typed.replace("\x00", "")
 
                                 value = illegal_chars.sub(
                                     "",
                                     value
                                 )
 
-                                return value.strip()
+                                # Keep leading/trailing spaces (e.g. CHAR columns)
+                                # so the data matches the database exactly
+                                return value
 
                             for col in df.columns:
 
@@ -6309,7 +6527,7 @@ class DatabaseConnectorGUI:
                                     max_row=data_last_row
                                 ):
                                     for cell in row:
-                                        cell.number_format = "@"
+                                        cell.number_format = excel_number_format(cell.value)
                                         cell.border = all_border
                                     
                             # Header ต้องมีสีเสมอ แม้ไม่มี Data
@@ -6360,8 +6578,10 @@ class DatabaseConnectorGUI:
         self.execute_btn.config(state="normal")
         self.inspect_btn.config(state="normal")
         self.save_job_btn.config(state="normal")
-        
-    
+        self._batch_running = False
+        self.run_all_btn.config(state="normal")
+
+
     def show_critical_error(self, operation, error_msg):
         """Show critical error message when data modification fails"""
         self.results_text.insert(tk.END, f"\n{'='*150}\n")
@@ -6602,7 +6822,9 @@ class DatabaseConnectorGUI:
                 self.db_name.insert(0, config["db_name"])
             if "sql_query" in config:
                 self.sql_context.delete(1.0, tk.END)
-                self.sql_context.insert(1.0, config["sql_query"])
+                self.sql_context.insert(
+                    1.0, config["sql_query"].strip() or self.DEFAULT_SQL_QUERY
+                )
             
             self.results_text.insert(
                 tk.END,
@@ -6699,6 +6921,112 @@ class DatabaseConnectorGUI:
         ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
     
+    def new_profile_dialog(self):
+        """แสดง dialog สำหรับสร้าง Profile ใหม่ (กรอกข้อมูลการเชื่อมต่อทั้งหมด)"""
+        port_defaults = {
+            'PostgreSQL': '5432',
+            'MySQL': '3306',
+            'Microsoft SQL Server': '1433',
+            'Oracle': '1521'
+        }
+
+        dialog = self._create_centered_dialog("➕ New Profile", 460, 540)
+        dialog.configure(bg=UI['card'])
+        dialog.resizable(False, False)
+
+        body = tk.Frame(dialog, bg=UI['card'])
+        body.pack(fill='both', expand=True, padx=20, pady=16)
+        body.columnconfigure(0, weight=1)
+
+        tk.Label(body, text="Create New Profile", bg=UI['card'], fg=UI['text'],
+                 font=('Segoe UI', 12, 'bold')).grid(row=0, column=0, sticky='w', pady=(0, 10))
+
+        row = [1]
+
+        def _add(label, widget_factory):
+            ui_field_label(body, label).grid(row=row[0], column=0, sticky='w', pady=(4, 2))
+            w = widget_factory()
+            w.grid(row=row[0] + 1, column=0, sticky='ew')
+            row[0] += 2
+            return w
+
+        name_entry = _add("PROFILE NAME", lambda: ttk.Entry(body, font=UI_FONT, style='Fluent.TEntry'))
+        type_combo = _add("DATABASE TYPE", lambda: ttk.Combobox(
+            body, state="readonly", font=UI_FONT, style='Fluent.TCombobox',
+            values=tuple(port_defaults.keys())))
+        type_combo.current(0)
+        host_entry = _add("HOST", lambda: ttk.Entry(body, font=UI_FONT, style='Fluent.TEntry'))
+        port_entry = _add("PORT", lambda: ttk.Entry(body, font=UI_FONT, style='Fluent.TEntry'))
+        port_entry.insert(0, port_defaults['PostgreSQL'])
+        user_entry = _add("USER", lambda: ttk.Entry(body, font=UI_FONT, style='Fluent.TEntry'))
+        pass_entry = _add("PASSWORD", lambda: ttk.Entry(body, show="*", font=UI_FONT,
+                                                        style='Fluent.TEntry'))
+        dbname_entry = _add("DATABASE", lambda: ttk.Entry(body, font=UI_FONT,
+                                                                      style='Fluent.TEntry'))
+
+        def _on_type_change(_e=None):
+            port_entry.delete(0, tk.END)
+            port_entry.insert(0, port_defaults.get(type_combo.get(), '5432'))
+
+        type_combo.bind('<<ComboboxSelected>>', _on_type_change)
+        name_entry.focus_set()
+
+        def create():
+            profile_name = name_entry.get().strip()
+            if not profile_name:
+                messagebox.showwarning("Warning", "กรุณาใส่ชื่อ Profile", parent=dialog)
+                name_entry.focus_set()
+                return
+            if profile_name == 'last_used_profile':
+                messagebox.showwarning("Warning", "ชื่อนี้สงวนไว้ กรุณาใช้ชื่ออื่น", parent=dialog)
+                return
+            if profile_name in self.saved_profiles:
+                messagebox.showwarning("Warning", f"มี Profile '{profile_name}' อยู่แล้ว\n"
+                                       "กรุณาใช้ชื่ออื่น", parent=dialog)
+                name_entry.focus_set()
+                return
+            if not host_entry.get().strip():
+                messagebox.showwarning("Warning", "กรุณาใส่ Host", parent=dialog)
+                host_entry.focus_set()
+                return
+
+            port_value = port_entry.get().strip()
+            if ':' in port_value:
+                port_value = port_value.split(':')[0]
+
+            self.saved_profiles[profile_name] = {
+                'db_type': type_combo.get(),
+                'db_user': user_entry.get().strip(),
+                'db_password': pass_entry.get(),
+                'db_host': host_entry.get().strip(),
+                'db_port': port_value,
+                'db_name': dbname_entry.get().strip(),
+                'sql_query': self.DEFAULT_SQL_QUERY
+            }
+            self.save_profiles()
+            self.save_last_used_profile(profile_name)
+
+            # เลือก Profile ใหม่และโหลดข้อมูลเข้าฟอร์ม
+            self.update_profile_list()
+            profile_names = list(self.saved_profiles.keys())
+            self.profile_combo.current(profile_names.index(profile_name))
+            self.load_profile_data(profile_name)
+
+            self.results_text.insert(tk.END, f"➕ Created profile: {profile_name}\n\n")
+            self.results_text.see(tk.END)
+            dialog.destroy()
+            messagebox.showinfo("Success", f"สร้าง Profile '{profile_name}' เรียบร้อย")
+
+        btn_frame = tk.Frame(body, bg=UI['card'])
+        btn_frame.grid(row=row[0], column=0, sticky='e', pady=(16, 0))
+        _cancel_outer, _ = ui_button(btn_frame, "Cancel", dialog.destroy, kind='secondary', size='sm')
+        _cancel_outer.pack(side=tk.RIGHT)
+        _create_outer, _ = ui_button(btn_frame, "➕ Create", create, kind='primary', size='sm')
+        _create_outer.pack(side=tk.RIGHT, padx=(0, 6))
+
+        dialog.bind('<Return>', lambda _e: create())
+        dialog.bind('<Escape>', lambda _e: dialog.destroy())
+
     def delete_profile(self):
         """ลบ profile ที่เลือก"""
         profile_name = self.profile_combo.get()
@@ -6952,34 +7280,62 @@ class DatabaseConnectorGUI:
         tk.Label(dialog, text="LOADED PARAMETERS", bg=UI['card'], fg=UI['muted'],
                  font=UI_FONT_LABEL).pack(anchor="w", padx=20, pady=(12, 4))
 
-        parameter_list = tk.Listbox(
-            dialog,
-            font=UI_FONT_MONO,
-            selectmode=tk.SINGLE,
-            exportselection=False,
-            bg='#FFFFFF', fg=UI['text'], relief='flat', bd=0, activestyle='none',
-            highlightthickness=1, highlightbackground=UI['border'], highlightcolor=UI['primary'],
-            selectbackground='#DBEAFE', selectforeground=UI['text']
-        )
-        parameter_list.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        # Checkbox list (scrollable) so several parameters can be reset at once
+        list_border = tk.Frame(dialog, bg='#FFFFFF', highlightthickness=1,
+                               highlightbackground=UI['border'])
+        list_border.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+        list_scroll = ttk.Scrollbar(list_border, orient="vertical")
+        list_canvas = tk.Canvas(list_border, bg='#FFFFFF', highlightthickness=0, bd=0,
+                                yscrollcommand=list_scroll.set)
+        list_scroll.config(command=list_canvas.yview)
+        list_scroll.pack(side="right", fill="y")
+        list_canvas.pack(side="left", fill="both", expand=True)
+        list_inner = tk.Frame(list_canvas, bg='#FFFFFF')
+        inner_window = list_canvas.create_window((0, 0), window=list_inner, anchor="nw")
+        list_inner.bind("<Configure>",
+                        lambda _e: list_canvas.configure(scrollregion=list_canvas.bbox("all")))
+        list_canvas.bind("<Configure>",
+                         lambda e: list_canvas.itemconfigure(inner_window, width=e.width))
+
+        def _on_list_wheel(event):
+            if list_inner.winfo_height() > list_canvas.winfo_height():
+                list_canvas.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        list_canvas.bind("<MouseWheel>", _on_list_wheel)
+        list_inner.bind("<MouseWheel>", _on_list_wheel)
+
+        parameter_vars = {}  # parameter key -> BooleanVar
 
         def refresh_parameter_list():
-            parameter_list.delete(0, tk.END)
+            for widget in list_inner.winfo_children():
+                widget.destroy()
+            parameter_vars.clear()
             for parameter_key in self._excel_parameter_values:
-                parameter_list.insert(tk.END, parameter_key)
+                var = tk.BooleanVar(value=False)
+                parameter_vars[parameter_key] = var
+                check = tk.Checkbutton(
+                    list_inner, text=parameter_key, variable=var, anchor="w",
+                    font=UI_FONT_MONO, bg='#FFFFFF', fg=UI['text'],
+                    activebackground='#DBEAFE', selectcolor='#FFFFFF',
+                    relief='flat', bd=0, highlightthickness=0
+                )
+                check.pack(fill="x", anchor="w", padx=6, pady=1)
+                check.bind("<MouseWheel>", _on_list_wheel)
+            list_canvas.yview_moveto(0)
 
         def reset_selected():
-            selection = parameter_list.curselection()
-            if not selection:
+            selected_keys = [key for key, var in parameter_vars.items() if var.get()]
+            if not selected_keys:
                 messagebox.showwarning(
                     "Reset Parameter",
-                    "Please select a parameter",
+                    "Please select at least one parameter",
                     parent=dialog
                 )
                 return
 
-            parameter_key = parameter_list.get(selection[0])
-            self.reset_single_parameter(parameter_key)
+            for parameter_key in selected_keys:
+                self.reset_single_parameter(parameter_key)
             refresh_parameter_list()
             if close_after_selected or not self._excel_parameter_values:
                 dialog.destroy()
@@ -7151,20 +7507,80 @@ class DatabaseConnectorGUI:
         parameter_combo.pack(side="left")
 
         # ---- Panel titles ----
-        ttk.Label(content, text="Column", font=("Arial", 10, "bold")).grid(
+        ttk.Label(content, text="① Select column", font=("Arial", 10, "bold")).grid(
             row=1, column=0, sticky="w", padx=(0, 10), pady=(0, 4)
         )
-        ttk.Label(content, text="ข้อมูลใน Column", font=("Arial", 10, "bold")).grid(
+        ttk.Label(content, text="② Pick values", font=("Arial", 10, "bold")).grid(
             row=1, column=1, sticky="w", padx=10, pady=(0, 4)
         )
         selected_title = ttk.Label(
-            content, text="ข้อมูลที่เลือกจาก ข้อมูลใน Column", font=("Arial", 10, "bold")
+            content, text="③ Selected values", font=("Arial", 10, "bold")
         )
         selected_title.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(0, 4))
+
+        # ---- Per-panel search box (filters only the panel it sits in) ----
+        search_jobs = {}
+
+        def debounce(key, fn, delay=150):
+            job = search_jobs.pop(key, None)
+            if job:
+                dialog.after_cancel(job)
+
+            def _run():
+                search_jobs.pop(key, None)
+                fn()
+            search_jobs[key] = dialog.after(delay, _run)
+
+        def cancel_debounce(key):
+            job = search_jobs.pop(key, None)
+            if job:
+                dialog.after_cancel(job)
+
+        def search_ctrl_key(e):
+            """Ctrl+C/X/V/A by keycode so it works with Thai/EN keyboard layouts."""
+            w = e.widget
+            try:
+                if e.keycode == 86:      # V
+                    try:
+                        w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                    except tk.TclError:
+                        pass
+                    w.insert(tk.INSERT, dialog.clipboard_get().strip())
+                elif e.keycode in (67, 88):  # C / X
+                    dialog.clipboard_clear()
+                    dialog.clipboard_append(w.selection_get())
+                    if e.keycode == 88:
+                        w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                elif e.keycode == 65:    # A
+                    w.select_range(0, tk.END)
+                    w.icursor(tk.END)
+                else:
+                    return None
+            except tk.TclError:
+                pass
+            return "break"
+
+        def make_search(panel, key, on_change):
+            var = tk.StringVar()
+            row = tk.Frame(panel, bg="#ffffff")
+            row.pack(side="top", fill="x", padx=6, pady=(6, 0))
+            tk.Label(row, text="🔍", bg="#ffffff", fg="#64748B",
+                     font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+            entry = ttk.Entry(row, textvariable=var)
+            entry.pack(side="left", fill="x", expand=True)
+            tk.Button(row, text="✕", relief="flat", bd=0, bg="#ffffff", fg="#64748B",
+                      activebackground="#ffffff", cursor="hand2",
+                      command=lambda: (var.set(""), entry.focus_set())
+                      ).pack(side="left", padx=(4, 0))
+            entry.bind("<Escape>", lambda _e: var.set(""))
+            entry.bind("<Control-KeyPress>", search_ctrl_key)
+            var.trace_add("write", lambda *_a: debounce(key, on_change))
+            return var
 
         # ---- Panel 1: Column list ----
         column_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
         column_panel.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
+        column_search = make_search(column_panel, "columns", lambda: render_column_list())
         column_scroll = ttk.Scrollbar(column_panel, orient="vertical")
         column_list = tk.Listbox(
             column_panel,
@@ -7182,6 +7598,7 @@ class DatabaseConnectorGUI:
         # ---- Panel 2: Values of the column (checkboxes) ----
         values_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
         values_panel.grid(row=2, column=1, sticky="nsew", padx=10)
+        values_search = make_search(values_panel, "values", lambda: render_values())
 
         values_buttons = ttk.Frame(values_panel)
         values_buttons.pack(side="bottom", pady=8)
@@ -7209,6 +7626,7 @@ class DatabaseConnectorGUI:
         # ---- Panel 3: Selected values ----
         selected_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
         selected_panel.grid(row=2, column=2, sticky="nsew", padx=(10, 0))
+        selected_search = make_search(selected_panel, "selected", lambda: refresh_selected_list())
 
         selected_buttons = ttk.Frame(selected_panel)
         selected_buttons.pack(side="bottom", pady=8)
@@ -7286,26 +7704,27 @@ class DatabaseConnectorGUI:
             sql_preview.config(state="disabled")
 
         def refresh_selected_list():
+            cancel_debounce("selected")
+            query = selected_search.get().strip().lower()
             selected_list.delete(0, tk.END)
-            if is_auto_where():
-                total = 0
-                for column in columns_with_selection():
-                    values = selected_of(column)
-                    total += len(values)
-                    selected_list.insert(tk.END, f"[{column}]")
-                    selected_list.itemconfig(tk.END, fg="#2c3e50")
-                    for value in values:
-                        selected_list.insert(tk.END, f"    {value}")
-                selected_title.config(
-                    text=f"ข้อมูลที่เลือกจาก ข้อมูลใน Column ({total})"
-                )
-            else:
-                values = selected_of(column_var.get())
-                for value in values:
+            # Show only the values ticked in Panel 2 for the column picked in Panel 1
+            column_name = column_var.get()
+            values = selected_of(column_name)
+            for value in values:
+                if query in value.lower():
                     selected_list.insert(tk.END, value)
-                selected_title.config(
-                    text=f"ข้อมูลที่เลือกจาก ข้อมูลใน Column ({len(values)} / {len(value_vars)})"
-                )
+            total_values = len(column_values.get(column_name, []))
+            title = f"③ Selected values ({len(values)} / {total_values})"
+            if is_auto_where():
+                # Other columns' ticks still go into the WHERE; show the overall count
+                used = columns_with_selection()
+                if any(column != column_name for column in used):
+                    all_count = sum(len(selected_of(column)) for column in used)
+                    title += f"  ·  {len(used)} columns, {all_count} total"
+            selected_title.config(text=title)
+            if query and selected_list.size() == 0:
+                selected_list.insert(tk.END, "No matching values")
+                selected_list.itemconfig(tk.END, fg="#94A3B8")
             refresh_sql_preview()
 
         def on_value_toggled(value_str, var):
@@ -7316,25 +7735,31 @@ class DatabaseConnectorGUI:
                 chosen.discard(value_str)
             refresh_selected_list()
 
-        def show_column_values(_event=None):
+        def load_column_values(column_name):
+            dataframe = sheet_data["dataframe"]
+            if dataframe is None or column_name not in column_lookup:
+                return
+            if column_name not in column_values:
+                # dict keeps Excel order and dedupes in O(n)
+                column_values[column_name] = list(dict.fromkeys(
+                    str(value) for value in dataframe[column_lookup[column_name]].dropna().tolist()
+                ))
+
+        def render_values():
+            """Show the current column's values that match the Pick-values search."""
+            cancel_debounce("values")
             for widget in values_inner.winfo_children():
                 widget.destroy()
             value_vars.clear()
 
-            dataframe = sheet_data["dataframe"]
-            selection = column_list.curselection()
-            if dataframe is not None and selection:
-                column_name = column_list.get(selection[0])
-                column_var.set(column_name)
-                if column_name not in column_values:
-                    unique_values = []
-                    for value in dataframe[column_lookup[column_name]].dropna().tolist():
-                        value_str = str(value)
-                        if value_str not in unique_values:
-                            unique_values.append(value_str)
-                    column_values[column_name] = unique_values
+            column_name = column_var.get()
+            if sheet_data["dataframe"] is not None and column_name in column_lookup:
+                load_column_values(column_name)
+                query = values_search.get().strip().lower()
                 chosen = column_selected.get(column_name, set())
                 for value_str in column_values[column_name]:
+                    if query and query not in value_str.lower():
+                        continue
                     var = tk.BooleanVar(value=value_str in chosen)
                     value_vars[value_str] = var
                     tk.Checkbutton(
@@ -7345,11 +7770,38 @@ class DatabaseConnectorGUI:
                         bg="#ffffff",
                         command=lambda v=value_str, b=var: on_value_toggled(v, b)
                     ).pack(fill="x", anchor="w")
-            else:
-                column_var.set("")
+                if query and not value_vars:
+                    tk.Label(values_inner, text="No matching values", bg="#ffffff",
+                             fg="#94A3B8").pack(anchor="w", padx=4, pady=4)
 
             values_canvas.yview_moveto(0)
             refresh_selected_list()
+
+        def select_column(column_name):
+            changed = column_name != column_var.get()
+            column_var.set(column_name)
+            load_column_values(column_name)
+            if changed and values_search.get():
+                values_search.set("")  # new column → start with an empty value search
+            render_values()
+
+        def show_column_values(_event=None):
+            selection = column_list.curselection()
+            if selection:
+                select_column(column_list.get(selection[0]))
+
+        def render_column_list():
+            """Show column names that match the Select-column search; keep the current pick."""
+            cancel_debounce("columns")
+            query = column_search.get().strip().lower()
+            column_list.delete(0, tk.END)
+            for column_name in column_lookup:
+                if query and query not in column_name.lower():
+                    continue
+                column_list.insert(tk.END, column_name)
+                if column_name == column_var.get():
+                    column_list.selection_set(tk.END)
+                    column_list.see(tk.END)
 
         def update_columns(_event=None):
             column_values.clear()
@@ -7364,12 +7816,9 @@ class DatabaseConnectorGUI:
                 column_lookup.clear()
                 messagebox.showerror("Excel Import Error", str(error), parent=dialog)
 
-            column_list.delete(0, tk.END)
-            for column_name in column_lookup:
-                column_list.insert(tk.END, column_name)
-            if column_lookup:
-                column_list.selection_set(0)
-            show_column_values()
+            column_var.set("")
+            select_column(next(iter(column_lookup), ""))
+            render_column_list()
 
         def set_all_values(checked):
             chosen = column_selected.setdefault(column_var.get(), set())
@@ -7451,10 +7900,14 @@ class DatabaseConnectorGUI:
         sheet_combo.bind("<<ComboboxSelected>>", update_columns)
         column_list.bind("<<ListboxSelect>>", show_column_values)
         parameter_combo.bind("<<ComboboxSelected>>", lambda _e: refresh_selected_list())
-        dialog.bind(
-            "<Destroy>",
-            lambda e: values_canvas.unbind_all("<MouseWheel>") if e.widget is dialog else None
-        )
+        def _on_dialog_destroy(e):
+            if e.widget is not dialog:
+                return
+            values_canvas.unbind_all("<MouseWheel>")
+            for key in list(search_jobs):
+                cancel_debounce(key)
+
+        dialog.bind("<Destroy>", _on_dialog_destroy)
 
         update_columns()
 
