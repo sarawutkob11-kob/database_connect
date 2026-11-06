@@ -7715,6 +7715,18 @@ class DatabaseConnectorGUI:
         self.run_all_btn.config(state="normal")
         self._finish_job_result_report(success_count + error_count, success_count, error_count)
 
+        # Keep this run's SELECT results so Export Excel can reuse them
+        # instead of running the same queries again
+        self._last_run_results = {
+            "time": pd.Timestamp.now(),
+            "engine": self.engine,
+            "items": {
+                (r["Name"], str(r["_job"].get("query", "")).strip()): r["_data"]
+                for r in job_results
+                if r["_error"] is None and r["_query_type"] == "select"
+            },
+        }
+
         if not job_results:
             self._clear_results_grid("No result set from this run")
             return
@@ -7760,6 +7772,43 @@ class DatabaseConnectorGUI:
 
         self.results_text.see(tk.END)
 
+    def _reuse_last_run_results(self, jobs):
+        """Offer to export results of the last run instead of running again.
+
+        Returns the jobs to export (with cached results attached when the
+        user agrees), or None if the user cancelled.
+        """
+        last = getattr(self, "_last_run_results", None)
+        if not last or last.get("engine") is not self.engine or not last.get("items"):
+            return jobs
+        cached = {}
+        for job in jobs:
+            if job.get("_export_dataframe") is not None:
+                continue
+            key = (job.get("name"), str(job.get("query", "")).strip())
+            if key in last["items"]:
+                cached[id(job)] = last["items"][key]
+        if not cached:
+            return jobs
+
+        others = len(jobs) - len(cached)
+        answer = messagebox.askyesnocancel(
+            "Export Excel",
+            f"{len(cached)} of {len(jobs)} job(s) already have results from the run at "
+            f"{last['time'].strftime('%H:%M:%S')}.\n\n"
+            "Yes = export those results (no re-run, faster)"
+            + (f"\n        the other {others} job(s) will be run" if others else "")
+            + "\nNo = run all queries again (latest data)\nCancel = do not export",
+        )
+        if answer is None:
+            return None
+        if not answer:
+            return jobs
+        return [
+            dict(job, _export_dataframe=cached[id(job)]) if id(job) in cached else job
+            for job in jobs
+        ]
+
     def export_jobs_to_excel(self, jobs_override=None, file_prefix=None):
         """Export ผลลัพธ์ของทุก Job ลง Excel - 1 Job = 1 Sheet (ชื่อ Sheet = ชื่อ Job)"""
         import re
@@ -7795,6 +7844,9 @@ class DatabaseConnectorGUI:
             return  # User cancelled
 
         jobs = jobs_override if jobs_override is not None else self.get_jobs_to_run()
+        jobs = self._reuse_last_run_results(jobs)
+        if jobs is None:
+            return  # User cancelled
         self._start_stoppable_run()
 
         # ---- เขียน log เริ่มต้นลง Results ----
