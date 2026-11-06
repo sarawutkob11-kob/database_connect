@@ -924,6 +924,16 @@ class DatabaseConnectorGUI:
         # Stop button: set while a stop was requested; DB connections in use
         self._stop_event = threading.Event()
         self._stop_buttons = []
+        # Run All / Run Group: open one result window per job (remembered)
+        self.open_result_popups = tk.BooleanVar(
+            value=bool(self._load_app_settings().get("open_result_popups", True))
+        )
+        self.open_result_popups.trace_add(
+            "write",
+            lambda *_: self._save_app_setting(
+                "open_result_popups", bool(self.open_result_popups.get())
+            ),
+        )
         self._active_db_connections = set()
         self._active_db_lock = threading.Lock()
 
@@ -1684,6 +1694,7 @@ class DatabaseConnectorGUI:
             select_frame, text="", bg=UI["card"], fg=UI["primary"], font=UI_FONT_SM
         )
         self.selected_jobs_label.pack(side="left", padx=8)
+        self._result_windows_checkbox(select_frame, UI["card"]).pack(side="right")
 
         # Jobs list frame with scrollbar
         jobs_list_frame = tk.Frame(
@@ -3627,13 +3638,7 @@ class DatabaseConnectorGUI:
         )
         stop_group_btn.pack(side="left", padx=6)
         self._register_stop_button(stop_group_btn)
-        tk.Label(
-            run_bar,
-            text="Scripts run in the order shown",
-            font=("Arial", 9),
-            bg="#ffffff",
-            fg="#7f8c8d",
-        ).pack(side="right")
+        self._result_windows_checkbox(run_bar, "#ffffff").pack(side="right")
 
         groups_box.bind("<<ListboxSelect>>", lambda _e: refresh_scripts())
         groups_box.bind("<Double-Button-1>", lambda _e: rename_group())
@@ -5969,6 +5974,41 @@ class DatabaseConnectorGUI:
             or query_upper.startswith("(SELECT")
         )
 
+    def _app_settings_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
+
+    def _load_app_settings(self):
+        try:
+            with open(self._app_settings_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_app_setting(self, key, value):
+        settings = self._load_app_settings()
+        settings[key] = value
+        try:
+            with open(self._app_settings_path(), "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Cannot save app_settings.json: {e}")
+
+    def _result_windows_checkbox(self, parent, bg):
+        """Checkbox bound to the shared 'open result windows' setting."""
+        return tk.Checkbutton(
+            parent,
+            text="Open result windows",
+            variable=self.open_result_popups,
+            bg=bg,
+            activebackground=bg,
+            selectcolor="#FFFFFF",
+            font=UI_FONT_SM,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+
     def _track_engine_connections(self, engine):
         """Remember which DB connections are in use, so Stop can cancel them."""
         from sqlalchemy import event
@@ -7748,7 +7788,16 @@ class DatabaseConnectorGUI:
                 + "\n",
             )
 
-        if select_results:
+        if select_results and not self.open_result_popups.get():
+            self.results_text.insert(
+                tk.END,
+                f"📊 {len(select_results)} result(s) in the Results Grid tab "
+                "(result windows are turned off)\n",
+            )
+            self._show_results_grid_sets(
+                [(r["Name"], r["_data"], r["_job"]["query"]) for r in select_results]
+            )
+        elif select_results:
             self.results_text.insert(
                 tk.END,
                 f"📊 Opening {len(select_results)} result window(s) — "
