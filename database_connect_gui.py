@@ -921,6 +921,11 @@ class DatabaseConnectorGUI:
         self._excel_parameterized_sql = None
         self._excel_parameter_values = {}
         self._checked_job_ids = set()  # id() of jobs ticked in Saved Jobs list
+        # Stop button: set while a stop was requested; DB connections in use
+        self._stop_event = threading.Event()
+        self._stop_buttons = []
+        self._active_db_connections = set()
+        self._active_db_lock = threading.Lock()
 
         self.load_table_mappings()
 
@@ -1492,6 +1497,17 @@ class DatabaseConnectorGUI:
         self.execute_btn.pack(side="left", padx=(0, 8), ipady=1)
         _bind_hover(self.execute_btn, FL["primary"], FL["primary_hover"])
 
+        # Stop — enabled only while a query / job run is in progress
+        self.stop_btn = tk.Button(
+            query_buttons_inner,
+            text="⏹ Stop",
+            command=self.stop_running_queries,
+            **ui_button_style("danger"),
+        )
+        self.stop_btn.pack(side="left", padx=(0, 8), ipady=1)
+        _bind_hover(self.stop_btn, FL["danger_soft"], FL["danger_hover"])
+        self._register_stop_button(self.stop_btn)
+
         # 3) Save Job — secondary
         save_job_border = _bordered(query_buttons_inner, FL["border_strong"])
         save_job_border.pack(side="left", padx=(0, 8))
@@ -1625,6 +1641,16 @@ class DatabaseConnectorGUI:
             **ui_button_style("success", "sm"),
         )
         self.run_all_btn.pack(side="right")
+
+        _stop_jobs_btn = tk.Button(
+            controls_frame,
+            text="⏹ Stop",
+            command=self.stop_running_queries,
+            **ui_button_style("danger", "sm"),
+        )
+        _stop_jobs_btn.pack(side="right", padx=(0, 6))
+        ui_bind_hover(_stop_jobs_btn, UI["danger_soft"], UI["danger_hover"])
+        self._register_stop_button(_stop_jobs_btn)
         ui_bind_hover(self.run_all_btn, UI["success"], UI["success_hover"])
 
         # Shown only while at least one job is ticked (packed by _refresh_job_selection_ui)
@@ -1806,6 +1832,8 @@ class DatabaseConnectorGUI:
 
         # Apply the Modern Enterprise theme to every dialog/popup (presentation only)
         self._dialog_theme = DialogTheme(self.root)
+
+        self._refresh_stop_buttons()
 
         # Auto-load last used profile
         self.auto_load_last_profile()
@@ -3422,6 +3450,12 @@ class DatabaseConnectorGUI:
 
         run_btn = _btn(run_bar, "▶ Run Group", run_group, "#27ae60", side="left", padx=(0, 6))
         export_btn = _btn(run_bar, "📤 Export Group to Excel", export_group, "#3498db", side="left")
+        stop_group_btn = tk.Button(
+            run_bar, text="⏹ Stop", command=self.stop_running_queries, bg="#e74c3c", fg="white",
+            font=("Arial", 9),
+        )
+        stop_group_btn.pack(side="left", padx=6)
+        self._register_stop_button(stop_group_btn)
         tk.Label(
             run_bar,
             text="Scripts run in the order shown",
@@ -5674,6 +5708,7 @@ class DatabaseConnectorGUI:
                 # Never reuse a connection older than 30 minutes
                 pool_recycle=1800,
             )
+            self._track_engine_connections(self.engine)
             with self.engine.connect() as connection:
                 connection.execute(
                     text("SELECT 1 FROM DUAL" if db_type == "Oracle" else "SELECT 1")
@@ -5763,6 +5798,87 @@ class DatabaseConnectorGUI:
             or query_upper.startswith("(SELECT")
         )
 
+    def _track_engine_connections(self, engine):
+        """Remember which DB connections are in use, so Stop can cancel them."""
+        from sqlalchemy import event
+
+        with self._active_db_lock:
+            self._active_db_connections.clear()
+
+        def _on_checkout(dbapi_connection, _record, _proxy):
+            with self._active_db_lock:
+                self._active_db_connections.add(dbapi_connection)
+
+        def _on_checkin(dbapi_connection, _record):
+            with self._active_db_lock:
+                self._active_db_connections.discard(dbapi_connection)
+
+        event.listen(engine, "checkout", _on_checkout)
+        event.listen(engine, "checkin", _on_checkin)
+
+    def _is_query_running(self):
+        with self._active_db_lock:
+            busy = bool(self._active_db_connections)
+        return (
+            busy
+            or getattr(self, "_batch_running", False)
+            or "Loading" in str(self.execute_btn.cget("text"))
+            or "Exporting" in str(self.export_excel_btn.cget("text"))
+        )
+
+    def _start_stoppable_run(self):
+        """Called when a run starts: forget any earlier Stop request."""
+        self._stop_event.clear()
+
+    def stop_running_queries(self):
+        """Stop button: cancel the query in progress and skip remaining jobs."""
+        if not self._is_query_running():
+            return
+        self._stop_event.set()
+        with self._active_db_lock:
+            connections = list(self._active_db_connections)
+        cancelled = 0
+        for dbapi_connection in connections:
+            cancel = getattr(dbapi_connection, "cancel", None)  # Oracle (python-oracledb)
+            if cancel is None:
+                continue
+            try:
+                cancel()
+                cancelled += 1
+            except Exception as e:
+                print(f"Stop: cancel failed: {e}")
+        if cancelled:
+            msg = f"\n⏹ Stop requested — cancelled {cancelled} running query(ies); remaining jobs are skipped.\n"
+        else:
+            msg = (
+                "\n⏹ Stop requested — remaining jobs are skipped. "
+                "This database driver cannot cancel a running query, so the current one finishes first.\n"
+            )
+        self.results_text.insert(tk.END, msg)
+        self.results_text.see(tk.END)
+
+    def _register_stop_button(self, button):
+        self._stop_buttons.append(button)
+        button.config(state="disabled")
+
+    def _refresh_stop_buttons(self):
+        """Poll: Stop buttons are enabled only while something runs."""
+        try:
+            state = "normal" if self._is_query_running() else "disabled"
+            alive = []
+            for button in self._stop_buttons:
+                try:
+                    if button.winfo_exists():
+                        if str(button["state"]) != state:
+                            button.config(state=state)
+                        alive.append(button)
+                except tk.TclError:
+                    pass
+            self._stop_buttons = alive
+        except tk.TclError:
+            return
+        self.root.after(300, self._refresh_stop_buttons)
+
     def _confirm_data_change(self, jobs):
         """Ask before running statements that are not SELECT (they are committed).
 
@@ -5810,6 +5926,7 @@ class DatabaseConnectorGUI:
 
         if not self._confirm_data_change([{"name": None, "query": sql_query}]):
             return
+        self._start_stoppable_run()
 
         # Show loading message
         self.results_text.delete("1.0", tk.END)
@@ -7059,6 +7176,7 @@ class DatabaseConnectorGUI:
 
         if not self._confirm_data_change([job]):
             return
+        self._start_stoppable_run()
 
         # หาเลขลำดับของ Job ตาม Saved Jobs
         current_profile = self.profile_combo.get()
@@ -7169,6 +7287,7 @@ class DatabaseConnectorGUI:
 
         if not self._confirm_data_change(profile_jobs):
             return
+        self._start_stoppable_run()
         self._batch_running = True
         self.run_all_btn.config(state="disabled")
 
@@ -7201,6 +7320,15 @@ class DatabaseConnectorGUI:
                 error_count = 0
 
                 for idx, job in enumerate(profile_jobs, 1):
+                    if self._stop_event.is_set():
+                        not_run = len(profile_jobs) - idx + 1
+                        self.root.after(
+                            0,
+                            lambda n=not_run: self.results_text.insert(
+                                tk.END, f"⏹ Stopped — {n} job(s) not run\n"
+                            ),
+                        )
+                        break
                     start_time = time_module.time()
                     self.root.after(0, lambda i=idx, j=job: self.update_job_status(i, j, "running"))
                     time_module.sleep(0.1)
@@ -7496,6 +7624,7 @@ class DatabaseConnectorGUI:
             return  # User cancelled
 
         jobs = jobs_override if jobs_override is not None else self.get_jobs_to_run()
+        self._start_stoppable_run()
 
         # ---- เขียน log เริ่มต้นลง Results ----
         self.results_text.delete("1.0", tk.END)
@@ -7556,6 +7685,9 @@ class DatabaseConnectorGUI:
             try:
                 with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
                     for idx, job in enumerate(jobs, 1):
+                        if self._stop_event.is_set():
+                            log(f"⏹ Stopped — {len(jobs) - idx + 1} job(s) not exported\n")
+                            break
                         job_name = job.get("name", f"Job {idx}")
                         query = job["query"]
                         log(f"DEBUG Job Name : {job_name}\n")
