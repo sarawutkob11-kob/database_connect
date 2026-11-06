@@ -5763,6 +5763,40 @@ class DatabaseConnectorGUI:
             or query_upper.startswith("(SELECT")
         )
 
+    def _confirm_data_change(self, jobs):
+        """Ask before running statements that are not SELECT (they are committed).
+
+        jobs: list of {"name", "query"}. Returns True when nothing needs
+        confirming or the user agreed; SELECT-only runs are never prompted.
+        """
+        changes = [job for job in jobs if not self.is_select_query(job.get("query", ""))]
+        if not changes:
+            return True
+
+        target = self.db_type.get()
+        host = self.db_host.get().strip()
+        database = self.db_name.get().strip()
+        if host:
+            target += f" · {host}" + (f" / {database}" if database else "")
+
+        lines = []
+        for job in changes[:10]:
+            first_line = " ".join(str(job.get("query", "")).split())[:70]
+            lines.append(f"• {job.get('name') or 'SQL Editor'}:  {first_line}")
+        if len(changes) > 10:
+            lines.append(f"... and {len(changes) - 10} more")
+
+        return messagebox.askyesno(
+            "Confirm Data Change",
+            f"{len(changes)} statement(s) will CHANGE DATA and be committed immediately:\n\n"
+            + "\n".join(lines)
+            + f"\n\nProfile : {self.profile_combo.get() or '-'}\n"
+            f"Database: {target}\n\n"
+            "This cannot be undone. Continue?",
+            icon="warning",
+            default="no",
+        )
+
     def execute_query(self):
         """Execute the SQL query with comprehensive error handling and retry capability"""
         if not self.engine:
@@ -5772,6 +5806,9 @@ class DatabaseConnectorGUI:
         sql_query = self.sql_context.get(1.0, tk.END).strip()
         if not sql_query:
             messagebox.showerror("Error", "Please enter a SQL query")
+            return
+
+        if not self._confirm_data_change([{"name": None, "query": sql_query}]):
             return
 
         # Show loading message
@@ -7020,6 +7057,9 @@ class DatabaseConnectorGUI:
             messagebox.showwarning("Warning", "SQL Query is empty")
             return
 
+        if not self._confirm_data_change([job]):
+            return
+
         # หาเลขลำดับของ Job ตาม Saved Jobs
         current_profile = self.profile_combo.get()
 
@@ -7125,6 +7165,9 @@ class DatabaseConnectorGUI:
         # Ignore extra clicks while a run is in progress (each click would
         # otherwise start another run and open another set of popups)
         if getattr(self, "_batch_running", False):
+            return
+
+        if not self._confirm_data_change(profile_jobs):
             return
         self._batch_running = True
         self.run_all_btn.config(state="disabled")
