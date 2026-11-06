@@ -10,3 +10,4 @@ saved_jobs.json
 script_groups.json
 script_groups_backup.json
 app_settings.json
+logs/

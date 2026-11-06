@@ -1792,7 +1792,19 @@ class DatabaseConnectorGUI:
         # --- Tab 2: Execution Logs (the existing results_text widget)
         results_frame = tk.Frame(self.results_notebook, bg=UI["card"])
         results_frame.columnconfigure(0, weight=1)
-        results_frame.rowconfigure(0, weight=1)
+        results_frame.rowconfigure(1, weight=1)
+
+        # Toolbar: where the log is saved + open the folder
+        log_toolbar = tk.Frame(results_frame, bg=UI["card"])
+        log_toolbar.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 0))
+        self._log_file_label = tk.Label(
+            log_toolbar, text="", bg=UI["card"], fg=UI["muted"], font=UI_FONT_SM
+        )
+        self._log_file_label.pack(side="left")
+        _outer, _ = ui_button(
+            log_toolbar, "📂 Open Log Folder", self.open_log_folder, size="sm"
+        )
+        _outer.pack(side="right")
 
         # Results Text Area
         self.results_text = scrolledtext.ScrolledText(
@@ -1815,8 +1827,21 @@ class DatabaseConnectorGUI:
             pady=8,
         )
         self.results_text.grid(
-            row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=16, pady=(12, 16)
+            row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=16, pady=(8, 16)
         )
+
+        # Everything written to the Execution Logs is also appended to
+        # logs/run_YYYY-MM-DD.log (with a timestamp per line)
+        self._init_run_log()
+        _log_insert = self.results_text.insert
+
+        def _insert_and_log(index, chars, *args):
+            result = _log_insert(index, chars, *args)
+            if isinstance(chars, str):
+                self._write_run_log(chars)
+            return result
+
+        self.results_text.insert = _insert_and_log
 
         # --- Tab 3: Error & Debug
         debug_tab = tk.Frame(self.results_notebook, bg=UI["card"])
@@ -6040,6 +6065,85 @@ class DatabaseConnectorGUI:
     def _start_stoppable_run(self):
         """Called when a run starts: forget any earlier Stop request."""
         self._stop_event.clear()
+        self._log_run_context()
+
+    # ---------------------------------------------------------------
+    # Run log file (logs/run_YYYY-MM-DD.log) — never contains passwords
+    # ---------------------------------------------------------------
+    RUN_LOG_KEEP_DAYS = 90
+
+    def _init_run_log(self):
+        self._log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        self._log_buffer = ""
+        self._log_lock = threading.Lock()
+        try:
+            os.makedirs(self._log_dir, exist_ok=True)
+            # Remove log files older than RUN_LOG_KEEP_DAYS
+            cutoff = _dt.datetime.now().timestamp() - self.RUN_LOG_KEEP_DAYS * 86400
+            for name in os.listdir(self._log_dir):
+                path = os.path.join(self._log_dir, name)
+                if name.startswith("run_") and name.endswith(".log") and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+        except Exception as e:
+            print(f"Run log: {e}")
+        self._refresh_log_file_label()
+
+    def _run_log_path(self):
+        return os.path.join(self._log_dir, f"run_{_dt.date.today():%Y-%m-%d}.log")
+
+    def _refresh_log_file_label(self):
+        label = getattr(self, "_log_file_label", None)
+        if label is not None:
+            label.config(text=f"Saved to logs\\{os.path.basename(self._run_log_path())}")
+
+    def _write_run_log(self, text_value):
+        """Append complete lines (timestamped) to today's log file."""
+        if not hasattr(self, "_log_lock"):
+            return
+        with self._log_lock:
+            self._log_buffer += text_value
+            if "\n" not in self._log_buffer:
+                return
+            *lines, self._log_buffer = self._log_buffer.split("\n")
+            stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            out = []
+            for line in lines:
+                line = line.rstrip()
+                if not line:
+                    continue
+                if set(line) <= set("=─-━"):
+                    line = "-" * 40  # shorten long separator lines
+                out.append(f"{stamp} | {line}\n")
+            if not out:
+                return
+            try:
+                with open(self._run_log_path(), "a", encoding="utf-8") as f:
+                    f.writelines(out)
+            except Exception as e:
+                print(f"Run log: cannot write: {e}")
+        self._refresh_log_file_label()
+
+    def _log_run_context(self):
+        """Log who/where a run goes to (profile and target, no password)."""
+        try:
+            user = self.db_user.get().strip()
+            host = self.db_host.get().strip()
+            port = self.db_port.get().strip()
+            database = self.db_name.get().strip()
+            target = f"{user}@{host}" + (f":{port}" if port else "") + (f"/{database}" if database else "")
+            self._write_run_log(
+                f"\n===== RUN  profile={self.profile_combo.get() or '-'}  "
+                f"{self.db_type.get()}  {target} =====\n"
+            )
+        except tk.TclError:
+            pass
+
+    def open_log_folder(self):
+        try:
+            os.makedirs(self._log_dir, exist_ok=True)
+            os.startfile(self._log_dir)
+        except Exception as e:
+            messagebox.showerror("Logs", f"Cannot open log folder:\n{self._log_dir}\n\n{e}")
 
     def stop_running_queries(self):
         """Stop button: cancel the query in progress and skip remaining jobs."""
@@ -7716,6 +7820,7 @@ class DatabaseConnectorGUI:
                 f"Columns     : {columns}\n"
                 "Status      : Success\n",
             )
+            self._write_run_log(f"SQL         : {' '.join(str(job.get('query', '')).split())}\n")
             self.results_text.see(tk.END)
             if not show_popup:
                 return
@@ -7736,6 +7841,7 @@ class DatabaseConnectorGUI:
                 "Status      : Fail\n"
                 f"Error       : {error}\n",
             )
+            self._write_run_log(f"SQL         : {' '.join(str(job.get('query', '')).split())}\n")
             self.results_text.see(tk.END)
             if not show_popup:
                 return
