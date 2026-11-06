@@ -413,7 +413,8 @@ class DBConnectorLibrary:
         import html as _html
 
         try:
-            self.app.canvas.yview_moveto(0.0 if view == "บน" else 1.0)
+            if hasattr(self.app.canvas, "yview_moveto"):  # older layout scrolled as a whole
+                self.app.canvas.yview_moveto(0.0 if view == "บน" else 1.0)
             self._pump(350)
             windows = [self.root] + [
                 t for t in self._toplevels() if t.winfo_exists() and t.winfo_ismapped()
