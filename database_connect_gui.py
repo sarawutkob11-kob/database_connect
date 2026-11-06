@@ -3083,8 +3083,11 @@ class DatabaseConnectorGUI:
             existing.focus_force()
             return
 
-        # Not transient: result windows of a group run must be able to come on top
+        # Owned by the main window like the result popups: it stays above the
+        # main window (which comes forward when a result popup opens), while
+        # result popups of a group run can still be raised above it.
         dialog = tk.Toplevel(self.root)
+        dialog.transient(self.root)
         self._script_groups_window = dialog
         dialog.title("Script Groups")
         dialog.configure(bg="#f0f0f0")
