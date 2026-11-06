@@ -2858,8 +2858,16 @@ class DatabaseConnectorGUI:
             ]
             clean.append(dict(group, scripts=scripts))
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            # Keep the previous version as script_groups_backup.json, then write
+            # to a temp file and swap it in, so a crash never leaves a broken file
+            if os.path.exists(path):
+                import shutil
+
+                shutil.copy2(path, os.path.splitext(path)[0] + "_backup.json")
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump({"version": 1, "groups": clean}, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, path)
         except Exception as e:
             messagebox.showerror("Script Groups", f"Cannot save script_groups.json:\n{e}")
 
@@ -3134,6 +3142,8 @@ class DatabaseConnectorGUI:
         ).pack(side="left")
         profile_label = tk.Label(header, text="", font=("Arial", 10), bg="#f0f0f0", fg="#7f8c8d")
         profile_label.pack(side="left", padx=12, pady=(4, 0))
+        header_buttons = tk.Frame(header, bg="#f0f0f0")
+        header_buttons.pack(side="right")
 
         body = tk.Frame(dialog, bg="#f0f0f0")
         body.pack(fill="both", expand=True, padx=15, pady=12)
@@ -3423,6 +3433,165 @@ class DatabaseConnectorGUI:
                 return
             self.export_jobs_to_excel(jobs_override=group_jobs(group), file_prefix=group["name"])
 
+        # ---- backup: export / import -----------------------------------------
+        def export_groups():
+            groups = state["groups"]
+            if not groups:
+                messagebox.showinfo("Export Groups", "This profile has no groups to export", parent=dialog)
+                return
+            selected = current_group()
+            scope_all = True
+            if selected is not None and len(groups) > 1:
+                answer = messagebox.askyesnocancel(
+                    "Export Groups",
+                    f"Export ALL {len(groups)} groups of profile '{state['profile']}'?\n\n"
+                    f"Yes = all groups\nNo = only '{selected['name']}'",
+                    parent=dialog,
+                )
+                if answer is None:
+                    return
+                scope_all = answer
+            chosen = groups if scope_all else [selected]
+            stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+            label = state["profile"] if scope_all else selected["name"]
+            safe = re.sub(r'[\\/:*?"<>|]', "_", str(label)).strip() or "groups"
+            file_path = filedialog.asksaveasfilename(
+                parent=dialog,
+                title="Export Script Groups",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json")],
+                initialfile=f"script_groups_{safe}_{stamp}.json",
+            )
+            if not file_path:
+                return
+            data = {
+                "type": "script_groups",
+                "version": 1,
+                "exported": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "profile": state["profile"],
+                "groups": [
+                    {
+                        "name": g["name"],
+                        "created": g.get("created"),
+                        "scripts": [
+                            {k: v for k, v in sc.items() if not k.startswith("_") and k != "run_index"}
+                            for sc in g.get("scripts", [])
+                        ],
+                    }
+                    for g in chosen
+                ],
+            }
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                messagebox.showerror("Export Groups", f"Cannot write file:\n{e}", parent=dialog)
+                return
+            count = sum(len(g["scripts"]) for g in data["groups"])
+            self.results_text.insert(
+                tk.END, f"📤 Exported {len(chosen)} group(s), {count} script(s) → {file_path}\n"
+            )
+            self.results_text.see(tk.END)
+            messagebox.showinfo(
+                "Export Groups",
+                f"Exported {len(chosen)} group(s), {count} script(s)\n\n{file_path}",
+                parent=dialog,
+            )
+
+        def import_groups():
+            profile = self.profile_combo.get()
+            if not profile:
+                messagebox.showwarning("Import Groups", "Please select a profile first", parent=dialog)
+                return
+            file_path = filedialog.askopenfilename(
+                parent=dialog,
+                title="Import Script Groups",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+            if not file_path:
+                return
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                incoming = data.get("groups") if isinstance(data, dict) else data
+                if not isinstance(incoming, list):
+                    raise ValueError("no 'groups' list in this file")
+                incoming = [
+                    g for g in incoming
+                    if isinstance(g, dict) and g.get("name") and isinstance(g.get("scripts", []), list)
+                ]
+                for g in incoming:
+                    for sc in g.get("scripts", []):
+                        if not isinstance(sc, dict) or not sc.get("query"):
+                            raise ValueError(f"group '{g['name']}' has a script without SQL")
+            except Exception as e:
+                messagebox.showerror("Import Groups", f"Not a valid Script Groups file:\n{e}", parent=dialog)
+                return
+            if not incoming:
+                messagebox.showinfo("Import Groups", "No groups found in this file", parent=dialog)
+                return
+
+            profile_groups = [g for g in self.script_groups if g.get("profile") == profile]
+            existing = {g["name"].lower(): g for g in profile_groups}
+            clashes = [g["name"] for g in incoming if g["name"].lower() in existing]
+            summary = "\n".join(
+                f"• {g['name']}  ({len(g.get('scripts', []))} scripts)"
+                + ("  ← already exists" if g["name"] in clashes else "")
+                for g in incoming[:15]
+            )
+            if len(incoming) > 15:
+                summary += f"\n... and {len(incoming) - 15} more"
+            replace = False
+            if clashes:
+                answer = messagebox.askyesnocancel(
+                    "Import Groups",
+                    f"Import {len(incoming)} group(s) into profile '{profile}':\n\n{summary}\n\n"
+                    f"{len(clashes)} group name(s) already exist.\n"
+                    "Yes = replace them\nNo = keep both (imported copy gets a new name)\n"
+                    "Cancel = do not import",
+                    parent=dialog,
+                )
+                if answer is None:
+                    return
+                replace = answer
+            elif not messagebox.askyesno(
+                "Import Groups",
+                f"Import {len(incoming)} group(s) into profile '{profile}'?\n\n{summary}",
+                parent=dialog,
+            ):
+                return
+
+            now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            taken = {g["name"].lower() for g in profile_groups}
+            last_name = None
+            for g in incoming:
+                name = g["name"]
+                old = existing.get(name.lower())
+                if old is not None and replace:
+                    self.script_groups.remove(old)
+                elif old is not None:
+                    n = 2
+                    while f"{name} ({n})".lower() in taken:
+                        n += 1
+                    name = f"{name} ({n})"
+                taken.add(name.lower())
+                self.script_groups.append(
+                    {
+                        "name": name,
+                        "profile": profile,
+                        "created": g.get("created") or now,
+                        "imported": now,
+                        "scripts": json.loads(json.dumps(g.get("scripts", []), default=str)),
+                    }
+                )
+                last_name = name
+            self.save_script_groups()
+            refresh_groups(select_name=last_name)
+            self.results_text.insert(
+                tk.END, f"📥 Imported {len(incoming)} group(s) from {file_path}\n"
+            )
+            self.results_text.see(tk.END)
+
         # ---- buttons -------------------------------------------------------
         def _btn(parent, text, command, color="#95a5a6", **pack):
             b = tk.Button(parent, text=text, command=command, bg=color, fg="white", font=("Arial", 9))
@@ -3431,6 +3600,8 @@ class DatabaseConnectorGUI:
             return b
 
         _btn(group_buttons, "+ New Group", new_group, "#27ae60", side="left", padx=(0, 4))
+        _btn(header_buttons, "📥 Import Groups", import_groups, side="left", padx=(0, 6))
+        _btn(header_buttons, "📤 Export Groups", export_groups, side="left")
         rename_btn = _btn(group_buttons, "✏ Rename", rename_group, side="left", padx=4)
         delete_group_btn = _btn(group_buttons, "🗑 Delete", delete_group, "#e74c3c", side="left", padx=4)
 

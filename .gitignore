@@ -8,3 +8,4 @@ saved_jobs.json
 *.xlsx
 *.log
 script_groups.json
+script_groups_backup.json
