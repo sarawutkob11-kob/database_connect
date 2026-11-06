@@ -5666,7 +5666,13 @@ class DatabaseConnectorGUI:
                 db_type, user, password, host, port, database
             )
             self.engine = create_engine(
-                connection_string, connect_args=self.get_connect_args(db_type)
+                connection_string,
+                connect_args=self.get_connect_args(db_type),
+                # Check a pooled connection before each use and reconnect if the
+                # server/firewall dropped it while idle (e.g. ORA-03113, DPI-1080)
+                pool_pre_ping=True,
+                # Never reuse a connection older than 30 minutes
+                pool_recycle=1800,
             )
             with self.engine.connect() as connection:
                 connection.execute(
