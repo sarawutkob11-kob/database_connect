@@ -12,3 +12,10 @@ script_groups_backup.json
 app_settings.json
 logs/
 robot_tests/results/
+
+# Robot Framework output when run from the project root
+/log.html
+/report.html
+/output.xml
+/interactive_console_output.xml
+/screenshots/
