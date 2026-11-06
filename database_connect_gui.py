@@ -384,6 +384,95 @@ def ui_tooltip(widget, text, delay_ms=400, wraplength=720):
     widget.bind("<Destroy>", _leave, add="+")
 
 
+DIALOG_TONES = {
+    "warn": ("#FEF3C7", "#D97706", "⚠"),
+    "danger": ("#FEE2E2", "#DC2626", "✕"),
+    "info": ("#DBEAFE", "#2563EB", "i"),
+    "brand": ("#DBEAFE", "#2563EB", "▣"),
+}
+
+
+def ui_dialog(parent, title, heading, subtitle="", tone="info", build_body=None,
+              buttons=(("OK", True, "primary"),), cancel_value=None, focus_value=None,
+              message="", width=540):
+    """Modal dialog in the app style; returns the value of the pressed button.
+
+    build_body(container) adds the dialog content; it may return a function
+    that turns the pressed button's value into the final result.
+    `message` is a plain-text summary (used for logs/tests, not shown).
+    """
+    soft, strong, glyph = DIALOG_TONES.get(tone, DIALOG_TONES["info"])
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.configure(bg=UI["card"])
+    dialog.resizable(False, False)
+    try:
+        dialog.transient(parent.winfo_toplevel())
+    except tk.TclError:
+        pass
+    result = {"value": cancel_value}
+
+    content = tk.Frame(dialog, bg=UI["card"])
+    content.pack(fill="both", expand=True, padx=24, pady=(20, 16))
+    head = tk.Frame(content, bg=UI["card"])
+    head.pack(fill="x")
+    badge = tk.Canvas(head, width=40, height=40, bg=UI["card"], highlightthickness=0)
+    badge.create_oval(1, 1, 39, 39, fill=soft, outline=soft)
+    badge.create_text(20, 20, text=glyph, fill=strong, font=("Segoe UI Semibold", 14))
+    badge.pack(side="left", anchor="n", padx=(0, 14))
+    titles = tk.Frame(head, bg=UI["card"])
+    titles.pack(side="left", fill="x", expand=True)
+    tk.Label(titles, text=heading, bg=UI["card"], fg=UI["text"],
+             font=("Segoe UI Semibold", 13), anchor="w", justify="left").pack(fill="x")
+    if subtitle:
+        tk.Label(titles, text=subtitle, bg=UI["card"], fg=UI["muted"], font=UI_FONT,
+                 anchor="w", justify="left", wraplength=width - 120).pack(fill="x", pady=(2, 0))
+
+    body = tk.Frame(content, bg=UI["card"])
+    body.pack(fill="both", expand=True, pady=(14, 0))
+    transform = build_body(body) if build_body else None
+
+    tk.Frame(dialog, bg=UI["border"], height=1).pack(fill="x")
+    footer = tk.Frame(dialog, bg=UI["surface"])
+    footer.pack(fill="x")
+    bar = tk.Frame(footer, bg=UI["surface"])
+    bar.pack(side="right", padx=24, pady=12)
+
+    def _finish(value):
+        result["value"] = transform(value) if transform else value
+        dialog.destroy()
+
+    focus_btn = None
+    for label, value, kind in buttons:
+        outer, btn = ui_button(bar, label, lambda v=value: _finish(v), kind=kind, size="md")
+        outer.pack(side="left", padx=(8, 0))
+        if value == focus_value or (focus_btn is None and kind == "primary" and focus_value is None):
+            focus_btn = btn
+    if focus_btn is not None:
+        focus_btn.config(highlightthickness=2, highlightbackground="#93C5FD", highlightcolor="#93C5FD")
+        focus_btn.focus_set()
+        dialog.bind("<Return>", lambda _e: focus_btn.invoke())
+    dialog.bind("<Escape>", lambda _e: _finish(cancel_value))
+    dialog.protocol("WM_DELETE_WINDOW", lambda: _finish(cancel_value))
+
+    dialog.update_idletasks()
+    w = max(width, dialog.winfo_reqwidth())
+    h = dialog.winfo_reqheight()
+    try:
+        top = parent.winfo_toplevel()
+        x = top.winfo_rootx() + (top.winfo_width() - w) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - h) // 3
+    except tk.TclError:
+        x, y = 200, 200
+    dialog.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+    try:
+        dialog.grab_set()
+    except tk.TclError:
+        pass
+    dialog.wait_window()
+    return result["value"]
+
+
 def ui_fit_text(label, full_text, width_px):
     """Show `full_text` in `label`, cut with … so it fits `width_px` pixels."""
     try:
@@ -3403,67 +3492,90 @@ class DatabaseConnectorGUI:
         dialog.transient(self.root)
         self._script_groups_window = dialog
         dialog.title("Script Groups")
-        dialog.configure(bg="#f0f0f0")
-        dialog.geometry("1050x640")
-        dialog.minsize(820, 480)
-        x = self.root.winfo_rootx() + max((self.root.winfo_width() - 1050) // 2, 0)
-        y = self.root.winfo_rooty() + max((self.root.winfo_height() - 640) // 3, 0)
+        dialog.configure(bg=UI["card"])
+        dialog.geometry("1060x660")
+        dialog.minsize(860, 500)
+        x = self.root.winfo_rootx() + max((self.root.winfo_width() - 1060) // 2, 0)
+        y = self.root.winfo_rooty() + max((self.root.winfo_height() - 660) // 3, 0)
         dialog.geometry(f"+{x}+{y}")
 
         state = {"profile": None, "groups": []}
+        CARD, SURF = UI["card"], UI["surface"]
 
-        header = tk.Frame(dialog, bg="#f0f0f0")
-        header.pack(fill="x", padx=15, pady=(12, 0))
-        tk.Label(
-            header, text="Script Groups", font=("Arial", 14, "bold"), bg="#f0f0f0", fg="#2c3e50"
-        ).pack(side="left")
-        profile_label = tk.Label(header, text="", font=("Arial", 10), bg="#f0f0f0", fg="#7f8c8d")
-        profile_label.pack(side="left", padx=12, pady=(4, 0))
-        header_buttons = tk.Frame(header, bg="#f0f0f0")
+        def _panel(parent):
+            return tk.Frame(parent, bg=SURF, highlightthickness=1,
+                            highlightbackground=UI["border"], highlightcolor=UI["border"])
+
+        def _listbox(parent, **kw):
+            return tk.Listbox(
+                parent, font=UI_FONT, exportselection=False, activestyle="none", bd=0,
+                highlightthickness=1, highlightbackground=UI["border"], highlightcolor=UI["primary"],
+                selectbackground="#DBEAFE", selectforeground=UI["text"], fg=UI["text"], bg=CARD, **kw,
+            )
+
+        # Header: title + subtitle (profile), Import / Export on the right
+        header = tk.Frame(dialog, bg=CARD)
+        header.pack(fill="x", padx=20, pady=(16, 10))
+        titles = tk.Frame(header, bg=CARD)
+        titles.pack(side="left")
+        tk.Label(titles, text="Script Groups", font=("Segoe UI Semibold", 15), bg=CARD,
+                 fg=UI["text"]).pack(anchor="w")
+        profile_label = tk.Label(titles, text="", font=UI_FONT_SM, bg=CARD, fg=UI["muted"])
+        profile_label.pack(anchor="w")
+        header_buttons = tk.Frame(header, bg=CARD)
         header_buttons.pack(side="right")
 
-        body = tk.Frame(dialog, bg="#f0f0f0")
-        body.pack(fill="both", expand=True, padx=15, pady=12)
-        body.columnconfigure(0, weight=1, minsize=260)
+        # Run bar across the bottom of the window
+        run_wrap = tk.Frame(dialog, bg=SURF)
+        run_wrap.pack(side="bottom", fill="x")
+        tk.Frame(run_wrap, bg=UI["border"], height=1).pack(fill="x")
+        run_bar = tk.Frame(run_wrap, bg=SURF)
+        run_bar.pack(fill="x", padx=20, pady=12)
+
+        body = tk.Frame(dialog, bg=CARD)
+        body.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        body.columnconfigure(0, weight=1, minsize=270)
         body.columnconfigure(1, weight=3)
         body.rowconfigure(0, weight=1)
 
         # ---- Left: groups ------------------------------------------------
-        left = tk.Frame(body, bg="#ffffff", relief="solid", bd=1)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        tk.Label(left, text="Groups", font=("Arial", 11, "bold"), bg="#ffffff").pack(
-            anchor="w", padx=10, pady=(10, 5)
-        )
-        group_buttons = tk.Frame(left, bg="#ffffff")
-        group_buttons.pack(side="bottom", fill="x", padx=10, pady=10)
-        groups_box = tk.Listbox(left, font=("Arial", 10), exportselection=False, activestyle="none")
-        groups_box.pack(fill="both", expand=True, padx=10)
+        left = _panel(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        left_head = tk.Frame(left, bg=SURF)
+        left_head.pack(fill="x", padx=12, pady=(12, 8))
+        tk.Label(left_head, text="กลุ่ม", font=("Segoe UI Semibold", 11), bg=SURF,
+                 fg=UI["text"]).pack(side="left")
+        group_buttons = tk.Frame(left, bg=SURF)
+        group_buttons.pack(side="bottom", fill="x", padx=12, pady=12)
+        groups_box = _listbox(left)
+        groups_box.pack(fill="both", expand=True, padx=12)
 
         # ---- Right: scripts of the selected group --------------------------
-        right = tk.Frame(body, bg="#ffffff", relief="solid", bd=1)
+        right = tk.Frame(body, bg=CARD)
         right.grid(row=0, column=1, sticky="nsew")
-        scripts_title = tk.Label(right, text="Scripts", font=("Arial", 11, "bold"), bg="#ffffff")
-        scripts_title.pack(anchor="w", padx=10, pady=(10, 5))
+        right_head = tk.Frame(right, bg=CARD)
+        right_head.pack(fill="x", pady=(0, 8))
+        scripts_title = tk.Label(right_head, text="Scripts", font=("Segoe UI Semibold", 11),
+                                 bg=CARD, fg=UI["text"])
+        scripts_title.pack(side="left")
+        script_buttons = tk.Frame(right_head, bg=CARD)
+        script_buttons.pack(side="right")
 
-        run_bar = tk.Frame(right, bg="#ffffff")
-        run_bar.pack(side="bottom", fill="x", padx=10, pady=10)
-        script_buttons = tk.Frame(right, bg="#ffffff")
-        script_buttons.pack(side="bottom", fill="x", padx=10, pady=(6, 0))
-
-        list_row = tk.Frame(right, bg="#ffffff")
-        list_row.pack(fill="both", expand=True, padx=10)
-        order_buttons = tk.Frame(list_row, bg="#ffffff")
-        order_buttons.pack(side="right", fill="y", padx=(6, 0))
-        scripts_box = tk.Listbox(
-            list_row, font=("Arial", 10), exportselection=False, activestyle="none", height=10
-        )
+        list_row = tk.Frame(right, bg=CARD)
+        list_row.pack(fill="both", expand=True)
+        order_buttons = tk.Frame(list_row, bg=CARD)
+        order_buttons.pack(side="right", fill="y", padx=(8, 0))
+        scripts_box = _listbox(list_row, height=9)
         scripts_box.pack(side="left", fill="both", expand=True)
 
-        tk.Label(right, text="SQL preview:", font=("Arial", 9), bg="#ffffff", fg="#7f8c8d").pack(
-            anchor="w", padx=10, pady=(8, 2)
+        tk.Label(right, text="SQL preview", font=UI_FONT_LABEL, bg=CARD, fg=UI["muted"]).pack(
+            anchor="w", pady=(10, 4)
         )
-        preview = scrolledtext.ScrolledText(right, height=8, font=("Courier", 9), wrap=tk.NONE)
-        preview.pack(fill="both", expand=False, padx=10)
+        preview = scrolledtext.ScrolledText(
+            right, height=7, font=("Consolas", 10), wrap=tk.NONE, bg=SURF, fg=UI["text"], bd=0,
+            relief="flat", highlightthickness=1, highlightbackground=UI["border"], padx=10, pady=8,
+        )
+        preview.pack(fill="both", expand=False)
         preview.config(state="disabled")
 
         # ---- helpers -----------------------------------------------------
@@ -3486,7 +3598,7 @@ class DatabaseConnectorGUI:
         def refresh_groups(select_name=None):
             profile = self.profile_combo.get()
             state["profile"] = profile
-            profile_label.config(text=f"Profile: {profile or '-'}")
+            profile_label.config(text=f"เก็บ Script เป็นชุด แยกจาก Saved Jobs · Profile: {profile or '-'}")
             previous = current_group()
             keep = select_name or (previous["name"] if previous else None)
             state["groups"] = [g for g in self.script_groups if g.get("profile") == profile]
@@ -3515,7 +3627,7 @@ class DatabaseConnectorGUI:
                 update_buttons()
                 return
             scripts = group.setdefault("scripts", [])
-            scripts_title.config(text=f"Scripts in '{group['name']}'  ({len(scripts)})")
+            scripts_title.config(text=f"{group['name']}   ·   {len(scripts)} scripts · รันตามลำดับ")
             for number, script in enumerate(scripts, 1):
                 scripts_box.insert(tk.END, f"{number}. {script.get('name', '')}")
             if scripts:
@@ -3528,10 +3640,10 @@ class DatabaseConnectorGUI:
             update_buttons()
 
         def set_enabled(btn, enabled):
-            # Grey out coloured buttons too, so disabled ones never look clickable
+            # Disabled buttons turn grey, so they never look clickable
             btn.config(
                 state="normal" if enabled else "disabled",
-                bg=btn._group_color if enabled else "#bdc3c7",
+                bg=btn._group_color if enabled else UI["hover"],
             )
 
         def update_buttons():
@@ -3870,41 +3982,42 @@ class DatabaseConnectorGUI:
             self.results_text.see(tk.END)
 
         # ---- buttons -------------------------------------------------------
-        def _btn(parent, text, command, color="#95a5a6", **pack):
-            b = tk.Button(parent, text=text, command=command, bg=color, fg="white", font=("Arial", 9))
-            b._group_color = color
+        KIND = {"#27ae60": "success", "#3498db": "secondary", "#e74c3c": "danger", "#95a5a6": "secondary"}
+
+        def _btn(parent, text, command, color="#95a5a6", size="sm", **pack):
+            kind = KIND.get(color, "secondary")
+            style = ui_button_style(kind, size)
+            if kind == "secondary":
+                style.update(highlightthickness=1, highlightbackground=UI["border_strong"])
+            b = tk.Button(parent, text=text, command=command, **style)
+            b._group_color = style["bg"]
+            hover = {"success": UI["success_hover"], "danger": UI["danger_hover"]}.get(kind, UI["hover"])
+            b.bind("<Enter>", lambda _e: str(b["state"]) != "disabled" and b.config(bg=hover), add="+")
+            b.bind("<Leave>", lambda _e: str(b["state"]) != "disabled" and b.config(bg=b._group_color), add="+")
             b.pack(**pack)
             return b
 
-        _btn(group_buttons, "+ New Group", new_group, "#27ae60", side="left", padx=(0, 4))
-        _btn(header_buttons, "📥 Import Groups", import_groups, side="left", padx=(0, 6))
-        _btn(header_buttons, "📤 Export Groups", export_groups, side="left")
-        rename_btn = _btn(group_buttons, "✏ Rename", rename_group, side="left", padx=4)
-        delete_group_btn = _btn(group_buttons, "🗑 Delete", delete_group, "#e74c3c", side="left", padx=4)
+        _btn(left_head, "＋ New Group", new_group, "#27ae60", side="right")
+        _btn(header_buttons, "⇧  Import Groups", import_groups, side="left", padx=(0, 6))
+        _btn(header_buttons, "⇩  Export Groups", export_groups, side="left")
+        rename_btn = _btn(group_buttons, "✎  Rename", rename_group, side="left", padx=(0, 6))
+        delete_group_btn = _btn(group_buttons, "🗑  Delete", delete_group, "#e74c3c", side="left")
 
-        up_btn = _btn(order_buttons, "↑", lambda: move_script(-1), side="top", pady=(0, 4))
-        down_btn = _btn(order_buttons, "↓", lambda: move_script(1), side="top")
+        up_btn = _btn(order_buttons, "↑", lambda: move_script(-1), side="top", pady=(0, 4), fill="x")
+        down_btn = _btn(order_buttons, "↓", lambda: move_script(1), side="top", pady=(0, 12), fill="x")
+        edit_btn = _btn(order_buttons, "✎ Edit", edit_script, side="top", pady=(0, 4), fill="x")
+        delete_script_btn = _btn(order_buttons, "🗑 Remove", delete_script, "#e74c3c", side="top", fill="x")
 
-        add_editor_btn = _btn(
-            script_buttons, "+ Add SQL", add_sql, "#3498db", side="left", padx=(0, 4)
-        )
-        add_jobs_btn = _btn(
-            script_buttons, "+ From Saved Jobs", add_from_jobs, "#3498db", side="left", padx=4
-        )
-        edit_btn = _btn(script_buttons, "✏ Edit", edit_script, side="left", padx=4)
-        delete_script_btn = _btn(
-            script_buttons, "🗑 Remove", delete_script, "#e74c3c", side="left", padx=4
-        )
+        add_editor_btn = _btn(script_buttons, "＋ Add SQL", add_sql, side="left", padx=(0, 6))
+        add_jobs_btn = _btn(script_buttons, "🕘  From Saved Jobs", add_from_jobs, side="left")
 
-        run_btn = _btn(run_bar, "▶ Run Group", run_group, "#27ae60", side="left", padx=(0, 6))
-        export_btn = _btn(run_bar, "📤 Export Group to Excel", export_group, "#3498db", side="left")
-        stop_group_btn = tk.Button(
-            run_bar, text="⏹ Stop", command=self.stop_running_queries, bg="#e74c3c", fg="white",
-            font=("Arial", 9),
-        )
-        stop_group_btn.pack(side="left", padx=6)
+        run_btn = _btn(run_bar, "▶  Run Group", run_group, "#27ae60", size="md", side="left", padx=(0, 8))
+        export_btn = _btn(run_bar, "⇩  Export Group to Excel", export_group, size="md", side="left")
+        stop_group_btn = tk.Button(run_bar, text="⏹  Stop", command=self.stop_running_queries,
+                                   **ui_button_style("danger", "md"))
+        stop_group_btn.pack(side="left", padx=8)
         self._register_stop_button(stop_group_btn)
-        self._result_windows_checkbox(run_bar, "#ffffff").pack(side="right")
+        self._result_windows_checkbox(run_bar, UI["surface"]).pack(side="right")
 
         groups_box.bind("<<ListboxSelect>>", lambda _e: refresh_scripts())
         groups_box.bind("<Double-Button-1>", lambda _e: rename_group())
@@ -6167,7 +6280,42 @@ class DatabaseConnectorGUI:
             self.status_label.config(text="❌ Connection Failed", foreground="#e74c3c")
             self.results_text.insert(tk.END, f"❌ Connection Error: {error}\n\n")
             self.results_text.see(tk.END)
-            messagebox.showerror("Connection Error", str(error))
+            self._show_connection_error(error)
+
+    def _show_connection_error(self, error):
+        """Connection failed: show the database message and what to check."""
+        profile = self.profile_combo.get() or "-"
+
+        def body(frame):
+            box = tk.Frame(frame, bg=UI["danger_soft"])
+            box.pack(fill="x")
+            msg = str(error).strip()
+            tk.Label(box, text=msg if len(msg) <= 400 else msg[:399] + "…", bg=UI["danger_soft"],
+                     fg=UI["danger"], font=("Consolas", 9), anchor="w", justify="left",
+                     wraplength=470).pack(fill="x", padx=12, pady=10)
+            tk.Label(frame, text="ลองตรวจสอบ", bg=UI["card"], fg=UI["muted"], font=UI_FONT_LABEL,
+                     anchor="w").pack(fill="x", pady=(12, 2))
+            for tip in ("•  User / Password ถูกต้อง และยังไม่หมดอายุ",
+                        "•  Host, Port และ Database / Service Name",
+                        "•  ต่อ VPN / network ของธนาคารอยู่"):
+                tk.Label(frame, text=tip, bg=UI["card"], fg=UI["text"], font=UI_FONT,
+                         anchor="w").pack(fill="x")
+
+        choice = ui_dialog(
+            self.root,
+            "Connection Error",
+            "เชื่อมต่อฐานข้อมูลไม่สำเร็จ",
+            f"Profile {profile} ต่อ {self.db_type.get()} ไม่ได้ ข้อความจากฐานข้อมูล:",
+            tone="danger",
+            build_body=body,
+            buttons=(("แก้ไขข้อมูลเชื่อมต่อ", "edit", "secondary"), ("↻  ลองใหม่", "retry", "primary")),
+            cancel_value=None,
+            message=str(error),
+        )
+        if choice == "edit" and not getattr(self, "creds_expanded", True):
+            self.creds_toggle_btn.invoke()
+        elif choice == "retry":
+            self.root.after(50, self.connect_database)
 
     def read_sql_dataframe(self, sql_query):
         """Run a SELECT through the driver cursor and keep values as returned.
@@ -6457,17 +6605,45 @@ class DatabaseConnectorGUI:
             lines.append(f"• {job.get('name') or 'SQL Editor'}:  {first_line}")
         if len(changes) > 10:
             lines.append(f"... and {len(changes) - 10} more")
+        profile = self.profile_combo.get() or "-"
 
-        return messagebox.askyesno(
+        def body(frame):
+            box = tk.Frame(frame, bg="#FEF3C7")
+            box.pack(fill="x")
+            for job in changes[:6]:
+                tk.Label(box, text=job.get("name") or "SQL Editor", bg="#FEF3C7", fg=UI["text"],
+                         font=UI_FONT_SEMI, anchor="w").pack(fill="x", padx=12, pady=(8, 0))
+                sql = " ".join(str(job.get("query", "")).split())
+                tk.Label(box, text=sql if len(sql) <= 90 else sql[:89] + "…", bg="#FEF3C7",
+                         fg=UI["muted"], font=("Consolas", 9), anchor="w").pack(fill="x", padx=12)
+            if len(changes) > 6:
+                tk.Label(box, text=f"… และอีก {len(changes) - 6} คำสั่ง", bg="#FEF3C7",
+                         fg=UI["muted"], font=UI_FONT_SM, anchor="w").pack(fill="x", padx=12)
+            tk.Frame(box, bg="#FEF3C7", height=8).pack()
+            info = tk.Frame(frame, bg=UI["card"])
+            info.pack(fill="x", pady=(12, 0))
+            for r, (k, v) in enumerate((("Profile", profile), ("Database", target))):
+                tk.Label(info, text=k, bg=UI["card"], fg=UI["muted"], font=UI_FONT_SM).grid(
+                    row=r, column=0, sticky="w", padx=(0, 16), pady=1)
+                tk.Label(info, text=v, bg=UI["card"], fg=UI["text"], font=UI_FONT_SEMI).grid(
+                    row=r, column=1, sticky="w", pady=1)
+            tk.Label(frame, text="ⓘ  ย้อนกลับไม่ได้หลัง commit", bg=UI["card"], fg=UI["danger"],
+                     font=UI_FONT_SM, anchor="w").pack(fill="x", pady=(10, 0))
+
+        return bool(ui_dialog(
+            self.root,
             "Confirm Data Change",
-            f"{len(changes)} statement(s) will CHANGE DATA and be committed immediately:\n\n"
+            "ยืนยันการแก้ไขข้อมูล",
+            f"มี {len(changes)} คำสั่งที่จะแก้ไขข้อมูลและ commit ทันที ตรวจสอบก่อนกดรัน",
+            tone="warn",
+            build_body=body,
+            buttons=(("ยกเลิก", False, "secondary"), ("▶  รันและ commit", True, "danger")),
+            cancel_value=False,
+            focus_value=False,
+            message=f"{len(changes)} statement(s) will CHANGE DATA and be committed immediately:\n\n"
             + "\n".join(lines)
-            + f"\n\nProfile : {self.profile_combo.get() or '-'}\n"
-            f"Database: {target}\n\n"
-            "This cannot be undone. Continue?",
-            icon="warning",
-            default="no",
-        )
+            + f"\n\nProfile : {profile}\nDatabase: {target}",
+        ))
 
     def execute_query(self):
         """Execute the SQL query with comprehensive error handling and retry capability"""
@@ -8188,13 +8364,62 @@ class DatabaseConnectorGUI:
             return jobs
 
         others = len(jobs) - len(cached)
-        answer = messagebox.askyesnocancel(
+        run_time = last["time"].strftime("%H:%M:%S")
+
+        def body(frame):
+            choice = tk.BooleanVar(value=True)
+
+            def option(value, title, desc):
+                card = tk.Frame(frame, bg=UI["card"], highlightthickness=1, cursor="hand2")
+                card.pack(fill="x", pady=(0, 8))
+                rb = tk.Radiobutton(card, variable=choice, value=value, bg=UI["card"],
+                                    activebackground=UI["card"], selectcolor="#FFFFFF",
+                                    highlightthickness=0, bd=0, cursor="hand2")
+                rb.pack(side="left", padx=(12, 6), pady=10, anchor="n")
+                col = tk.Frame(card, bg=UI["card"])
+                col.pack(side="left", fill="x", expand=True, pady=8)
+                t = tk.Label(col, text=title, bg=UI["card"], fg=UI["text"], font=UI_FONT_SEMI, anchor="w")
+                t.pack(fill="x")
+                d = tk.Label(col, text=desc, bg=UI["card"], fg=UI["muted"], font=UI_FONT_SM,
+                             anchor="w", justify="left", wraplength=400)
+                d.pack(fill="x")
+                for w in (card, col, t, d):
+                    w.bind("<Button-1>", lambda _e: choice.set(value))
+                return card, (card, col, t, d, rb)
+
+            cards = [
+                option(True, "ใช้ผลเดิม (เร็ว)", "Export ทันทีจากผลที่รันไว้"
+                       + (f" อีก {others} Job ที่ยังไม่มีผลจะถูกรันให้" if others else "")),
+                option(False, "รัน Query ใหม่ทั้งหมด", "ได้ข้อมูลล่าสุด แต่ใช้เวลานานกว่า"),
+            ]
+
+            def paint(*_):
+                for (card, parts), value in zip(cards, (True, False)):
+                    on = choice.get() == value
+                    bg = "#EFF6FF" if on else UI["card"]
+                    card.config(highlightbackground=UI["primary"] if on else UI["border"],
+                                highlightcolor=UI["primary"] if on else UI["border"])
+                    for w in parts:
+                        w.config(bg=bg)
+                        if isinstance(w, tk.Radiobutton):
+                            w.config(activebackground=bg)
+
+            choice.trace_add("write", paint)
+            paint()
+            # "Export" returns the chosen option; "Cancel" stays None
+            return lambda pressed: choice.get() if pressed else None
+
+        answer = ui_dialog(
+            self.root,
             "Export Excel",
-            f"{len(cached)} of {len(jobs)} job(s) already have results from the run at "
-            f"{last['time'].strftime('%H:%M:%S')}.\n\n"
-            "Yes = export those results (no re-run, faster)"
-            + (f"\n        the other {others} job(s) will be run" if others else "")
-            + "\nNo = run all queries again (latest data)\nCancel = do not export",
+            "ใช้ผลจากรอบที่รันล่าสุด?",
+            f"{len(cached)} จาก {len(jobs)} Job มีผลจากการรันเมื่อ {run_time} แล้ว เลือกว่าจะ Export อย่างไร",
+            tone="info",
+            build_body=body,
+            buttons=(("ยกเลิก", None, "secondary"), ("⇩  Export Excel", True, "primary")),
+            cancel_value=None,
+            message=f"{len(cached)} of {len(jobs)} job(s) มีผลจากการรันเมื่อ {run_time}"
+            + (f"; the other {others} job(s) will be run" if others else ""),
         )
         if answer is None:
             return None
@@ -8923,63 +9148,193 @@ class DatabaseConnectorGUI:
             "Microsoft SQL Server": "1433",
             "Oracle": "1521",
         }
+        CARD = UI["card"]
 
-        dialog = self._create_centered_dialog("➕ New Profile", 460, 540)
-        dialog.configure(bg=UI["card"])
+        dialog = self._create_centered_dialog("New Profile", 620, 720)
+        dialog.configure(bg=CARD)
         dialog.resizable(False, False)
 
-        body = tk.Frame(dialog, bg=UI["card"])
-        body.pack(fill="both", expand=True, padx=20, pady=16)
+        body = tk.Frame(dialog, bg=CARD)
+        body.pack(fill="both", expand=True, padx=24, pady=(20, 12))
         body.columnconfigure(0, weight=1)
 
-        tk.Label(
-            body,
-            text="Create New Profile",
-            bg=UI["card"],
-            fg=UI["text"],
-            font=("Segoe UI", 12, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        # Heading
+        head = tk.Frame(body, bg=CARD)
+        head.pack(fill="x", pady=(0, 14))
+        badge = tk.Canvas(head, width=40, height=40, bg=CARD, highlightthickness=0)
+        badge.create_oval(1, 1, 39, 39, fill="#DBEAFE", outline="#DBEAFE")
+        badge.create_text(20, 20, text="🛢", fill=UI["primary"], font=("Segoe UI", 13))
+        badge.pack(side="left", padx=(0, 14))
+        titles = tk.Frame(head, bg=CARD)
+        titles.pack(side="left", fill="x")
+        tk.Label(titles, text="สร้าง Profile ใหม่", bg=CARD, fg=UI["text"],
+                 font=("Segoe UI Semibold", 13)).pack(anchor="w")
+        tk.Label(titles, text="บันทึกข้อมูลเชื่อมต่อไว้ใช้ครั้งถัดไป เลือก Profile แล้วกด Connect ได้เลย",
+                 bg=CARD, fg=UI["muted"], font=UI_FONT_SM).pack(anchor="w")
 
-        row = [1]
+        def label(parent, text, required=False):
+            row = tk.Frame(parent, bg=CARD)
+            row.pack(fill="x", pady=(0, 4))
+            tk.Label(row, text=text, bg=CARD, fg=UI["text"], font=UI_FONT_LABEL).pack(side="left")
+            if required:
+                tk.Label(row, text="*", bg=CARD, fg=UI["danger"], font=UI_FONT_LABEL).pack(side="left")
 
-        def _add(label, widget_factory):
-            ui_field_label(body, label).grid(row=row[0], column=0, sticky="w", pady=(4, 2))
-            w = widget_factory()
-            w.grid(row=row[0] + 1, column=0, sticky="ew")
-            row[0] += 2
-            return w
+        def helper(parent, text):
+            tk.Label(parent, text=text, bg=CARD, fg=UI["muted"], font=UI_FONT_SM,
+                     anchor="w").pack(fill="x", pady=(3, 0))
 
-        name_entry = _add(
-            "PROFILE NAME", lambda: ttk.Entry(body, font=UI_FONT, style="Fluent.TEntry")
-        )
-        type_combo = _add(
-            "DATABASE TYPE",
-            lambda: ttk.Combobox(
-                body,
-                state="readonly",
-                font=UI_FONT,
-                style="Fluent.TCombobox",
-                values=tuple(port_defaults.keys()),
-            ),
-        )
-        type_combo.current(0)
-        host_entry = _add("HOST", lambda: ttk.Entry(body, font=UI_FONT, style="Fluent.TEntry"))
-        port_entry = _add("PORT", lambda: ttk.Entry(body, font=UI_FONT, style="Fluent.TEntry"))
+        def entry(parent, show=None):
+            e = ttk.Entry(parent, font=UI_FONT, style="Fluent.TEntry", show=show or "")
+            e.pack(fill="x")
+            return e
+
+        def field(parent, text, required=False, show=None, hint=None):
+            box = tk.Frame(parent, bg=CARD)
+            label(box, text, required)
+            e = entry(box, show)
+            if hint:
+                helper(box, hint)
+            return box, e
+
+        # Profile name
+        box, name_entry = field(body, "ชื่อ Profile", True,
+                                hint="ตั้งให้รู้ว่าต่อที่ไหน เช่น uat select, prod readonly")
+        box.pack(fill="x", pady=(0, 14))
+
+        # Database type: 4 cards
+        type_box = tk.Frame(body, bg=CARD)
+        type_box.pack(fill="x", pady=(0, 14))
+        label(type_box, "ประเภทฐานข้อมูล", True)
+        type_var = tk.StringVar(value="PostgreSQL")
+        cards_row = tk.Frame(type_box, bg=CARD)
+        cards_row.pack(fill="x")
+        type_cards = {}
+        for col, (db, title) in enumerate((("Oracle", "Oracle"), ("PostgreSQL", "PostgreSQL"),
+                                           ("MySQL", "MySQL"), ("Microsoft SQL Server", "SQL Server"))):
+            cards_row.columnconfigure(col, weight=1, uniform="type")
+            card = tk.Frame(cards_row, bg=CARD, highlightthickness=1, cursor="hand2")
+            card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 8, 0))
+            t = tk.Label(card, text=title, bg=CARD, fg=UI["text"], font=UI_FONT_SEMI, anchor="w")
+            t.pack(fill="x", padx=12, pady=(8, 0))
+            p = tk.Label(card, text=f"port {port_defaults[db]}", bg=CARD, fg=UI["muted"],
+                         font=UI_FONT_SM, anchor="w")
+            p.pack(fill="x", padx=12, pady=(0, 8))
+            for w in (card, t, p):
+                w.bind("<Button-1>", lambda _e, v=db: type_var.set(v))
+            type_cards[db] = (card, t, p)
+
+        tk.Frame(body, bg=UI["border"], height=1).pack(fill="x", pady=(0, 12))
+        tk.Label(body, text="การเชื่อมต่อ", bg=CARD, fg=UI["text"],
+                 font=("Segoe UI Semibold", 11)).pack(anchor="w", pady=(0, 8))
+
+        # Host + Port
+        row1 = tk.Frame(body, bg=CARD)
+        row1.pack(fill="x", pady=(0, 12))
+        row1.columnconfigure(0, weight=3)
+        row1.columnconfigure(1, weight=1)
+        hb, host_entry = field(row1, "Host", True)
+        hb.grid(row=0, column=0, sticky="new", padx=(0, 12))
+        pb, port_entry = field(row1, "Port", True, hint="ใส่ให้อัตโนมัติตามประเภท")
+        pb.grid(row=0, column=1, sticky="new")
         port_entry.insert(0, port_defaults["PostgreSQL"])
-        user_entry = _add("USER", lambda: ttk.Entry(body, font=UI_FONT, style="Fluent.TEntry"))
-        pass_entry = _add(
-            "PASSWORD", lambda: ttk.Entry(body, show="*", font=UI_FONT, style="Fluent.TEntry")
-        )
-        dbname_entry = _add(
-            "DATABASE", lambda: ttk.Entry(body, font=UI_FONT, style="Fluent.TEntry")
-        )
 
-        def _on_type_change(_e=None):
+        db_box, dbname_entry = field(body, "Database / Service Name",
+                                     hint="Oracle ใส่ Service Name · SQL Server ถ้าว่างจะต่อ master")
+        db_box.pack(fill="x", pady=(0, 12))
+
+        # User + Password
+        row2 = tk.Frame(body, bg=CARD)
+        row2.pack(fill="x", pady=(0, 12))
+        row2.columnconfigure(0, weight=1, uniform="up")
+        row2.columnconfigure(1, weight=1, uniform="up")
+        ub, user_entry = field(row2, "User", True)
+        ub.grid(row=0, column=0, sticky="new", padx=(0, 12))
+        pwb, pass_entry = field(row2, "Password", True, show="*")
+        pwb.grid(row=0, column=1, sticky="new")
+        pass_entry.configure(style="Password.Fluent.TEntry")
+        eye = tk.Label(pass_entry, text=PASSWORD_ICON_SHOW, font=("Segoe MDL2 Assets", 11),
+                       bg="#FFFFFF", fg=UI["muted"], cursor="hand2", bd=0, padx=4)
+        eye.place(relx=1.0, rely=0.5, x=-6, anchor="e")
+
+        def _toggle_eye(_e=None):
+            showing = pass_entry.cget("show") == ""
+            pass_entry.configure(show="*" if showing else "")
+            eye.config(text=PASSWORD_ICON_SHOW if showing else PASSWORD_ICON_HIDE)
+
+        eye.bind("<Button-1>", _toggle_eye)
+
+        # Test result (hidden until "Test connection" is used)
+        result_box = tk.Frame(body, bg=CARD)
+        result_box.pack(fill="x")
+        result_label = tk.Label(result_box, text="", bg=CARD, font=UI_FONT_SEMI, anchor="w",
+                                justify="left", wraplength=540)
+
+        def _on_type_change(*_):
+            db = type_var.get()
             port_entry.delete(0, tk.END)
-            port_entry.insert(0, port_defaults.get(type_combo.get(), "5432"))
+            port_entry.insert(0, port_defaults.get(db, "5432"))
+            for key, (card, t, p) in type_cards.items():
+                on = key == db
+                bg = "#EFF6FF" if on else CARD
+                card.config(bg=bg, highlightbackground=UI["primary"] if on else UI["border_strong"],
+                            highlightcolor=UI["primary"] if on else UI["border_strong"],
+                            highlightthickness=2 if on else 1)
+                t.config(bg=bg, fg=UI["primary"] if on else UI["text"],
+                         text=(("✓  " if on else "") + t.cget("text").replace("✓  ", "")))
+                p.config(bg=bg)
 
-        type_combo.bind("<<ComboboxSelected>>", _on_type_change)
+        type_var.trace_add("write", _on_type_change)
+        _on_type_change()
+        port_entry.delete(0, tk.END)
+        port_entry.insert(0, port_defaults["PostgreSQL"])
         name_entry.focus_set()
+
+        for _w in (name_entry, host_entry, port_entry, user_entry, pass_entry, dbname_entry):
+            _w.bind("<Return>", lambda _e: create())
+
+        def test_connection():
+            """Try the entered details with a throw-away connection (main one untouched)."""
+            db_type = type_var.get()
+            args = (db_type, user_entry.get().strip(), pass_entry.get(), host_entry.get().strip(),
+                    port_entry.get().strip().split(":")[0], dbname_entry.get().strip())
+            result_label.config(text="⏳  กำลังทดสอบการเชื่อมต่อ…", bg="#FEF3C7", fg=UI["warn"])
+            result_box.config(bg="#FEF3C7")
+            result_label.pack(fill="x", padx=12, pady=10)
+            test_btn.config(state="disabled")
+
+            def work():
+                import time as _time
+
+                start = _time.perf_counter()
+                try:
+                    engine = create_engine(
+                        self.get_connection_string(*args), connect_args=self.get_connect_args(db_type)
+                    )
+                    try:
+                        with engine.connect() as conn:
+                            conn.execute(text("SELECT 1 FROM DUAL" if db_type == "Oracle" else "SELECT 1"))
+                    finally:
+                        engine.dispose()
+                    outcome = (True, f"✓  ทดสอบเชื่อมต่อสำเร็จ · {db_type} · {int((_time.perf_counter() - start) * 1000)} ms")
+                except Exception as error:
+                    first = next((ln for ln in str(error).splitlines() if ln.strip()), str(error))
+                    outcome = (False, f"✕  เชื่อมต่อไม่สำเร็จ: {first.strip()}")
+
+                def show():
+                    if not dialog.winfo_exists():
+                        return
+                    ok, msg = outcome
+                    bg, fg = (UI["success_soft"], UI["success"]) if ok else (UI["danger_soft"], UI["danger"])
+                    result_box.config(bg=bg)
+                    result_label.config(text=msg if len(msg) <= 300 else msg[:299] + "…", bg=bg, fg=fg)
+                    test_btn.config(state="normal")
+
+                try:
+                    dialog.after(0, show)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+            threading.Thread(target=work, daemon=True).start()
 
         def create():
             profile_name = name_entry.get().strip()
@@ -9008,7 +9363,7 @@ class DatabaseConnectorGUI:
                 port_value = port_value.split(":")[0]
 
             self.saved_profiles[profile_name] = {
-                "db_type": type_combo.get(),
+                "db_type": type_var.get(),
                 "db_user": user_entry.get().strip(),
                 "db_password": pass_entry.get(),
                 "db_host": host_entry.get().strip(),
@@ -9030,17 +9385,26 @@ class DatabaseConnectorGUI:
             dialog.destroy()
             messagebox.showinfo("Success", f"สร้าง Profile '{profile_name}' เรียบร้อย")
 
-        btn_frame = tk.Frame(body, bg=UI["card"])
-        btn_frame.grid(row=row[0], column=0, sticky="e", pady=(16, 0))
-        _cancel_outer, _ = ui_button(
-            btn_frame, "Cancel", dialog.destroy, kind="secondary", size="sm"
-        )
-        _cancel_outer.pack(side=tk.RIGHT)
-        _create_outer, _ = ui_button(btn_frame, "➕ Create", create, kind="primary", size="sm")
-        _create_outer.pack(side=tk.RIGHT, padx=(0, 6))
+        # Footer
+        tk.Frame(dialog, bg=UI["border"], height=1).pack(fill="x")
+        footer = tk.Frame(dialog, bg=UI["surface"])
+        footer.pack(fill="x")
+        _test_outer, test_btn = ui_button(footer, "🔌  ทดสอบการเชื่อมต่อ", test_connection,
+                                          kind="secondary", size="md")
+        _test_outer.pack(side=tk.LEFT, padx=24, pady=12)
+        _create_outer, _ = ui_button(footer, "＋  สร้าง Profile", create, kind="primary", size="md")
+        _create_outer.pack(side=tk.RIGHT, padx=(6, 24), pady=12)
+        _cancel_outer, _ = ui_button(footer, "ยกเลิก", dialog.destroy, kind="secondary", size="md")
+        _cancel_outer.pack(side=tk.RIGHT, pady=12)
 
-        dialog.bind("<Return>", lambda _e: create())
         dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
+        # Size the dialog to its content (and leave room for the test result)
+        dialog.update_idletasks()
+        w, h = 620, dialog.winfo_reqheight() + 56
+        x = (dialog.winfo_screenwidth() - w) // 2
+        y = max((dialog.winfo_screenheight() - h) // 2, 0)
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
 
     def delete_profile(self):
         """ลบ profile ที่เลือก"""
@@ -9484,27 +9848,46 @@ class DatabaseConnectorGUI:
         dialog.title("Load Excel SQL Parameters")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.geometry("1150x680")
-        dialog.minsize(900, 560)
+        dialog.geometry("1150x700")
+        dialog.minsize(900, 580)
+        dialog.configure(bg=UI["card"])
+        CARD = UI["card"]
 
-        content = ttk.Frame(dialog, padding=16)
-        content.pack(fill="both", expand=True)
+        # Header: title + Excel file
+        _head = tk.Frame(dialog, bg=CARD)
+        _head.pack(side="top", fill="x", padx=20, pady=(16, 4))
+        tk.Label(_head, text="Load Excel → SQL Parameter", bg=CARD, fg=UI["text"],
+                 font=("Segoe UI Semibold", 14)).pack(anchor="w")
+        tk.Label(_head, text=f"📗  {os.path.basename(file_path)}", bg=CARD, fg=UI["muted"],
+                 font=UI_FONT_SM).pack(anchor="w")
+
+        # Footer: Cancel / Confirm (buttons added at the end)
+        _footer = tk.Frame(dialog, bg=UI["surface"])
+        _footer.pack(side="bottom", fill="x")
+        tk.Frame(_footer, bg=UI["border"], height=1).pack(side="top", fill="x")
+        _footer_bar = tk.Frame(_footer, bg=UI["surface"])
+        _footer_bar.pack(fill="x", padx=20, pady=12)
+
+        content = tk.Frame(dialog, bg=CARD)
+        content.pack(fill="both", expand=True, padx=20, pady=(8, 14))
         content.columnconfigure(0, weight=1, uniform="panel")
         content.columnconfigure(1, weight=1, uniform="panel")
         content.columnconfigure(2, weight=1, uniform="panel")
         content.rowconfigure(2, weight=1)
 
         # ---- Top: Worksheet / SQL parameter ----
-        top_frame = ttk.Frame(content)
-        top_frame.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+        top_frame = tk.Frame(content, bg=CARD)
+        top_frame.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
-        ttk.Label(top_frame, text="Worksheet").pack(side="left", padx=(0, 6))
+        tk.Label(top_frame, text="Sheet", bg=CARD, fg=UI["muted"], font=UI_FONT_LABEL).pack(
+            side="left", padx=(0, 6))
         sheet_combo = ttk.Combobox(
             top_frame, textvariable=sheet_var, values=sheet_names, state="readonly", width=30
         )
         sheet_combo.pack(side="left", padx=(0, 20))
 
-        ttk.Label(top_frame, text="SQL parameter").pack(side="left", padx=(0, 6))
+        tk.Label(top_frame, text="ใส่แทน parameter ใน SQL", bg=CARD, fg=UI["muted"],
+                 font=UI_FONT_LABEL).pack(side="left", padx=(0, 6))
         parameter_combo = ttk.Combobox(
             top_frame,
             textvariable=parameter_var,
@@ -9515,14 +9898,16 @@ class DatabaseConnectorGUI:
         parameter_combo.pack(side="left")
 
         # ---- Panel titles ----
-        ttk.Label(content, text="① Select column", font=("Arial", 10, "bold")).grid(
-            row=1, column=0, sticky="w", padx=(0, 10), pady=(0, 4)
+        _step_font = ("Segoe UI Semibold", 10)
+        tk.Label(content, text="①  เลือกคอลัมน์", bg=CARD, fg=UI["primary"], font=_step_font).grid(
+            row=1, column=0, sticky="w", padx=(0, 10), pady=(0, 6)
         )
-        ttk.Label(content, text="② Pick values", font=("Arial", 10, "bold")).grid(
-            row=1, column=1, sticky="w", padx=10, pady=(0, 4)
+        tk.Label(content, text="②  เลือกค่า", bg=CARD, fg=UI["primary"], font=_step_font).grid(
+            row=1, column=1, sticky="w", padx=10, pady=(0, 6)
         )
-        selected_title = ttk.Label(content, text="③ Selected values", font=("Arial", 10, "bold"))
-        selected_title.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(0, 4))
+        selected_title = tk.Label(content, text="③ Selected values", bg=CARD, fg=UI["primary"],
+                                  font=_step_font)
+        selected_title.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(0, 6))
 
         # ---- Per-panel search box (filters only the panel it sits in) ----
         search_jobs = {}
@@ -9593,13 +9978,16 @@ class DatabaseConnectorGUI:
             return var
 
         # ---- Panel 1: Column list ----
-        column_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
+        column_panel = tk.Frame(content, bg="#ffffff", highlightthickness=1,
+                          highlightbackground=UI["border"], highlightcolor=UI["border"])
         column_panel.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         column_search = make_search(column_panel, "columns", lambda: render_column_list())
         column_scroll = ttk.Scrollbar(column_panel, orient="vertical")
         column_list = tk.Listbox(
             column_panel,
-            font=("Arial", 10),
+            font=UI_FONT,
+            selectbackground="#DBEAFE",
+            selectforeground=UI["text"],
             selectmode=tk.SINGLE,
             exportselection=False,
             bd=0,
@@ -9611,7 +9999,8 @@ class DatabaseConnectorGUI:
         column_list.pack(side="left", fill="both", expand=True, padx=6, pady=6)
 
         # ---- Panel 2: Values of the column (checkboxes) ----
-        values_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
+        values_panel = tk.Frame(content, bg="#ffffff", highlightthickness=1,
+                          highlightbackground=UI["border"], highlightcolor=UI["border"])
         values_panel.grid(row=2, column=1, sticky="nsew", padx=10)
         values_search = make_search(values_panel, "values", lambda: render_values())
 
@@ -9641,7 +10030,8 @@ class DatabaseConnectorGUI:
         values_canvas.bind("<Leave>", lambda _e: values_canvas.unbind_all("<MouseWheel>"))
 
         # ---- Panel 3: Selected values ----
-        selected_panel = tk.Frame(content, bd=1, relief="solid", bg="#ffffff")
+        selected_panel = tk.Frame(content, bg="#ffffff", highlightthickness=1,
+                          highlightbackground=UI["border"], highlightcolor=UI["border"])
         selected_panel.grid(row=2, column=2, sticky="nsew", padx=(10, 0))
         selected_search = make_search(selected_panel, "selected", lambda: refresh_selected_list())
 
@@ -9653,7 +10043,9 @@ class DatabaseConnectorGUI:
         selected_scroll = ttk.Scrollbar(selected_area, orient="vertical")
         selected_list = tk.Listbox(
             selected_area,
-            font=("Arial", 10),
+            font=UI_FONT,
+            selectbackground="#DBEAFE",
+            selectforeground=UI["text"],
             bd=0,
             highlightthickness=0,
             activestyle="none",
@@ -9664,10 +10056,13 @@ class DatabaseConnectorGUI:
         selected_list.pack(side="left", fill="both", expand=True)
 
         # ---- Bottom: SQL ----
+        tk.Label(content, text="SQL ที่จะได้", bg=CARD, fg=UI["muted"], font=UI_FONT_LABEL).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(14, 4))
         sql_preview = scrolledtext.ScrolledText(
-            content, height=6, font=("Courier", 9), wrap=tk.WORD
+            content, height=5, font=("Consolas", 10), wrap=tk.WORD, bg="#EFF6FF", fg=UI["text"],
+            bd=0, relief="flat", highlightthickness=1, highlightbackground="#BFDBFE", padx=10, pady=8,
         )
-        sql_preview.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(14, 0))
+        sql_preview.grid(row=4, column=0, columnspan=3, sticky="nsew")
 
         # Ticked values are kept per column, so several columns can be chosen
         column_values = {}  # column -> unique value strings, in Excel order
@@ -9908,18 +10303,16 @@ class DatabaseConnectorGUI:
             )
             dialog.destroy()
 
-        ttk.Button(values_buttons, text="Cancel", command=lambda: set_all_values(False)).pack(
-            side="left", padx=4
-        )
-        ttk.Button(values_buttons, text="Select All", command=lambda: set_all_values(True)).pack(
-            side="left", padx=4
-        )
-        ttk.Button(selected_buttons, text="Cancel", command=dialog.destroy).pack(
-            side="left", padx=4
-        )
-        ttk.Button(selected_buttons, text="Confirm", command=apply_parameters).pack(
-            side="left", padx=4
-        )
+        _o, _ = ui_button(values_buttons, "ล้างที่เลือก", lambda: set_all_values(False), size="sm")
+        _o.pack(side="left", padx=4)
+        _o, _ = ui_button(values_buttons, "☑  Select All", lambda: set_all_values(True), size="sm")
+        _o.pack(side="left", padx=4)
+        tk.Label(_footer_bar, text="ติ๊กค่าที่ต้องการ แล้วตรวจ SQL ด้านบนก่อนยืนยัน", bg=UI["surface"],
+                 fg=UI["muted"], font=UI_FONT_SM).pack(side="left")
+        _o, _ = ui_button(_footer_bar, "✓  Confirm · ใส่ค่าใน SQL", apply_parameters, kind="primary", size="md")
+        _o.pack(side="right")
+        _o, _ = ui_button(_footer_bar, "ยกเลิก", dialog.destroy, size="md")
+        _o.pack(side="right", padx=(0, 8))
 
         sheet_combo.bind("<<ComboboxSelected>>", update_columns)
         column_list.bind("<<ListboxSelect>>", show_column_values)

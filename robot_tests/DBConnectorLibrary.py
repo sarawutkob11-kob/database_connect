@@ -203,6 +203,22 @@ class DBConnectorLibrary:
         for kind in ("askyesno", "askyesnocancel", "askokcancel"):
             self._patch(messagebox, kind, ask(kind))
 
+        # The app's own styled dialogs (confirm data change, reuse results,
+        # connection error) are answered from the same queue as messageboxes
+        ask_dialog = ask("askyesnocancel")
+
+        def fake_ui_dialog(parent, title, heading, subtitle="", tone="info", build_body=None,
+                           buttons=(), cancel_value=None, focus_value=None, message="", width=540):
+            text_value = "\n".join(t for t in (heading, subtitle, message) if t)
+            if title == "Connection Error":  # information only — close it
+                self.messages.append(("showerror", title, text_value))
+                logger.info(f"[dialog] {title}: {text_value}")
+                return cancel_value
+            answer = ask_dialog(title, text_value)
+            return cancel_value if answer is None else answer
+
+        self._patch(appmod, "ui_dialog", fake_ui_dialog)
+
         def save_dialog(**kw):
             self.save_dialog_names.append(kw.get("initialfile"))
             return self.save_path or ""
