@@ -284,23 +284,403 @@ _UI_HOVER = {
 }
 
 
-def ui_button(parent, text, command, kind="secondary", size="md", **options):
-    """Create a themed button. Returns (outer, button): place `outer`, keep `button`.
+# ----------------------------------------------------------------------
+# Rounded components (Figma look): Tk widgets have no corner radius, so
+# rounded, anti-aliased images are generated here and used as stretchable
+# (9-slice) ttk elements for buttons, inputs, pills and tabs, and as the
+# indicator images of check / radio buttons. Presentation only.
+# ----------------------------------------------------------------------
+import base64 as _b64
+import math as _math
+import struct as _struct
+import zlib as _zlib
 
-    Secondary buttons get a 1px light border wrapper; solid buttons are their own outer.
+ROUND = {"theme": None}
+
+
+def _rgb(hex_color):
+    c = hex_color.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _png_rgba(w, h, rows):
+    raw = b"".join(b"\x00" + bytes(r) for r in rows)
+
+    def chunk(kind, data):
+        return (_struct.pack(">I", len(data)) + kind + data
+                + _struct.pack(">I", _zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", _struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", _zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def _sdf_round_rect(px, py, w, h, r, inset=0.0):
+    hw, hh, rr = w / 2 - inset, h / 2 - inset, max(r - inset, 0.0)
+    qx, qy = abs(px - w / 2) - (hw - rr), abs(py - h / 2) - (hh - rr)
+    return _math.hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - rr
+
+
+def _seg_dist(px, py, ax, ay, bx, by):
+    dx, dy = bx - ax, by - ay
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return _math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _make_image(w, h, r, fill=None, border=None, bw=1.0, stroke=None, stroke_color=None,
+                stroke_w=1.6, underline=None):
+    """Anti-aliased rounded rectangle as a PhotoImage.
+
+    Big plain shapes are built from a small one (corners computed, middle row /
+    column repeated), so a large centre is cheap — and ttk draws it in one go
+    instead of tiling a tiny centre thousands of times.
     """
-    style = ui_button_style(kind, size)
-    style.update(options)
-    if kind == "secondary":
-        outer = tk.Frame(parent, bg=UI["border_strong"], bd=0, highlightthickness=0)
-        btn = tk.Button(outer, text=text, command=command, **style)
-        btn.pack(padx=1, pady=1)
+    core = int(2 * _math.ceil(max(r, bw)) + 6)
+    if stroke is None and (w > core or h > core):
+        sw, sh = min(w, core), min(h, core)
+        small = _image_rows(sw, sh, r, fill, border, bw, None, None, stroke_w, underline)
+        mx, my = sw // 2, sh // 2
+        rows = []
+        for row in small:
+            mid = row[mx * 4:(mx + 1) * 4]
+            rows.append(row[:mx * 4] + mid * (w - sw + 1) + row[(mx + 1) * 4:])
+        rows = rows[:my] + [rows[my]] * (h - sh + 1) + rows[my + 1:]
     else:
-        btn = tk.Button(parent, text=text, command=command, **style)
-        outer = btn
-    normal, hover = _UI_HOVER[kind]
-    ui_bind_hover(btn, UI[normal], UI[hover])
-    return outer, btn
+        rows = _image_rows(w, h, r, fill, border, bw, stroke, stroke_color, stroke_w, underline)
+    return tk.PhotoImage(data=_b64.b64encode(_png_rgba(w, h, rows)))
+
+
+def _image_rows(w, h, r, fill, border, bw, stroke, stroke_color, stroke_w, underline):
+    f = _rgb(fill) if fill else None
+    b = _rgb(border) if border else None
+    s = _rgb(stroke_color) if stroke_color else None
+    u = _rgb(underline) if underline else None
+    rows = []
+    for y in range(h):
+        row = []
+        for x in range(w):
+            px, py = x + 0.5, y + 0.5
+            layers = []  # (colour, coverage) painted bottom → top
+            if f or b:
+                outer = min(max(0.5 - _sdf_round_rect(px, py, w, h, r), 0.0), 1.0)
+                inner = min(max(0.5 - _sdf_round_rect(px, py, w, h, r, bw), 0.0), 1.0) if b else outer
+                if f:
+                    layers.append((f, inner))
+                if b:
+                    layers.append((b, max(outer - inner, 0.0)))
+            if u and y >= h - 2:
+                layers.append((u, 1.0))
+            if s and stroke:
+                d = min(_seg_dist(px, py, *stroke[i], *stroke[i + 1]) for i in range(len(stroke) - 1))
+                layers.append((s, min(max(stroke_w / 2 + 0.5 - d, 0.0), 1.0)))
+            a, col = 0.0, [0.0, 0.0, 0.0]
+            for c, cov in layers:  # "over" compositing
+                if cov <= 0:
+                    continue
+                na = cov + a * (1 - cov)
+                col = [(c[i] * cov + col[i] * a * (1 - cov)) / na for i in range(3)]
+                a = na
+            row += [int(round(v)) for v in col] + [int(round(255 * a))]
+        rows.append(row)
+    return rows
+
+
+class RoundTheme:
+    """Registers the rounded ttk elements/styles once per application."""
+
+    BUTTONS = {
+        # kind: (normal, hover, pressed, disabled) as (fill, border); fg, disabled fg, bold
+        "primary": ((("#2563EB", None), ("#1D4ED8", None), ("#1E40AF", None), ("#BFDBFE", None)), "#FFFFFF", "#EFF6FF", True),
+        "success": ((("#16A34A", None), ("#15803D", None), ("#166534", None), ("#BBF7D0", None)), "#FFFFFF", "#F0FDF4", True),
+        "danger": ((("#FEF2F2", None), ("#FEE2E2", None), ("#FECACA", None), ("#FEF2F2", None)), "#DC2626", "#FCA5A5", False),
+        "secondary": ((("#FFFFFF", "#CBD5E1"), ("#F1F5F9", "#CBD5E1"), ("#E2E8F0", "#94A3B8"), ("#F8FAFC", "#E2E8F0")), "#0F172A", "#94A3B8", False),
+        "secondary_focus": ((("#FFFFFF", "#60A5FA"), ("#F1F5F9", "#60A5FA"), ("#E2E8F0", "#2563EB"), ("#F8FAFC", "#E2E8F0")), "#0F172A", "#94A3B8", False),
+        "soft": ((("#DBEAFE", None), ("#BFDBFE", None), ("#93C5FD", None), ("#EFF6FF", None)), "#2563EB", "#93C5FD", True),
+        "ghost": (((None, None), ("#F1F5F9", None), ("#E2E8F0", None), (None, None)), "#2563EB", "#94A3B8", False),
+        "ghost_muted": (((None, None), ("#F1F5F9", None), ("#E2E8F0", None), (None, None)), "#64748B", "#94A3B8", False),
+        "ghost_danger": (((None, None), ("#FEF2F2", None), ("#FEE2E2", None), (None, None)), "#DC2626", "#FCA5A5", False),
+    }
+    PADDING = {"lg": (18, 8), "md": (14, 6), "sm": (10, 4), "icon": (4, 1)}
+    PILLS = {
+        "success": ("#DCFCE7", "#16A34A"), "danger": ("#FEE2E2", "#DC2626"), "warn": ("#FEF3C7", "#D97706"),
+        "info": ("#DBEAFE", "#2563EB"), "neutral": ("#F1F5F9", "#64748B"),
+    }
+
+    def __init__(self, style):
+        self.style = style
+        self.images = []  # keep PhotoImages alive
+        self._styles = set()
+        self._button_elements = {}
+
+        def img(*a, **k):
+            i = _make_image(*a, **k)
+            self.images.append(i)
+            return i
+
+        self._img = img
+        # inputs: rounded field (normal / focus / disabled) + chevron
+        field = img(320, 44, 6, "#FFFFFF", "#CBD5E1")
+        field_focus = img(320, 44, 6, "#FFFFFF", "#2563EB", bw=1.6)
+        field_dis = img(320, 44, 6, "#F8FAFC", "#E2E8F0")
+        style.element_create("R.field", "image", field, ("disabled", field_dis), ("focus", field_focus),
+                             border=7, sticky="nsew", width=24, height=24)
+        chevron = img(18, 16, 0, stroke=[(5, 6), (9, 10), (13, 6)], stroke_color="#64748B", stroke_w=1.6)
+        style.element_create("R.downarrow", "image", chevron, sticky="")
+        style.layout("Fluent.TEntry", [("R.field", {"sticky": "nsew", "children": [
+            ("Entry.padding", {"sticky": "nsew", "children": [("Entry.textarea", {"sticky": "nsew"})]})]})])
+        style.layout("TEntry", style.layout("Fluent.TEntry"))
+        combo = [("R.field", {"sticky": "nsew", "children": [
+            ("R.downarrow", {"side": "right", "sticky": ""}),
+            ("Combobox.padding", {"expand": "1", "sticky": "nsew", "children": [
+                ("Combobox.textarea", {"sticky": "nsew"})]})]})]
+        style.layout("Fluent.TCombobox", combo)
+        style.layout("TCombobox", combo)
+        for name in ("Fluent.TCombobox", "TCombobox"):
+            style.configure(name, padding=(8, 5, 4, 5))
+        # check / radio indicators
+        self.check_off = img(18, 18, 4.5, "#FFFFFF", "#94A3B8", bw=1.4)
+        self.check_on = img(18, 18, 4.5, "#2563EB", stroke=[(4.5, 9.5), (7.6, 12.6), (13.5, 5.8)],
+                            stroke_color="#FFFFFF", stroke_w=2.0)
+        self.radio_off = img(18, 18, 9, "#FFFFFF", "#94A3B8", bw=1.4)
+        self.radio_on = img(18, 18, 9, "#FFFFFF", "#2563EB", bw=5.0)
+        # tabs: blue underline when selected, light hover
+        tab_idle = img(160, 44, 0)
+        tab_hover = img(160, 44, 6, "#F1F5F9")
+        tab_sel = img(160, 44, 0, underline="#2563EB")
+        style.element_create("R.tab", "image", tab_idle, ("selected", tab_sel), ("active", tab_hover),
+                             border=(5, 5, 5, 3), sticky="nsew", width=12, height=12)
+        style.layout("Fluent.TNotebook.Tab", [("R.tab", {"sticky": "nsew", "children": [
+            ("Notebook.padding", {"side": "top", "sticky": "nsew", "children": [
+                ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+        style.configure("Fluent.TNotebook.Tab", padding=(14, 8), background=UI["card"])
+        style.map("Fluent.TNotebook.Tab", background=[("selected", UI["card"])],
+                  foreground=[("selected", UI["primary"]), ("active", UI["text"])])
+        # pills (badges)
+        for tone, (bg, fg) in self.PILLS.items():
+            style.element_create(f"R.pill.{tone}", "image", img(240, 28, 12, bg), border=12, sticky="nsew",
+                                 width=26, height=24)
+
+        # rounded LabelFrames (dialogs)
+        lf = img(600, 400, 8, "#FFFFFF", "#E2E8F0")
+        style.element_create("R.lf", "image", lf, border=9, sticky="nsew", width=20, height=20)
+        style.layout("TLabelframe", [("R.lf", {"sticky": "nsew"})])
+        self._frame_elements = {}
+        self._tk_button_images = {}
+
+    # -- cards --------------------------------------------------------------
+    def frame_style(self, fill, border, radius, bg):
+        key = (fill.lower(), (border or "").lower(), radius)
+        if key not in self._frame_elements:
+            element = f"R.card.{fill.lstrip('#')}.{(border or 'none').lstrip('#')}.{radius}"
+            self.style.element_create(element, "image", self._img(900, 600, radius, fill, border),
+                                      border=radius + 2, sticky="nsew",
+                                      width=2 * radius + 6, height=2 * radius + 6)
+            self._frame_elements[key] = element
+        name = f"{self._frame_elements[key]}.{bg.lstrip('#').lower()}.TFrame".replace("R.card.", "Rc")
+        if name not in self._styles:
+            self.style.layout(name, [(self._frame_elements[key], {"sticky": "nsew"})])
+            self.style.configure(name, background=bg)
+            self._styles.add(name)
+        return name
+
+    def tk_button_images(self, kind, w, h):
+        key = (kind, w, h)
+        if key not in self._tk_button_images:
+            states, _fg, _dfg, _bold = self.BUTTONS[kind]
+            n, hv, pr, d = [self._img(w, h, 6, fill, border) for fill, border in states]
+            self._tk_button_images[key] = {"normal": n, "hover": hv, "pressed": pr, "disabled": d}
+        return self._tk_button_images[key]
+
+    # -- buttons ------------------------------------------------------------
+    def _button_element(self, kind):
+        if kind not in self._button_elements:
+            states, _fg, _dfg, _bold = self.BUTTONS[kind]
+            (n, h, p, d) = [self._img(320, 48, 6, fill, border) for fill, border in states]
+            name = f"R.btn.{kind}"
+            self.style.element_create(name, "image", n, ("disabled", d), ("pressed", p), ("active", h),
+                                      border=7, sticky="nsew", width=24, height=24)
+            self._button_elements[kind] = name
+        return self._button_elements[kind]
+
+    def button_style(self, kind, size, bg):
+        kind = kind if kind in self.BUTTONS else "secondary"
+        size = size if size in self.PADDING else "md"
+        name = f"{kind}.{size}.{bg.lstrip('#').lower()}.R.TButton"
+        if name not in self._styles:
+            _states, fg, dfg, bold = self.BUTTONS[kind]
+            element = self._button_element(kind)
+            self.style.layout(name, [(element, {"sticky": "nsew", "children": [
+                ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})])
+            font_size = 9 if size in ("sm", "icon") else 10
+            self.style.configure(
+                name, foreground=fg, background=bg, padding=self.PADDING[size], anchor="center", width=-1,
+                font=("Segoe UI Semibold" if bold else "Segoe UI", font_size),
+            )
+            self.style.map(name, foreground=[("disabled", dfg)], background=[("active", bg)])
+            self._styles.add(name)
+        return name
+
+    def pill_style(self, tone, bg):
+        name = f"{tone}.{bg.lstrip('#').lower()}.Pill.TLabel"
+        if name not in self._styles:
+            self.style.layout(name, [(f"R.pill.{tone}", {"sticky": "nsew", "children": [
+                ("Label.padding", {"sticky": "nsew", "children": [("Label.label", {"sticky": "nsew"})]})]})])
+            self.style.configure(name, foreground=self.PILLS[tone][1], background=bg,
+                                 padding=(10, 3), font=UI_FONT_LABEL)
+            self._styles.add(name)
+        return name
+
+
+def ui_round_init(style):
+    # one theme per Tk application (images and ttk elements belong to it)
+    theme = ROUND["theme"]
+    if theme is None or theme.style.tk is not style.tk:
+        ROUND["theme"] = RoundTheme(style)
+    return ROUND["theme"]
+
+
+def _parent_bg(parent):
+    try:
+        return str(parent.cget("bg"))
+    except tk.TclError:
+        try:
+            return str(ttk.Style(parent).lookup(parent.winfo_class(), "background")) or UI["card"]
+        except tk.TclError:
+            return UI["card"]
+
+
+def ui_rbutton(parent, text, command=None, kind="secondary", size="md", state=None, width=None):
+    """Rounded button (ttk). Same API the app uses: config(text/state), invoke()."""
+    theme = ROUND["theme"]
+    bg = _parent_bg(parent)
+    if not bg.startswith("#"):
+        bg = UI["card"]
+    btn = ttk.Button(parent, text=text, command=command, style=theme.button_style(kind, size, bg),
+                     cursor="hand2", takefocus=True)
+    if state:
+        btn.configure(state=state)
+    if width:
+        btn.configure(width=width)
+    return btn
+
+
+def ui_pill(parent, text, tone="neutral"):
+    bg = _parent_bg(parent)
+    return ttk.Label(parent, text=text, style=ROUND["theme"].pill_style(tone, bg if bg.startswith("#") else UI["card"]))
+
+
+def ui_pill_set(label, text, tone):
+    bg = str(ttk.Style(label).lookup(label.cget("style"), "background")) or UI["card"]
+    label.configure(text=text, style=ROUND["theme"].pill_style(tone, bg))
+
+
+def ui_round_frame(parent, fill=None, border=None, radius=8, pad=4):
+    """Rounded card: returns (outer, inner). Place `outer`; put content in `inner`."""
+    theme = ROUND["theme"]
+    fill = fill or UI["card"]
+    bg = _parent_bg(parent)
+    if not bg.startswith("#"):
+        bg = UI["card"]
+    outer = ttk.Frame(parent, style=theme.frame_style(fill, border, radius, bg))
+    inner = tk.Frame(outer, bg=fill, bd=0, highlightthickness=0)
+    inner.pack(fill="both", expand=True, padx=pad, pady=pad)
+    inner._round_outer = outer
+    inner._round_radius = radius
+    return outer, inner
+
+
+def ui_round_frame_set(inner, fill, border=None):
+    """Recolour a rounded card made by ui_round_frame (e.g. selected / not selected)."""
+    outer = getattr(inner, "_round_outer", None)
+    if outer is None:
+        return
+    bg = str(ttk.Style(outer).lookup(outer.cget("style"), "background")) or UI["card"]
+    outer.configure(style=ROUND["theme"].frame_style(fill, border, inner._round_radius, bg))
+    inner.configure(bg=fill)
+
+
+def ui_round_tkbutton(w, kind="secondary", size="md"):
+    """Rounded look for an existing tk.Button (same widget, same command and state)."""
+    theme = ROUND["theme"]
+    if theme is None:
+        return
+    kind = kind if kind in theme.BUTTONS else "secondary"
+    try:
+        if not hasattr(w, "_orig_width"):
+            w._orig_width = int(w.cget("width") or 0) if not str(w.cget("image")) else 0
+        font = tkfont.Font(font=w.cget("font"))
+        lines = str(w.cget("text")).split("\n") or [""]
+        text_w = max(font.measure(line) for line in lines)
+        text_h = font.metrics("linespace") * len(lines)
+        padx, pady = theme.PADDING.get(size, (14, 6))
+        width = max(text_w, w._orig_width * font.measure("0")) + 2 * padx + 4
+        height = max(text_h + 2 * pady + 2, 30 if size != "sm" else 26)
+        imgs = theme.tk_button_images(kind, int(width), int(height))
+        bg = _parent_bg(w.master)
+        if not bg.startswith("#"):
+            bg = UI["card"]
+        _states, fg, dfg, _bold = theme.BUTTONS[kind]
+        w.configure(image=imgs["normal"] if str(w["state"]) != "disabled" else imgs["disabled"],
+                    compound="center", width=0, height=0, padx=0, pady=0, bd=0, relief="flat",
+                    overrelief="flat", highlightthickness=0, bg=bg, activebackground=bg, fg=fg,
+                    activeforeground=fg, disabledforeground=dfg, cursor="hand2")
+        w._round_imgs = imgs
+        w._ui_bg = str(w.cget("bg")).lower()
+        if not getattr(w, "_round_bound", False):
+            def _img(name, b=w):
+                if getattr(b, "_round_imgs", None) and str(b["state"]) != "disabled":
+                    b.configure(image=b._round_imgs[name])
+
+            w.bind("<Enter>", lambda _e: _img("hover"), add="+")
+            w.bind("<Leave>", lambda _e: _img("normal"), add="+")
+            w.bind("<ButtonPress-1>", lambda _e: _img("pressed"), add="+")
+            w.bind("<ButtonRelease-1>", lambda _e: _img("hover"), add="+")
+            w._round_bound = True
+    except tk.TclError:
+        pass
+
+
+def ui_round_tkbutton_sync(w):
+    """Keep the image in step with the button state (normal / disabled)."""
+    imgs = getattr(w, "_round_imgs", None)
+    if not imgs:
+        return
+    try:
+        want = imgs["disabled"] if str(w["state"]) == "disabled" else None
+        current = str(w.cget("image"))
+        if want is not None and current != str(want):
+            w.configure(image=want)
+        elif want is None and current == str(imgs["disabled"]):
+            w.configure(image=imgs["normal"])
+    except tk.TclError:
+        pass
+
+
+def ui_round_check(widget):
+    """Give a tk Checkbutton / Radiobutton the rounded indicator images."""
+    theme = ROUND["theme"]
+    if theme is None or getattr(widget, "_round_done", False):
+        return
+    try:
+        cls = widget.winfo_class()
+        on, off = ((theme.check_on, theme.check_off) if cls == "Checkbutton"
+                   else (theme.radio_on, theme.radio_off))
+        bg = widget.cget("bg")
+        text = str(widget.cget("text"))
+        widget.configure(image=off, selectimage=on, indicatoron=False, compound="left",
+                         relief="flat", offrelief="flat", overrelief="flat", bd=0,
+                         highlightthickness=0, selectcolor=bg, activebackground=bg, cursor="hand2")
+        if text and not text.startswith(" "):
+            widget.configure(text="  " + text)
+        widget._round_done = True
+    except tk.TclError:
+        pass
+
+
+def ui_button(parent, text, command, kind="secondary", size="md", **options):
+    """Create a themed (rounded) button. Returns (outer, button): place `outer`, keep `button`."""
+    btn = ui_rbutton(parent, text, command, kind=kind, size=size,
+                     state=options.get("state"), width=options.get("width"))
+    return btn, btn
 
 
 def ui_card(parent):
@@ -444,12 +824,13 @@ def ui_dialog(parent, title, heading, subtitle="", tone="info", build_body=None,
 
     focus_btn = None
     for label, value, kind in buttons:
-        outer, btn = ui_button(bar, label, lambda v=value: _finish(v), kind=kind, size="md")
-        outer.pack(side="left", padx=(8, 0))
-        if value == focus_value or (focus_btn is None and kind == "primary" and focus_value is None):
+        focused = value == focus_value and focus_value is not None
+        btn = ui_rbutton(bar, label, lambda v=value: _finish(v),
+                         kind="secondary_focus" if focused and kind == "secondary" else kind, size="md")
+        btn.pack(side="left", padx=(8, 0))
+        if focused or (focus_btn is None and kind == "primary" and focus_value is None):
             focus_btn = btn
     if focus_btn is not None:
-        focus_btn.config(highlightthickness=2, highlightbackground="#93C5FD", highlightcolor="#93C5FD")
         focus_btn.focus_set()
         dialog.bind("<Return>", lambda _e: focus_btn.invoke())
     dialog.bind("<Escape>", lambda _e: _finish(cancel_value))
@@ -672,9 +1053,13 @@ class DialogTheme:
                 and bg != UI["hover"].lower()
             ):
                 self._style_button(w, kind)
+                if first_time:
+                    self._font(w)
+                ui_round_tkbutton(w, kind)
                 w._ui_bg = self._get(w, "bg")
-            if first_time:
+            elif first_time:
                 self._font(w)
+            ui_round_tkbutton_sync(w)
         elif not first_time:
             return  # non-button widgets only need one pass
         elif cls == "Toplevel":
@@ -711,6 +1096,7 @@ class DialogTheme:
                 cursor="hand2",
             )
             self._font(w)
+            ui_round_check(w)
         elif cls in ("Entry", "Spinbox"):
             w.config(
                 relief="flat",
@@ -742,7 +1128,14 @@ class DialogTheme:
             self._font(w)
         elif cls == "TButton":
             text = str(w.cget("text")).strip().lower()
-            if text in self.ACCENT_TTK_TEXT and not str(w.cget("style")):
+            style = str(w.cget("style"))
+            if style in ("", "TButton", "Accent.TButton") and ROUND["theme"] is not None:
+                accent = style == "Accent.TButton" or text in self.ACCENT_TTK_TEXT
+                bg = _parent_bg(w.master)
+                w.config(style=ROUND["theme"].button_style(
+                    "primary" if accent else "secondary", "sm", bg if bg.startswith("#") else UI["card"]),
+                    cursor="hand2")
+            elif text in self.ACCENT_TTK_TEXT and not style:
                 w.config(style="Accent.TButton")
         w._ui_themed = True
 
@@ -1117,6 +1510,7 @@ class DatabaseConnectorGUI:
         WARN_SOFT = "#FEF3C7"
         self.root.configure(bg=APP_BG)
         self.root.minsize(1100, 680)
+        ui_round_init(self.style)
         self.style.configure(
             "Running.Horizontal.TProgressbar",
             background=UI["warn"],
@@ -1141,51 +1535,13 @@ class DatabaseConnectorGUI:
         def _vline(parent, height=22):
             return tk.Frame(parent, bg=UI["border"], width=1, height=height)
 
-        def _ghost(parent, text, command, fg=UI["primary"], bg=UI["card"]):
-            btn = tk.Button(
-                parent,
-                text=text,
-                command=command,
-                relief="flat",
-                bd=0,
-                highlightthickness=0,
-                bg=bg,
-                fg=fg,
-                activebackground=UI["hover"],
-                activeforeground=fg,
-                cursor="hand2",
-                font=UI_FONT_SM,
-                padx=8,
-                pady=4,
-            )
-            ui_bind_hover(btn, bg, UI["hover"])
-            return btn
+        def _ghost(parent, text, command, fg=UI["primary"], bg=None):
+            kind = {UI["muted"]: "ghost_muted", UI["danger"]: "ghost_danger"}.get(fg, "ghost")
+            return ui_rbutton(parent, text, command, kind=kind, size="sm")
 
-        def _soft_icon_btn(parent, text, command, kind="default", bg_parent=UI["card"]):
-            colors = {
-                "default": (UI["card"], UI["text"], UI["hover"]),
-                "primary": (BRAND_SOFT, UI["primary"], "#BFDBFE"),
-                "danger": (UI["danger_soft"], UI["danger"], UI["danger_hover"]),
-            }[kind]
-            btn = tk.Button(
-                parent,
-                text=text,
-                command=command,
-                relief="flat",
-                bd=0,
-                highlightthickness=1 if kind == "default" else 0,
-                highlightbackground=UI["border"],
-                bg=colors[0],
-                fg=colors[1],
-                activebackground=colors[2],
-                activeforeground=colors[1],
-                cursor="hand2",
-                font=("Segoe UI Semibold", 9),
-                width=3,
-                pady=1,
-            )
-            ui_bind_hover(btn, colors[0], colors[2])
-            return btn
+        def _soft_icon_btn(parent, text, command, kind="default", bg_parent=None):
+            kind = {"default": "secondary", "primary": "soft", "danger": "danger"}[kind]
+            return ui_rbutton(parent, text, command, kind=kind, size="icon")
 
         # ------------------------------------------------------------------
         # Top bar · profile + connection
@@ -1218,49 +1574,16 @@ class DatabaseConnectorGUI:
         target_sub.pack(anchor="w")
 
         # Show / hide the connection fields (same toggle as before)
-        self.creds_toggle_btn = tk.Button(
-            top_inner,
-            text="✎  Details ▾",
-            relief="flat",
-            bd=0,
-            highlightthickness=1,
-            highlightbackground=UI["border_strong"],
-            bg=UI["card"],
-            fg=UI["text"],
-            activebackground=UI["hover"],
-            cursor="hand2",
-            font=UI_FONT_SM,
-            padx=10,
-            pady=3,
-        )
+        self.creds_toggle_btn = ui_rbutton(top_inner, "✎  Details ▾", None, "secondary", "sm")
         self.creds_toggle_btn.pack(side="left", padx=(0, 12))
-        ui_bind_hover(self.creds_toggle_btn, UI["card"], UI["hover"])
 
         _vline(top_inner).pack(side="left", padx=(0, 12))
 
-        conn_badge = tk.Frame(top_inner, bg=UI["danger_soft"])
+        conn_badge = ui_pill(top_inner, "●  Not Connected", "danger")
         conn_badge.pack(side="left", padx=(0, 10))
-        conn_badge_dot = tk.Label(
-            conn_badge, text="●", bg=UI["danger_soft"], fg=UI["danger"], font=("Segoe UI", 8)
-        )
-        conn_badge_dot.pack(side="left", padx=(10, 4), pady=3)
-        conn_badge_text = tk.Label(
-            conn_badge,
-            text="Not Connected",
-            bg=UI["danger_soft"],
-            fg=UI["danger"],
-            font=UI_FONT_LABEL,
-        )
-        conn_badge_text.pack(side="left", padx=(0, 12), pady=3)
 
-        self.connect_btn = tk.Button(
-            top_inner,
-            text="🔌  Connect",
-            command=self.connect_database,
-            **ui_button_style("primary", "sm"),
-        )
+        self.connect_btn = ui_rbutton(top_inner, "🔌  Connect", self.connect_database, "primary", "sm")
         self.connect_btn.pack(side="left")
-        ui_bind_hover(self.connect_btn, UI["primary"], UI["primary_hover"])
 
         # Profile actions (right)
         more_menu = tk.Menu(self.root, tearoff=0, font=UI_FONT_SM)
@@ -1272,7 +1595,6 @@ class DatabaseConnectorGUI:
             command=lambda: more_menu.tk_popup(
                 more_btn.winfo_rootx(), more_btn.winfo_rooty() + more_btn.winfo_height()
             ),
-            font=("Segoe UI Semibold", 11),
         )
         more_btn.pack(side="right")
         self.delete_btn = more_btn  # "Delete profile" lives in this menu
@@ -1283,8 +1605,7 @@ class DatabaseConnectorGUI:
             ("＋ New", self.new_profile_dialog),
         ):
             _b = _ghost(top_inner, _text, _cmd)
-            _b.config(padx=6)
-            _b.pack(side="right")
+            _b.pack(side="right", padx=(2, 0))
 
         # ------------------------------------------------------------------
         # Connection details drawer (hidden until "Details" is pressed)
@@ -1449,14 +1770,12 @@ class DatabaseConnectorGUI:
                 if raw.startswith("✅"):
                     detail = raw[raw.find("(") + 1 : raw.rfind(")")] if "(" in raw else ""
                     text = "Connected" + (f" · {detail}" if detail else "")
-                    bg, fg = UI["success_soft"], UI["success"]
+                    tone = "success"
                 else:
                     text = raw.replace("❌", "").strip() or "Not Connected"
-                    bg, fg = UI["danger_soft"], UI["danger"]
-                if conn_badge_text.cget("text") != text:
-                    conn_badge.config(bg=bg)
-                    conn_badge_dot.config(bg=bg, fg=fg)
-                    conn_badge_text.config(text=text, bg=bg, fg=fg)
+                    tone = "danger"
+                if str(conn_badge.cget("text")) != f"●  {text}":
+                    ui_pill_set(conn_badge, f"●  {text}", tone)
             except tk.TclError:
                 return
             conn_badge.after(300, _refresh_conn_badge)
@@ -1512,14 +1831,10 @@ class DatabaseConnectorGUI:
         # Run / export / new job
         controls_frame = tk.Frame(jobs_frame, bg=UI["card"])
         controls_frame.pack(fill="x", padx=12, pady=(12, 8))
-        self.run_all_btn = tk.Button(
-            controls_frame,
-            text="▶  Run all",
-            command=lambda: self.run_selected_job(),
-            **ui_button_style("success", "sm"),
+        self.run_all_btn = ui_rbutton(
+            controls_frame, "▶  Run all", lambda: self.run_selected_job(), "success", "sm"
         )
         self.run_all_btn.pack(side="left", padx=(0, 6))
-        ui_bind_hover(self.run_all_btn, UI["success"], UI["success_hover"])
         _outer, self.export_excel_btn = ui_button(
             controls_frame, "⇩  Export", self.export_jobs_to_excel, size="sm"
         )
@@ -1531,7 +1846,7 @@ class DatabaseConnectorGUI:
         select_frame = tk.Frame(jobs_frame, bg=UI["card"])
         select_frame.pack(fill="x", padx=12, pady=(0, 6))
         self.select_all_jobs_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
+        _select_all_cb = tk.Checkbutton(
             select_frame,
             text="Select all",
             variable=self.select_all_jobs_var,
@@ -1544,7 +1859,9 @@ class DatabaseConnectorGUI:
             bd=0,
             highlightthickness=0,
             cursor="hand2",
-        ).pack(side="left")
+        )
+        _select_all_cb.pack(side="left")
+        ui_round_check(_select_all_cb)
         self.selected_jobs_label = tk.Label(
             select_frame, text="", bg=UI["card"], fg=UI["primary"], font=UI_FONT_SM
         )
@@ -1639,20 +1956,13 @@ class DatabaseConnectorGUI:
         split.pack(fill="both", expand=True, padx=16, pady=(14, 14))
 
         def _card(parent):
-            return tk.Frame(
-                parent,
-                bg=UI["card"],
-                highlightthickness=1,
-                highlightbackground=UI["border"],
-                highlightcolor=UI["border"],
-                bd=0,
-            )
+            return ui_round_frame(parent, fill=UI["card"], border=UI["border"], radius=10, pad=3)
 
         FL = UI
-        query_frame = _card(split)
-        results_card = _card(split)
-        split.add(query_frame, minsize=180, height=330, stretch="always")
-        split.add(results_card, minsize=200, stretch="always")
+        _qf_outer, query_frame = _card(split)
+        _rc_outer, results_card = _card(split)
+        split.add(_qf_outer, minsize=180, height=330, stretch="always")
+        split.add(_rc_outer, minsize=200, stretch="always")
         query_frame.columnconfigure(0, weight=1)
         query_frame.rowconfigure(3, weight=1)
 
@@ -1663,26 +1973,13 @@ class DatabaseConnectorGUI:
         tb = tk.Frame(toolbar, bg=FL["card"])
         tb.pack(side="left", padx=12, pady=9)
 
-        primary_btn_style = ui_button_style("primary")
-        primary_btn_style.update(padx=16)
-        self.execute_btn = tk.Button(
-            tb,
-            text="▶  Run",
-            command=self.execute_query,
-            state="disabled",
-            **primary_btn_style,
+        self.execute_btn = ui_rbutton(
+            tb, "▶  Run", self.execute_query, "primary", "md", state="disabled"
         )
         self.execute_btn.pack(side="left", padx=(0, 8))
-        ui_bind_hover(self.execute_btn, FL["primary"], FL["primary_hover"])
 
-        self.stop_btn = tk.Button(
-            tb,
-            text="⏹  Stop",
-            command=self.stop_running_queries,
-            **ui_button_style("danger"),
-        )
+        self.stop_btn = ui_rbutton(tb, "⏹  Stop", self.stop_running_queries, "danger", "md")
         self.stop_btn.pack(side="left", padx=(0, 10))
-        ui_bind_hover(self.stop_btn, FL["danger_soft"], FL["danger_hover"])
         self._register_stop_button(self.stop_btn)
 
         _vline(tb).pack(side="left", padx=(0, 10))
@@ -1905,12 +2202,7 @@ class DatabaseConnectorGUI:
             rb_left, style="Running.Horizontal.TProgressbar", mode="determinate", maximum=100
         )
         rb_progress.pack(fill="x", pady=(4, 0))
-        _rb_stop = tk.Button(
-            running_banner,
-            text="⏹  Stop",
-            command=self.stop_running_queries,
-            **ui_button_style("danger", "sm"),
-        )
+        _rb_stop = ui_rbutton(running_banner, "⏹  Stop", self.stop_running_queries, "danger", "sm")
         _rb_stop.pack(side="right", padx=12)
         self._register_stop_button(_rb_stop)
 
@@ -2134,13 +2426,6 @@ class DatabaseConnectorGUI:
                     pass
                 line, col = self.sql_context.index(tk.INSERT).split(".")
                 _sb_cursor.config(text=f"Ln {line}, Col {int(col) + 1}")
-
-                # Keep the primary button visually consistent with its state
-                if str(self.execute_btn["state"]) == "disabled":
-                    if self.execute_btn.cget("bg") != FL["primary_disabled"]:
-                        self.execute_btn.config(bg=FL["primary_disabled"])
-                elif self.execute_btn.cget("bg") == FL["primary_disabled"]:
-                    self.execute_btn.config(bg=FL["primary"])
             except tk.TclError:
                 return
             status_bar.after(300, _refresh_live_ui)
@@ -2751,34 +3036,13 @@ class DatabaseConnectorGUI:
         SELECTED_BORDER = "#BFDBFE"
 
         def _small_btn(parent, text, command, kind, bg):
-            colors = {
-                "run": ("#DBEAFE", UI["primary"], "#BFDBFE"),
-                "edit": (UI["card"], UI["text"], UI["hover"]),
-                "delete": (UI["danger_soft"], UI["danger"], UI["danger_hover"]),
-            }[kind]
-            btn = tk.Button(
-                parent,
-                text=text,
-                command=command,
-                relief="flat",
-                bd=0,
-                highlightthickness=1 if kind == "edit" else 0,
-                highlightbackground=UI["border"],
-                bg=colors[0],
-                fg=colors[1],
-                activebackground=colors[2],
-                activeforeground=colors[1],
-                cursor="hand2",
-                font=("Segoe UI Semibold", 9),
-                width=3,
-            )
-            ui_bind_hover(btn, colors[0], colors[2])
-            return btn
+            kind = {"run": "soft", "edit": "secondary", "delete": "danger"}[kind]
+            return ui_rbutton(parent, text, command, kind=kind, size="icon")
 
         def _tint(frame, checked):
             """Selected rows get a light blue background (display only)."""
             bg = SELECTED_BG if checked else UI["card"]
-            frame.config(highlightbackground=SELECTED_BORDER if checked else UI["border"])
+            ui_round_frame_set(frame, bg, SELECTED_BORDER if checked else UI["border"])
             stack = [frame]
             while stack:
                 w = stack.pop()
@@ -2787,7 +3051,7 @@ class DatabaseConnectorGUI:
                 try:
                     w.config(bg=bg)
                     if w.winfo_class() == "Checkbutton":
-                        w.config(activebackground=bg)
+                        w.config(activebackground=bg, selectcolor=bg)
                 except tk.TclError:
                     pass
                 stack.extend(w.winfo_children())
@@ -2798,15 +3062,11 @@ class DatabaseConnectorGUI:
             is_checked = id(job) in self._checked_job_ids
             row_bg = SELECTED_BG if is_checked else UI["card"]
 
-            job_frame = tk.Frame(
-                self.jobs_container,
-                bg=row_bg,
-                bd=0,
-                highlightthickness=1,
-                highlightbackground=SELECTED_BORDER if is_checked else UI["border"],
-                highlightcolor=UI["border"],
+            _row_outer, job_frame = ui_round_frame(
+                self.jobs_container, fill=row_bg,
+                border=SELECTED_BORDER if is_checked else UI["border"], radius=8, pad=2,
             )
-            job_frame.pack(fill=tk.X, padx=(0, 4), pady=(8 if idx == 1 else 0, 6))
+            _row_outer.pack(fill=tk.X, padx=(0, 4), pady=(8 if idx == 1 else 0, 6))
 
             job_name = job.get("name", f"Job {idx}")
 
@@ -2824,7 +3084,10 @@ class DatabaseConnectorGUI:
                 bd=0,
                 highlightthickness=0,
                 cursor="hand2",
-            ).pack(side=tk.LEFT, anchor="n", padx=(8, 2), pady=(8, 0))
+            )
+            _row_cb = job_frame.winfo_children()[-1]
+            _row_cb.pack(side=tk.LEFT, anchor="n", padx=(8, 2), pady=(8, 0))
+            ui_round_check(_row_cb)
 
             # Run / Edit / Delete (right)
             actions = tk.Frame(job_frame, bg=row_bg)
@@ -3539,8 +3802,8 @@ class DatabaseConnectorGUI:
         body.rowconfigure(0, weight=1)
 
         # ---- Left: groups ------------------------------------------------
-        left = _panel(body)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
+        _left_outer, left = ui_round_frame(body, fill=SURF, border=UI["border"], radius=10, pad=3)
+        _left_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
         left_head = tk.Frame(left, bg=SURF)
         left_head.pack(fill="x", padx=12, pady=(12, 8))
         tk.Label(left_head, text="กลุ่ม", font=("Segoe UI Semibold", 11), bg=SURF,
@@ -3640,11 +3903,7 @@ class DatabaseConnectorGUI:
             update_buttons()
 
         def set_enabled(btn, enabled):
-            # Disabled buttons turn grey, so they never look clickable
-            btn.config(
-                state="normal" if enabled else "disabled",
-                bg=btn._group_color if enabled else UI["hover"],
-            )
+            btn.config(state="normal" if enabled else "disabled")
 
         def update_buttons():
             has_group = current_group() is not None
@@ -3985,15 +4244,7 @@ class DatabaseConnectorGUI:
         KIND = {"#27ae60": "success", "#3498db": "secondary", "#e74c3c": "danger", "#95a5a6": "secondary"}
 
         def _btn(parent, text, command, color="#95a5a6", size="sm", **pack):
-            kind = KIND.get(color, "secondary")
-            style = ui_button_style(kind, size)
-            if kind == "secondary":
-                style.update(highlightthickness=1, highlightbackground=UI["border_strong"])
-            b = tk.Button(parent, text=text, command=command, **style)
-            b._group_color = style["bg"]
-            hover = {"success": UI["success_hover"], "danger": UI["danger_hover"]}.get(kind, UI["hover"])
-            b.bind("<Enter>", lambda _e: str(b["state"]) != "disabled" and b.config(bg=hover), add="+")
-            b.bind("<Leave>", lambda _e: str(b["state"]) != "disabled" and b.config(bg=b._group_color), add="+")
+            b = ui_rbutton(parent, text, command, kind=KIND.get(color, "secondary"), size=size)
             b.pack(**pack)
             return b
 
@@ -4013,8 +4264,7 @@ class DatabaseConnectorGUI:
 
         run_btn = _btn(run_bar, "▶  Run Group", run_group, "#27ae60", size="md", side="left", padx=(0, 8))
         export_btn = _btn(run_bar, "⇩  Export Group to Excel", export_group, size="md", side="left")
-        stop_group_btn = tk.Button(run_bar, text="⏹  Stop", command=self.stop_running_queries,
-                                   **ui_button_style("danger", "md"))
+        stop_group_btn = ui_rbutton(run_bar, "⏹  Stop", self.stop_running_queries, "danger", "md")
         stop_group_btn.pack(side="left", padx=8)
         self._register_stop_button(stop_group_btn)
         self._result_windows_checkbox(run_bar, UI["surface"]).pack(side="right")
@@ -6287,8 +6537,8 @@ class DatabaseConnectorGUI:
         profile = self.profile_combo.get() or "-"
 
         def body(frame):
-            box = tk.Frame(frame, bg=UI["danger_soft"])
-            box.pack(fill="x")
+            _box_outer, box = ui_round_frame(frame, fill=UI["danger_soft"], radius=8, pad=2)
+            _box_outer.pack(fill="x")
             msg = str(error).strip()
             tk.Label(box, text=msg if len(msg) <= 400 else msg[:399] + "…", bg=UI["danger_soft"],
                      fg=UI["danger"], font=("Consolas", 9), anchor="w", justify="left",
@@ -6410,7 +6660,7 @@ class DatabaseConnectorGUI:
 
     def _result_windows_checkbox(self, parent, bg):
         """Checkbox bound to the shared 'open result windows' setting."""
-        return tk.Checkbutton(
+        cb = tk.Checkbutton(
             parent,
             text="Open result windows",
             variable=self.open_result_popups,
@@ -6422,6 +6672,8 @@ class DatabaseConnectorGUI:
             highlightthickness=0,
             cursor="hand2",
         )
+        ui_round_check(cb)
+        return cb
 
     def _track_engine_connections(self, engine):
         """Remember which DB connections are in use, so Stop can cancel them."""
@@ -6608,8 +6860,8 @@ class DatabaseConnectorGUI:
         profile = self.profile_combo.get() or "-"
 
         def body(frame):
-            box = tk.Frame(frame, bg="#FEF3C7")
-            box.pack(fill="x")
+            _box_outer, box = ui_round_frame(frame, fill="#FEF3C7", radius=8, pad=2)
+            _box_outer.pack(fill="x")
             for job in changes[:6]:
                 tk.Label(box, text=job.get("name") or "SQL Editor", bg="#FEF3C7", fg=UI["text"],
                          font=UI_FONT_SEMI, anchor="w").pack(fill="x", padx=12, pady=(8, 0))
@@ -6806,6 +7058,7 @@ class DatabaseConnectorGUI:
             padx=6,
             command=self._open_results_set_menu,
         )
+        ui_round_tkbutton(self._rg_set_btn, "secondary", "sm")
         self._rg_set_btn.pack(side="left")
 
         self._rg_info = tk.Label(
@@ -7017,7 +7270,7 @@ class DatabaseConnectorGUI:
         toolbar = tk.Frame(tab, bg=UI["card"])
         toolbar.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 8))
 
-        tk.Checkbutton(
+        _debug_cb = tk.Checkbutton(
             toolbar,
             text="Debug mode (console logging)",
             variable=self.debug_mode,
@@ -7029,7 +7282,9 @@ class DatabaseConnectorGUI:
             bd=0,
             highlightthickness=0,
             cursor="hand2",
-        ).pack(side="left")
+        )
+        _debug_cb.pack(side="left")
+        ui_round_check(_debug_cb)
 
         _outer, self._dbg_details_btn = ui_button(
             toolbar,
@@ -8370,12 +8625,14 @@ class DatabaseConnectorGUI:
             choice = tk.BooleanVar(value=True)
 
             def option(value, title, desc):
-                card = tk.Frame(frame, bg=UI["card"], highlightthickness=1, cursor="hand2")
-                card.pack(fill="x", pady=(0, 8))
+                _card_outer, card = ui_round_frame(frame, fill=UI["card"], border=UI["border"], radius=8, pad=2)
+                _card_outer.pack(fill="x", pady=(0, 8))
+                card.configure(cursor="hand2")
                 rb = tk.Radiobutton(card, variable=choice, value=value, bg=UI["card"],
                                     activebackground=UI["card"], selectcolor="#FFFFFF",
                                     highlightthickness=0, bd=0, cursor="hand2")
                 rb.pack(side="left", padx=(12, 6), pady=10, anchor="n")
+                ui_round_check(rb)
                 col = tk.Frame(card, bg=UI["card"])
                 col.pack(side="left", fill="x", expand=True, pady=8)
                 t = tk.Label(col, text=title, bg=UI["card"], fg=UI["text"], font=UI_FONT_SEMI, anchor="w")
@@ -8397,12 +8654,11 @@ class DatabaseConnectorGUI:
                 for (card, parts), value in zip(cards, (True, False)):
                     on = choice.get() == value
                     bg = "#EFF6FF" if on else UI["card"]
-                    card.config(highlightbackground=UI["primary"] if on else UI["border"],
-                                highlightcolor=UI["primary"] if on else UI["border"])
+                    ui_round_frame_set(card, bg, UI["primary"] if on else UI["border"])
                     for w in parts:
                         w.config(bg=bg)
                         if isinstance(w, tk.Radiobutton):
-                            w.config(activebackground=bg)
+                            w.config(activebackground=bg, selectcolor=bg)
 
             choice.trace_add("write", paint)
             paint()
@@ -9212,8 +9468,9 @@ class DatabaseConnectorGUI:
         for col, (db, title) in enumerate((("Oracle", "Oracle"), ("PostgreSQL", "PostgreSQL"),
                                            ("MySQL", "MySQL"), ("Microsoft SQL Server", "SQL Server"))):
             cards_row.columnconfigure(col, weight=1, uniform="type")
-            card = tk.Frame(cards_row, bg=CARD, highlightthickness=1, cursor="hand2")
-            card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 8, 0))
+            _type_outer, card = ui_round_frame(cards_row, fill=CARD, border=UI["border_strong"], radius=8, pad=2)
+            _type_outer.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 8, 0))
+            card.configure(cursor="hand2")
             t = tk.Label(card, text=title, bg=CARD, fg=UI["text"], font=UI_FONT_SEMI, anchor="w")
             t.pack(fill="x", padx=12, pady=(8, 0))
             p = tk.Label(card, text=f"port {port_defaults[db]}", bg=CARD, fg=UI["muted"],
@@ -9264,8 +9521,8 @@ class DatabaseConnectorGUI:
         eye.bind("<Button-1>", _toggle_eye)
 
         # Test result (hidden until "Test connection" is used)
-        result_box = tk.Frame(body, bg=CARD)
-        result_box.pack(fill="x")
+        _result_outer, result_box = ui_round_frame(body, fill=CARD, radius=8, pad=1)
+        _result_outer.pack(fill="x")
         result_label = tk.Label(result_box, text="", bg=CARD, font=UI_FONT_SEMI, anchor="w",
                                 justify="left", wraplength=540)
 
@@ -9276,9 +9533,7 @@ class DatabaseConnectorGUI:
             for key, (card, t, p) in type_cards.items():
                 on = key == db
                 bg = "#EFF6FF" if on else CARD
-                card.config(bg=bg, highlightbackground=UI["primary"] if on else UI["border_strong"],
-                            highlightcolor=UI["primary"] if on else UI["border_strong"],
-                            highlightthickness=2 if on else 1)
+                ui_round_frame_set(card, bg, UI["primary"] if on else UI["border_strong"])
                 t.config(bg=bg, fg=UI["primary"] if on else UI["text"],
                          text=(("✓  " if on else "") + t.cget("text").replace("✓  ", "")))
                 p.config(bg=bg)
@@ -9298,7 +9553,7 @@ class DatabaseConnectorGUI:
             args = (db_type, user_entry.get().strip(), pass_entry.get(), host_entry.get().strip(),
                     port_entry.get().strip().split(":")[0], dbname_entry.get().strip())
             result_label.config(text="⏳  กำลังทดสอบการเชื่อมต่อ…", bg="#FEF3C7", fg=UI["warn"])
-            result_box.config(bg="#FEF3C7")
+            ui_round_frame_set(result_box, "#FEF3C7")
             result_label.pack(fill="x", padx=12, pady=10)
             test_btn.config(state="disabled")
 
@@ -9325,7 +9580,7 @@ class DatabaseConnectorGUI:
                         return
                     ok, msg = outcome
                     bg, fg = (UI["success_soft"], UI["success"]) if ok else (UI["danger_soft"], UI["danger"])
-                    result_box.config(bg=bg)
+                    ui_round_frame_set(result_box, bg)
                     result_label.config(text=msg if len(msg) <= 300 else msg[:299] + "…", bg=bg, fg=fg)
                     test_btn.config(state="normal")
 
@@ -9978,9 +10233,8 @@ class DatabaseConnectorGUI:
             return var
 
         # ---- Panel 1: Column list ----
-        column_panel = tk.Frame(content, bg="#ffffff", highlightthickness=1,
-                          highlightbackground=UI["border"], highlightcolor=UI["border"])
-        column_panel.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
+        _column_panel_outer, column_panel = ui_round_frame(content, fill="#FFFFFF", border=UI["border"], radius=10, pad=3)
+        _column_panel_outer.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         column_search = make_search(column_panel, "columns", lambda: render_column_list())
         column_scroll = ttk.Scrollbar(column_panel, orient="vertical")
         column_list = tk.Listbox(
@@ -9999,9 +10253,8 @@ class DatabaseConnectorGUI:
         column_list.pack(side="left", fill="both", expand=True, padx=6, pady=6)
 
         # ---- Panel 2: Values of the column (checkboxes) ----
-        values_panel = tk.Frame(content, bg="#ffffff", highlightthickness=1,
-                          highlightbackground=UI["border"], highlightcolor=UI["border"])
-        values_panel.grid(row=2, column=1, sticky="nsew", padx=10)
+        _values_panel_outer, values_panel = ui_round_frame(content, fill="#FFFFFF", border=UI["border"], radius=10, pad=3)
+        _values_panel_outer.grid(row=2, column=1, sticky="nsew", padx=10)
         values_search = make_search(values_panel, "values", lambda: render_values())
 
         values_buttons = ttk.Frame(values_panel)
@@ -10030,9 +10283,8 @@ class DatabaseConnectorGUI:
         values_canvas.bind("<Leave>", lambda _e: values_canvas.unbind_all("<MouseWheel>"))
 
         # ---- Panel 3: Selected values ----
-        selected_panel = tk.Frame(content, bg="#ffffff", highlightthickness=1,
-                          highlightbackground=UI["border"], highlightcolor=UI["border"])
-        selected_panel.grid(row=2, column=2, sticky="nsew", padx=(10, 0))
+        _selected_panel_outer, selected_panel = ui_round_frame(content, fill="#FFFFFF", border=UI["border"], radius=10, pad=3)
+        _selected_panel_outer.grid(row=2, column=2, sticky="nsew", padx=(10, 0))
         selected_search = make_search(selected_panel, "selected", lambda: refresh_selected_list())
 
         selected_buttons = ttk.Frame(selected_panel)
