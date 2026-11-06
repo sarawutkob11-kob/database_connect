@@ -11,3 +11,4 @@ script_groups.json
 script_groups_backup.json
 app_settings.json
 logs/
+robot_tests/results/
