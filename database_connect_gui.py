@@ -1198,7 +1198,9 @@ class DialogTheme:
 class DatabaseConnectorGUI:
 
     # Starter query shown in the SQL editor (app start, new / empty profiles)
-    DEFAULT_SQL_QUERY = "SELECT * FROM Table WHERE Column1 IN ({ACCOUNT_LIST})"
+    DEFAULT_SQL_QUERY = "SELECT\n    *\nFROM Table"
+    # Old starter query still stored in existing profiles — treated as "default"
+    LEGACY_DEFAULT_SQL_QUERIES = {"SELECT * FROM Table WHERE Column1 IN ({ACCOUNT_LIST})"}
 
     def __init__(self, root):
         self.root = root
@@ -2352,7 +2354,10 @@ class DatabaseConnectorGUI:
                 except (TypeError, ValueError):
                     continue
                 count = len([v for v in str(sql_values).split(",") if v.strip()])
-                name = key if parameter == getattr(self, "AUTO_WHERE_PARAMETER", None) else parameter
+                name = key if parameter in (
+                    getattr(self, "AUTO_WHERE_PARAMETER", None),
+                    getattr(self, "IN_COLUMN_PARAMETER", None),
+                ) else parameter
                 parts.append(f"{name} ← {count} ค่า")
             return parts
 
@@ -8161,8 +8166,19 @@ class DatabaseConnectorGUI:
             messagebox.showwarning("Warning", "SQL Query is empty")
             return
 
+        # ▶ stays clickable while the query runs: a second click (or a
+        # double-click) used to start a second run and open a second window
+        running_jobs = self.__dict__.setdefault("_running_job_ids", set())
+        if id(job) in running_jobs:
+            self.results_text.insert(
+                tk.END, f"⏳ {job.get('name', '')} is already running — please wait\n"
+            )
+            self.results_text.see(tk.END)
+            return
+
         if not self._confirm_data_change([job]):
             return
+        running_jobs.add(id(job))
         self._start_stoppable_run()
 
         # หาเลขลำดับของ Job ตาม Saved Jobs
@@ -8189,6 +8205,7 @@ class DatabaseConnectorGUI:
         self.save_job_btn.config(state="disabled")
 
         def finish(status, result_data=None, query_type="select", error=None, query_time=0):
+            running_jobs.discard(id(job))
             self.execute_btn.config(state="normal")
             self.inspect_btn.config(state="normal")
             self.save_job_btn.config(state="normal")
@@ -9296,7 +9313,10 @@ class DatabaseConnectorGUI:
                 self.db_name.insert(0, config["db_name"])
             if "sql_query" in config:
                 self.sql_context.delete(1.0, tk.END)
-                self.sql_context.insert(1.0, config["sql_query"].strip() or self.DEFAULT_SQL_QUERY)
+                saved_sql = config["sql_query"].strip()
+                if not saved_sql or saved_sql in self.LEGACY_DEFAULT_SQL_QUERIES:
+                    saved_sql = self.DEFAULT_SQL_QUERY
+                self.sql_context.insert(1.0, saved_sql)
 
             self.results_text.insert(tk.END, f"📂 Loaded profile: {profile_name}\n\n")
 
@@ -9770,6 +9790,18 @@ class DatabaseConnectorGUI:
     # Marker stored as the "parameter" of an auto WHERE condition built from
     # an Excel column name (key = "WHERE <column>")
     AUTO_WHERE_PARAMETER = "__AUTO_WHERE__"
+    # Marker for "replace the IN (...) list of a named column" (key = "IN <column>")
+    IN_COLUMN_PARAMETER = "__IN_COLUMN__"
+
+    @classmethod
+    def _replace_column_in_list(cls, sql, column, sql_values):
+        """Replace the values of the first `<column> IN (...)` list in sql."""
+        wanted = re.sub(r"\s+", "", column).lower()
+        for item in cls._detect_sql_in_lists(sql):
+            if item["column"].lower() == wanted:
+                start, end = item["vals_span"]
+                return sql[:start] + sql_values + sql[end:]
+        raise ValueError(f"SQL template no longer contains {column} IN (...)")
 
     @staticmethod
     def _sql_column_identifier(column_name):
@@ -9807,6 +9839,11 @@ class DatabaseConnectorGUI:
             parameter, sql_values = parameter_data
             if parameter == self.AUTO_WHERE_PARAMETER:
                 where_conditions.append((parameter_key[len("WHERE ") :], sql_values))
+                continue
+            if parameter == self.IN_COLUMN_PARAMETER:
+                rendered_sql = self._replace_column_in_list(
+                    rendered_sql, parameter_key[len("IN ") :], sql_values
+                )
                 continue
             if parameter_key == "__FIRST_IN_LIST__":
                 rendered_sql, replacements = re.subn(
@@ -9865,123 +9902,517 @@ class DatabaseConnectorGUI:
             "Reset SQL Template", "All parameters have been reset.", parent=self.root
         )
 
+    @staticmethod
+    def _split_sql_values(sql_values):
+        """Split "'a', 'O''Brien', 12" into its SQL tokens (quotes kept)."""
+        tokens, current, in_quote, i = [], [], False, 0
+        text = str(sql_values or "")
+        while i < len(text):
+            char = text[i]
+            if in_quote:
+                current.append(char)
+                if char == "'":
+                    if i + 1 < len(text) and text[i + 1] == "'":
+                        current.append("'")
+                        i += 1
+                    else:
+                        in_quote = False
+            elif char == "'":
+                in_quote = True
+                current.append(char)
+            elif char == ",":
+                token = "".join(current).strip()
+                if token:
+                    tokens.append(token)
+                current = []
+            else:
+                current.append(char)
+            i += 1
+        token = "".join(current).strip()
+        if token:
+            tokens.append(token)
+        return tokens
+
+    @staticmethod
+    def _sql_token_display(token):
+        """SQL token -> value text shown to the user ('O''Brien' -> O'Brien)."""
+        if len(token) >= 2 and token.startswith("'") and token.endswith("'"):
+            return token[1:-1].replace("''", "'")
+        return token
+
+    # "<column> [NOT] IN (<values>)" — values may contain quoted ')' or ','
+    _IN_LIST_PATTERN = re.compile(
+        r"""(?P<col>(?:"[^"]+"|[A-Za-z_][\w$#]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][\w$#]*))*)"""
+        r"""\s+(?:NOT\s+)?IN\s*\((?P<vals>(?:'(?:[^']|'')*'|[^'()])*)\)""",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _detect_sql_in_lists(cls, sql):
+        """Find literal IN (...) lists in SQL that has no tracked Excel parameters."""
+        found = []
+        for match in cls._IN_LIST_PATTERN.finditer(sql or ""):
+            values = match.group("vals")
+            if re.match(r"\s*SELECT\b", values, flags=re.IGNORECASE):
+                continue
+            tokens = list(dict.fromkeys(cls._split_sql_values(values)))
+            if not tokens:
+                continue
+            found.append({
+                "column": re.sub(r"\s+", "", match.group("col")),
+                "span": match.span(),
+                "vals_span": match.span("vals"),
+                "tokens": tokens,
+            })
+        return found
+
+    @staticmethod
+    def _remove_sql_condition(sql, start, end):
+        """Remove the condition sql[start:end] plus its AND/OR (or WHERE if it is the only one)."""
+        before, after = sql[:start], sql[end:]
+        connective_before = re.search(r"\s*\b(?:AND|OR)\s*$", before, flags=re.IGNORECASE)
+        if connective_before:
+            return before[: connective_before.start()] + after
+        connective_after = re.match(r"\s*\b(?:AND|OR)\b\s*", after, flags=re.IGNORECASE)
+        if re.search(r"\bWHERE\s*$", before, flags=re.IGNORECASE):
+            if connective_after:
+                return before + after[connective_after.end():]
+            where = re.search(r"\s*\bWHERE\s*$", before, flags=re.IGNORECASE)
+            return before[: where.start()] + after
+        if connective_after:
+            return before + after[connective_after.end():]
+        return before + "1=1" + after
+
+    @classmethod
+    def _reset_sql_in_lists(cls, sql, in_lists, selected):
+        """Drop selected[i] tokens from in_lists[i] directly in the SQL text."""
+        for index in sorted(range(len(in_lists)), key=lambda i: -in_lists[i]["span"][0]):
+            chosen = selected.get(index)
+            if not chosen:
+                continue
+            item = in_lists[index]
+            remaining = [token for token in item["tokens"] if token not in chosen]
+            if remaining:
+                start, end = item["vals_span"]
+                sql = sql[:start] + ", ".join(remaining) + sql[end:]
+            else:
+                sql = cls._remove_sql_condition(sql, *item["span"])
+        return sql
+
     def show_reset_parameter_dialog(self, close_after_selected=False, wait=False):
-        if not self._excel_parameter_values:
-            messagebox.showwarning("Reset Parameter", "No parameter loaded", parent=self.root)
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Reset Parameter")
-        dialog.geometry("550x450")
-        dialog.configure(bg=UI["card"])
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        # Header
-        header = tk.Frame(dialog, bg=UI["card"])
-        header.pack(fill="x", padx=20, pady=(16, 10))
-        ttk.Label(header, text="Select parameter to reset", font=UI_FONT_TITLE).pack(anchor="w")
-        tk.Label(
-            header,
-            text="Restore a replaced Excel parameter back to its placeholder in the SQL template.",
-            bg=UI["card"],
-            fg=UI["muted"],
-            font=UI_FONT_SM,
-            wraplength=500,
-            justify="left",
-        ).pack(anchor="w", pady=(2, 0))
-        tk.Frame(dialog, bg=UI["border"], height=1).pack(fill="x")
-
-        tk.Label(
-            dialog, text="LOADED PARAMETERS", bg=UI["card"], fg=UI["muted"], font=UI_FONT_LABEL
-        ).pack(anchor="w", padx=20, pady=(12, 4))
-
-        # Checkbox list (scrollable) so several parameters can be reset at once
-        list_border = tk.Frame(
-            dialog, bg="#FFFFFF", highlightthickness=1, highlightbackground=UI["border"]
-        )
-        list_border.pack(fill="both", expand=True, padx=20, pady=(0, 12))
-        list_scroll = ttk.Scrollbar(list_border, orient="vertical")
-        list_canvas = tk.Canvas(
-            list_border, bg="#FFFFFF", highlightthickness=0, bd=0, yscrollcommand=list_scroll.set
-        )
-        list_scroll.config(command=list_canvas.yview)
-        list_scroll.pack(side="right", fill="y")
-        list_canvas.pack(side="left", fill="both", expand=True)
-        list_inner = tk.Frame(list_canvas, bg="#FFFFFF")
-        inner_window = list_canvas.create_window((0, 0), window=list_inner, anchor="nw")
-        list_inner.bind(
-            "<Configure>", lambda _e: list_canvas.configure(scrollregion=list_canvas.bbox("all"))
-        )
-        list_canvas.bind(
-            "<Configure>", lambda e: list_canvas.itemconfigure(inner_window, width=e.width)
-        )
-
-        def _on_list_wheel(event):
-            if list_inner.winfo_height() > list_canvas.winfo_height():
-                list_canvas.yview_scroll(int(-event.delta / 120), "units")
-            return "break"
-
-        list_canvas.bind("<MouseWheel>", _on_list_wheel)
-        list_inner.bind("<MouseWheel>", _on_list_wheel)
-
-        parameter_vars = {}  # parameter key -> BooleanVar
-
-        def refresh_parameter_list():
-            for widget in list_inner.winfo_children():
-                widget.destroy()
-            parameter_vars.clear()
-            for parameter_key in self._excel_parameter_values:
-                var = tk.BooleanVar(value=False)
-                parameter_vars[parameter_key] = var
-                check = tk.Checkbutton(
-                    list_inner,
-                    text=parameter_key,
-                    variable=var,
-                    anchor="w",
-                    font=UI_FONT_MONO,
-                    bg="#FFFFFF",
-                    fg=UI["text"],
-                    activebackground="#DBEAFE",
-                    selectcolor="#FFFFFF",
-                    relief="flat",
-                    bd=0,
-                    highlightthickness=0,
-                )
-                check.pack(fill="x", anchor="w", padx=6, pady=1)
-                check.bind("<MouseWheel>", _on_list_wheel)
-            list_canvas.yview_moveto(0)
-
-        def reset_selected():
-            selected_keys = [key for key, var in parameter_vars.items() if var.get()]
-            if not selected_keys:
+        # No tracked Excel parameters (e.g. a job saved with values typed into
+        # the SQL): fall back to the IN (...) lists found in the SQL itself.
+        detected_mode = not self._excel_parameter_values
+        detected = []
+        if detected_mode:
+            source_sql = self.sql_context.get("1.0", tk.END).rstrip("\n")
+            detected = self._detect_sql_in_lists(source_sql)
+            if not detected:
                 messagebox.showwarning(
-                    "Reset Parameter", "Please select at least one parameter", parent=dialog
+                    "Reset Parameter",
+                    "No parameter loaded and no IN (...) list found in the SQL",
+                    parent=self.root,
                 )
                 return
 
-            for parameter_key in selected_keys:
-                self.reset_single_parameter(parameter_key)
-            refresh_parameter_list()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Reset Parameter")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("1150x700")
+        dialog.minsize(900, 580)
+        dialog.configure(bg=UI["card"])
+        CARD = UI["card"]
+
+        # Header
+        _head = tk.Frame(dialog, bg=CARD)
+        _head.pack(side="top", fill="x", padx=20, pady=(16, 4))
+        tk.Label(_head, text="Reset Parameter", bg=CARD, fg=UI["text"],
+                 font=("Segoe UI Semibold", 14)).pack(anchor="w")
+        tk.Label(
+            _head,
+            text="เลือกคอลัมน์ แล้วติ๊กค่าที่ต้องการเอาออกจาก SQL "
+                 "(ถ้าเอาออกครบทุกค่า คอลัมน์นั้นจะกลับเป็น placeholder เดิม)",
+            bg=CARD, fg=UI["muted"], font=UI_FONT_SM,
+        ).pack(anchor="w")
+
+        # Footer (buttons added at the end)
+        _footer = tk.Frame(dialog, bg=UI["surface"])
+        _footer.pack(side="bottom", fill="x")
+        tk.Frame(_footer, bg=UI["border"], height=1).pack(side="top", fill="x")
+        _footer_bar = tk.Frame(_footer, bg=UI["surface"])
+        _footer_bar.pack(fill="x", padx=20, pady=12)
+
+        content = tk.Frame(dialog, bg=CARD)
+        content.pack(fill="both", expand=True, padx=20, pady=(8, 14))
+        for col in range(3):
+            content.columnconfigure(col, weight=1, uniform="panel")
+        content.rowconfigure(1, weight=1)
+
+        _step_font = ("Segoe UI Semibold", 10)
+        tk.Label(content, text="①  เลือกคอลัมน์", bg=CARD, fg=UI["primary"], font=_step_font).grid(
+            row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 6)
+        )
+        tk.Label(content, text="②  เลือกค่าที่จะ Reset", bg=CARD, fg=UI["primary"],
+                 font=_step_font).grid(row=0, column=1, sticky="w", padx=10, pady=(0, 6))
+        selected_title = tk.Label(content, text="③ ค่าที่จะ Reset", bg=CARD, fg=UI["primary"],
+                                  font=_step_font)
+        selected_title.grid(row=0, column=2, sticky="w", padx=(10, 0), pady=(0, 6))
+
+        # ---- Search boxes (debounced, one per panel) ----
+        search_jobs = {}
+
+        def debounce(key, fn, delay=150):
+            job = search_jobs.pop(key, None)
+            if job:
+                dialog.after_cancel(job)
+
+            def _run():
+                search_jobs.pop(key, None)
+                fn()
+
+            search_jobs[key] = dialog.after(delay, _run)
+
+        def cancel_debounce(key):
+            job = search_jobs.pop(key, None)
+            if job:
+                dialog.after_cancel(job)
+
+        def make_search(panel, key, on_change):
+            var = tk.StringVar()
+            row = tk.Frame(panel, bg="#ffffff")
+            row.pack(side="top", fill="x", padx=6, pady=(6, 0))
+            tk.Label(row, text="🔍", bg="#ffffff", fg="#64748B", font=("Segoe UI", 9)).pack(
+                side="left", padx=(0, 4)
+            )
+            entry = ttk.Entry(row, textvariable=var)
+            entry.pack(side="left", fill="x", expand=True)
+            tk.Button(
+                row, text="✕", relief="flat", bd=0, bg="#ffffff", fg="#64748B",
+                activebackground="#ffffff", cursor="hand2",
+                command=lambda: (var.set(""), entry.focus_set()),
+            ).pack(side="left", padx=(4, 0))
+            entry.bind("<Escape>", lambda _e: var.set(""))
+            var.trace_add("write", lambda *_a: debounce(key, on_change))
+            return var
+
+        # ---- Panel 1: loaded parameters / columns ----
+        _column_outer, column_panel = ui_round_frame(
+            content, fill="#FFFFFF", border=UI["border"], radius=10, pad=3)
+        _column_outer.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        column_search = make_search(column_panel, "columns", lambda: render_column_list())
+        column_scroll = ttk.Scrollbar(column_panel, orient="vertical")
+        column_list = tk.Listbox(
+            column_panel, font=UI_FONT, selectbackground="#DBEAFE",
+            selectforeground=UI["text"], selectmode=tk.SINGLE, exportselection=False,
+            bd=0, highlightthickness=0, yscrollcommand=column_scroll.set,
+        )
+        column_scroll.config(command=column_list.yview)
+        column_scroll.pack(side="right", fill="y")
+        column_list.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+
+        # ---- Panel 2: values of the column (checkboxes) ----
+        _values_outer, values_panel = ui_round_frame(
+            content, fill="#FFFFFF", border=UI["border"], radius=10, pad=3)
+        _values_outer.grid(row=1, column=1, sticky="nsew", padx=10)
+        values_search = make_search(values_panel, "values", lambda: render_values())
+        values_buttons = ttk.Frame(values_panel)
+        values_buttons.pack(side="bottom", pady=8)
+        values_area = tk.Frame(values_panel, bg="#ffffff")
+        values_area.pack(side="top", fill="both", expand=True, padx=6, pady=6)
+        values_canvas = tk.Canvas(values_area, bg="#ffffff", highlightthickness=0)
+        values_scroll = ttk.Scrollbar(values_area, orient="vertical", command=values_canvas.yview)
+        values_inner = tk.Frame(values_canvas, bg="#ffffff")
+        values_inner.bind(
+            "<Configure>",
+            lambda _e: values_canvas.configure(scrollregion=values_canvas.bbox("all")),
+        )
+        values_canvas.create_window((0, 0), window=values_inner, anchor="nw")
+        values_canvas.configure(yscrollcommand=values_scroll.set)
+        values_scroll.pack(side="right", fill="y")
+        values_canvas.pack(side="left", fill="both", expand=True)
+
+        def _on_values_wheel(event):
+            values_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        values_canvas.bind(
+            "<Enter>", lambda _e: values_canvas.bind_all("<MouseWheel>", _on_values_wheel)
+        )
+        values_canvas.bind("<Leave>", lambda _e: values_canvas.unbind_all("<MouseWheel>"))
+
+        # ---- Panel 3: values that will be reset ----
+        _selected_outer, selected_panel = ui_round_frame(
+            content, fill="#FFFFFF", border=UI["border"], radius=10, pad=3)
+        _selected_outer.grid(row=1, column=2, sticky="nsew", padx=(10, 0))
+        selected_search = make_search(selected_panel, "selected", lambda: refresh_selected_list())
+        selected_area = tk.Frame(selected_panel, bg="#ffffff")
+        selected_area.pack(side="top", fill="both", expand=True, padx=6, pady=6)
+        selected_scroll = ttk.Scrollbar(selected_area, orient="vertical")
+        selected_list = tk.Listbox(
+            selected_area, font=UI_FONT, selectbackground="#DBEAFE",
+            selectforeground=UI["text"], bd=0, highlightthickness=0, activestyle="none",
+            yscrollcommand=selected_scroll.set,
+        )
+        selected_scroll.config(command=selected_list.yview)
+        selected_scroll.pack(side="right", fill="y")
+        selected_list.pack(side="left", fill="both", expand=True)
+
+        # ---- SQL preview ----
+        tk.Label(content, text="SQL หลัง Reset", bg=CARD, fg=UI["muted"],
+                 font=UI_FONT_LABEL).grid(row=2, column=0, columnspan=3, sticky="w", pady=(14, 4))
+        sql_preview = scrolledtext.ScrolledText(
+            content, height=5, font=("Consolas", 10), wrap=tk.WORD, bg="#EFF6FF", fg=UI["text"],
+            bd=0, relief="flat", highlightthickness=1, highlightbackground="#BFDBFE",
+            padx=10, pady=8,
+        )
+        sql_preview.grid(row=3, column=0, columnspan=3, sticky="nsew")
+
+        # ---- State ----
+        column_var = tk.StringVar()
+        shown_columns = []  # Listbox index -> parameter key
+        column_tokens = {}  # parameter key -> SQL tokens currently in the SQL
+        column_selected = {}  # parameter key -> set of tokens ticked for reset
+        value_vars = {}  # token -> BooleanVar of the shown column
+
+        def load_tokens():
+            column_tokens.clear()
+            if detected_mode:
+                # key = index in `detected` (a column can appear in several IN lists)
+                for index, item in enumerate(detected):
+                    column_tokens[str(index)] = item["tokens"]  # str: kept in a StringVar
+                return
+            for key, (_parameter, sql_values) in self._excel_parameter_values.items():
+                column_tokens[key] = list(dict.fromkeys(self._split_sql_values(sql_values)))
+            for key in list(column_selected):
+                if key not in column_tokens:
+                    column_selected.pop(key)
+                else:
+                    column_selected[key] &= set(column_tokens[key])
+
+        def column_label(key):
+            if detected_mode:
+                index = int(key)
+                column = detected[index]["column"]
+                same = [i for i, item in enumerate(detected) if item["column"] == column]
+                return column if len(same) == 1 else f"{column} #{same.index(index) + 1}"
+            if self._excel_parameter_values[key][0] == self.AUTO_WHERE_PARAMETER:
+                return key[len("WHERE "):]
+            if self._excel_parameter_values[key][0] == self.IN_COLUMN_PARAMETER:
+                return key[len("IN "):]
+            if key == "__FIRST_IN_LIST__":
+                return "First IN (...) list"
+            return key
+
+        def selected_of(key):
+            chosen = column_selected.get(key, set())
+            return [token for token in column_tokens.get(key, []) if token in chosen]
+
+        def build_reset_values():
+            """Parameter values after removing every ticked value."""
+            result = {}
+            for key, (parameter, sql_values) in self._excel_parameter_values.items():
+                chosen = column_selected.get(key)
+                if not chosen:
+                    result[key] = (parameter, sql_values)
+                    continue
+                remaining = [t for t in column_tokens.get(key, []) if t not in chosen]
+                if remaining:
+                    result[key] = (parameter, ", ".join(remaining))
+                # all values removed -> parameter goes back to its placeholder
+            return result
+
+        def render_sql(values):
+            return self._render_sql_template(values) if values else self.sql_template
+
+        def build_detected_sql():
+            selected = {int(key): chosen for key, chosen in column_selected.items()}
+            return self._reset_sql_in_lists(source_sql, detected, selected)
+
+        def refresh_sql_preview():
+            if detected_mode:
+                preview_sql = build_detected_sql()
+            else:
+                try:
+                    preview_sql = render_sql(build_reset_values())
+                except ValueError as error:
+                    preview_sql = f"{self.sql_template}\n\n-- {error}"
+            sql_preview.config(state="normal")
+            sql_preview.delete("1.0", tk.END)
+            sql_preview.insert("1.0", preview_sql or "")
+            sql_preview.config(state="disabled")
+
+        def refresh_selected_list():
+            cancel_debounce("selected")
+            query = selected_search.get().strip().lower()
+            selected_list.delete(0, tk.END)
+            key = column_var.get()
+            tokens = selected_of(key)
+            for token in tokens:
+                text = self._sql_token_display(token)
+                if query in text.lower():
+                    selected_list.insert(tk.END, text)
+            title = f"③ ค่าที่จะ Reset ({len(tokens)} / {len(column_tokens.get(key, []))})"
+            used = [k for k in column_tokens if selected_of(k)]
+            if any(k != key for k in used):
+                total = sum(len(selected_of(k)) for k in used)
+                title += f"  ·  {len(used)} columns, {total} total"
+            selected_title.config(text=title)
+            if query and selected_list.size() == 0:
+                selected_list.insert(tk.END, "No matching values")
+                selected_list.itemconfig(tk.END, fg="#94A3B8")
+            refresh_sql_preview()
+
+        def on_value_toggled(token, var):
+            chosen = column_selected.setdefault(column_var.get(), set())
+            if var.get():
+                chosen.add(token)
+            else:
+                chosen.discard(token)
+            refresh_selected_list()
+            render_column_list()
+
+        def render_values():
+            cancel_debounce("values")
+            for widget in values_inner.winfo_children():
+                widget.destroy()
+            value_vars.clear()
+            key = column_var.get()
+            query = values_search.get().strip().lower()
+            chosen = column_selected.get(key, set())
+            for token in column_tokens.get(key, []):
+                text = self._sql_token_display(token)
+                if query and query not in text.lower():
+                    continue
+                var = tk.BooleanVar(value=token in chosen)
+                value_vars[token] = var
+                tk.Checkbutton(
+                    values_inner, text=text, variable=var, anchor="w", bg="#ffffff",
+                    command=lambda t=token, b=var: on_value_toggled(t, b),
+                ).pack(fill="x", anchor="w")
+            if query and not value_vars:
+                tk.Label(values_inner, text="No matching values", bg="#ffffff",
+                         fg="#94A3B8").pack(anchor="w", padx=4, pady=4)
+            values_canvas.yview_moveto(0)
+            refresh_selected_list()
+
+        def select_column(key):
+            changed = key != column_var.get()
+            column_var.set(key)
+            if changed and values_search.get():
+                values_search.set("")
+            render_values()
+
+        def render_column_list():
+            cancel_debounce("columns")
+            query = column_search.get().strip().lower()
+            column_list.delete(0, tk.END)
+            shown_columns.clear()
+            for key in column_tokens:
+                label = column_label(key)
+                if query and query not in label.lower():
+                    continue
+                ticked = len(selected_of(key))
+                suffix = f"   ({ticked}/{len(column_tokens[key])})" if ticked else \
+                    f"   ({len(column_tokens[key])})"
+                column_list.insert(tk.END, label + suffix)
+                shown_columns.append(key)
+                if key == column_var.get():
+                    column_list.selection_set(tk.END)
+                    column_list.see(tk.END)
+
+        def on_column_select(_event=None):
+            selection = column_list.curselection()
+            if selection:
+                select_column(shown_columns[selection[0]])
+
+        def set_all_values(checked):
+            chosen = column_selected.setdefault(column_var.get(), set())
+            for token, var in value_vars.items():
+                var.set(checked)
+                if checked:
+                    chosen.add(token)
+                else:
+                    chosen.discard(token)
+            refresh_selected_list()
+            render_column_list()
+
+        def write_sql(rendered_sql):
+            self.sql_context.delete("1.0", tk.END)
+            self.sql_context.insert("1.0", rendered_sql or "")
+            self._excel_parameterized_sql = rendered_sql if self._excel_parameter_values else None
+
+        def reset_selected():
+            if not any(selected_of(key) for key in column_tokens):
+                messagebox.showwarning(
+                    "Reset Parameter", "Please select at least one value to reset", parent=dialog
+                )
+                return
+            if detected_mode:
+                # Values were typed into the SQL: edit the SQL text directly
+                self.sql_context.delete("1.0", tk.END)
+                self.sql_context.insert("1.0", build_detected_sql())
+                dialog.destroy()
+                return
+            new_values = build_reset_values()
+            try:
+                rendered_sql = render_sql(new_values)
+            except ValueError as error:
+                messagebox.showerror("Reset Error", str(error), parent=dialog)
+                return
+            self._excel_parameter_values.clear()
+            self._excel_parameter_values.update(new_values)
+            write_sql(rendered_sql)
+            if self.debug_mode.get():
+                print(f"[Excel Parameter Debug] Reset values; remaining="
+                      f"{list(self._excel_parameter_values)}")
             if close_after_selected or not self._excel_parameter_values:
                 dialog.destroy()
+                return
+            column_selected.clear()
+            load_tokens()
+            if column_var.get() not in column_tokens:
+                column_var.set(next(iter(column_tokens), ""))
+            render_column_list()
+            render_values()
 
         def reset_all():
             self.reset_all_parameters()
             dialog.destroy()
 
-        # Footer actions: [Reset All Parameters]            [Close] [Reset Selected]
-        tk.Frame(dialog, bg=UI["border"], height=1).pack(fill="x")
-        button_frame = tk.Frame(dialog, bg=UI["surface"])
-        button_frame.pack(fill="x")
-        _outer, _ = ui_button(button_frame, "Reset All Parameters", reset_all, kind="danger")
-        _outer.pack(side="left", padx=(20, 0), pady=12)
-        ttk.Button(
-            button_frame, text="Reset Selected", command=reset_selected, style="Accent.TButton"
-        ).pack(side="right", padx=(6, 20), pady=12)
-        ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="right", pady=12)
+        _o, _ = ui_button(values_buttons, "ล้างที่เลือก", lambda: set_all_values(False), size="sm")
+        _o.pack(side="left", padx=4)
+        _o, _ = ui_button(values_buttons, "☑  Select All", lambda: set_all_values(True), size="sm")
+        _o.pack(side="left", padx=4)
 
-        refresh_parameter_list()
+        if detected_mode:
+            # Nothing tracked to restore — values come from IN (...) lists in the SQL
+            tk.Label(_footer_bar, text="ค่าจาก IN (...) ใน SQL · ถ้าเอาออกครบทุกค่า เงื่อนไขนั้นจะถูกลบ",
+                     bg=UI["surface"], fg=UI["muted"], font=UI_FONT_SM).pack(side="left")
+        else:
+            _o, _ = ui_button(_footer_bar, "Reset All Parameters", reset_all, kind="danger",
+                              size="md")
+            _o.pack(side="left")
+        _o, _ = ui_button(_footer_bar, "↩  Confirm · Reset ค่าที่เลือก", reset_selected,
+                          kind="primary", size="md")
+        _o.pack(side="right")
+        _o, _ = ui_button(_footer_bar, "ยกเลิก", dialog.destroy, size="md")
+        _o.pack(side="right", padx=(0, 8))
+
+        column_list.bind("<<ListboxSelect>>", on_column_select)
+
+        def _on_dialog_destroy(e):
+            if e.widget is not dialog:
+                return
+            values_canvas.unbind_all("<MouseWheel>")
+            for key in list(search_jobs):
+                cancel_debounce(key)
+
+        dialog.bind("<Destroy>", _on_dialog_destroy)
+
+        load_tokens()
+        column_var.set("")
+        select_column(next(iter(column_tokens), ""))
+        render_column_list()
 
         if wait:
             dialog.wait_window()
@@ -10086,8 +10517,14 @@ class DatabaseConnectorGUI:
         placeholder_pattern = r"\{\{?\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}?|:[A-Za-z_][A-Za-z0-9_]*"
         placeholders = list(dict.fromkeys(re.findall(placeholder_pattern, sql_template)))
         auto_where_choice = "Auto WHERE (Excel column)"
+        # One choice per "<column> IN (...)" list, so values go into the right column
+        in_list_choices = {}  # combobox text -> SQL column
+        for item in self._detect_sql_in_lists(sql_template):
+            in_list_choices.setdefault(f"{item['column']} IN (...)", item["column"])
         if placeholders:
             parameter_choices = placeholders + [auto_where_choice]
+        elif in_list_choices:
+            parameter_choices = list(in_list_choices) + [auto_where_choice]
         elif re.search(r"\bIN\s*\(", sql_template, flags=re.IGNORECASE):
             parameter_choices = ["First IN (...) list", auto_where_choice]
         else:
@@ -10348,6 +10785,8 @@ class DatabaseConnectorGUI:
             parameter = parameter_var.get()
             if parameter == "First IN (...) list":
                 pending["__FIRST_IN_LIST__"] = (parameter, sql_values)
+            elif parameter in in_list_choices:
+                pending[f"IN {in_list_choices[parameter]}"] = (self.IN_COLUMN_PARAMETER, sql_values)
             else:
                 pending[parameter.lstrip(":").strip("{}").strip().upper()] = (parameter, sql_values)
             return pending
@@ -10448,6 +10887,13 @@ class DatabaseConnectorGUI:
             load_column_values(column_name)
             if changed and values_search.get():
                 values_search.set("")  # new column → start with an empty value search
+            # Excel column with the same name as an IN (...) column → target that list
+            if parameter_var.get() in in_list_choices:
+                wanted = re.sub(r"\s+", "", str(column_name)).strip('"').lower()
+                for choice, sql_column in in_list_choices.items():
+                    if sql_column.strip('"').split(".")[-1].lower() == wanted:
+                        parameter_var.set(choice)
+                        break
             render_values()
 
         def show_column_values(_event=None):
