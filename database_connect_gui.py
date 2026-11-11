@@ -11229,7 +11229,52 @@ class DatabaseConnectorGUI:
         self.root.destroy()
 
 
+_SINGLE_INSTANCE_MUTEX_NAME = "Local\\OFSAA_DatabaseConnector_SingleInstance"
+_ERROR_ALREADY_EXISTS = 183
+_SW_RESTORE = 9
+# Held for the life of the process; Windows releases the mutex when it exits.
+_single_instance_handle = None
+
+
+def _acquire_single_instance():
+    """Return True if this is the only running instance of the app.
+
+    Uses a named Windows mutex so a second launch (e.g. Run + Debug in
+    VS Code) is detected. Other platforms always return True.
+    """
+    global _single_instance_handle
+    if sys.platform != "win32":
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    handle = kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_MUTEX_NAME)
+    if not handle:
+        return True  # Can't create the mutex; don't block the user from starting.
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return False
+    _single_instance_handle = handle
+    return True
+
+
+def _focus_existing_window():
+    """Bring the already-running Database Connector window to the front."""
+    if sys.platform != "win32":
+        return
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW("TkTopLevel", "Database Connector")
+    if not hwnd:
+        return
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, _SW_RESTORE)
+    user32.SetForegroundWindow(hwnd)
+
+
 def main():
+    if not _acquire_single_instance():
+        _focus_existing_window()
+        return
     root = tk.Tk()
     app = DatabaseConnectorGUI(root)
     root.state("zoomed")
