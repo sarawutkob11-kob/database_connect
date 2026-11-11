@@ -55,7 +55,7 @@
 2. กด **📗 Load Excel** → เลือก Worksheet และ SQL parameter
 3. ① เลือกคอลัมน์ → ② เลือกค่า (มีช่องค้นหา / Select All) → ③ ตรวจค่าที่เลือก → **Confirm**
 4. ค่าตัวเลขใส่ตรง ๆ ค่าข้อความใส่ `'...'` และ escape `'` ให้อัตโนมัติ
-5. **↩ Reset SQL Template** — เลือก parameter ที่ต้องการคืนกลับเป็น placeholder ได้หลายตัวพร้อมกัน (checkbox) หรือ **Reset All Parameters**
+5. **↩ Reset SQL Template** — หน้าจอแบบเดียวกับ Load Excel: ① เลือกคอลัมน์/parameter ② ติ๊กค่าในคอลัมน์นั้นที่ต้องการเอาออก ③ ดูค่าที่จะ Reset และ SQL หลัง Reset ก่อนกดยืนยัน (เลือกได้หลายคอลัมน์; ถ้าเอาออกครบทุกค่า คอลัมน์นั้นจะกลับเป็น placeholder เดิม) หรือ **Reset All Parameters**
 
 อ่านไฟล์ Excel ได้แม้ไฟล์กำลังเปิดอยู่ใน Excel ค่า parameter ที่เลือกจะถูกเก็บไว้กับ Job ด้วย
 
