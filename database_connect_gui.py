@@ -1541,10 +1541,6 @@ class DatabaseConnectorGUI:
             kind = {UI["muted"]: "ghost_muted", UI["danger"]: "ghost_danger"}.get(fg, "ghost")
             return ui_rbutton(parent, text, command, kind=kind, size="sm")
 
-        def _soft_icon_btn(parent, text, command, kind="default", bg_parent=None):
-            kind = {"default": "secondary", "primary": "soft", "danger": "danger"}[kind]
-            return ui_rbutton(parent, text, command, kind=kind, size="icon")
-
         # ------------------------------------------------------------------
         # Top bar · profile + connection
         # ------------------------------------------------------------------
@@ -1830,7 +1826,7 @@ class DatabaseConnectorGUI:
         jobs_frame = tk.Frame(sidebar, bg=UI["card"])
         jobs_frame.pack(fill="both", expand=True)
 
-        # Run / export / new job
+        # Run / export
         controls_frame = tk.Frame(jobs_frame, bg=UI["card"])
         controls_frame.pack(fill="x", padx=12, pady=(12, 8))
         self.run_all_btn = ui_rbutton(
@@ -1841,8 +1837,6 @@ class DatabaseConnectorGUI:
             controls_frame, "⇩  Export", self.export_jobs_to_excel, size="sm"
         )
         _outer.pack(side="left")
-        _new_job = _soft_icon_btn(controls_frame, "＋", self.save_job_dialog, kind="primary")
-        _new_job.pack(side="right")
 
         # Select All + selection count (+ delete while something is ticked)
         select_frame = tk.Frame(jobs_frame, bg=UI["card"])
@@ -1978,12 +1972,9 @@ class DatabaseConnectorGUI:
         self.execute_btn = ui_rbutton(
             tb, "▶  Run", self.execute_query, "primary", "md", state="disabled"
         )
-        self.execute_btn.pack(side="left", padx=(0, 8))
+        self.execute_btn.pack(side="left", padx=(0, 10))
 
-        self.stop_btn = ui_rbutton(tb, "⏹  Stop", self.stop_running_queries, "danger", "md")
-        self.stop_btn.pack(side="left", padx=(0, 10))
-        self._register_stop_button(self.stop_btn)
-
+        # Stop lives on the running banner (shown only while queries run)
         _vline(tb).pack(side="left", padx=(0, 10))
 
         def _tool(text, command, **opts):
@@ -2204,9 +2195,9 @@ class DatabaseConnectorGUI:
             rb_left, style="Running.Horizontal.TProgressbar", mode="determinate", maximum=100
         )
         rb_progress.pack(fill="x", pady=(4, 0))
-        _rb_stop = ui_rbutton(running_banner, "⏹  Stop", self.stop_running_queries, "danger", "sm")
-        _rb_stop.pack(side="right", padx=12)
-        self._register_stop_button(_rb_stop)
+        self.stop_btn = ui_rbutton(running_banner, "⏹  Stop", self.stop_running_queries, "danger", "sm")
+        self.stop_btn.pack(side="right", padx=12)
+        self._register_stop_button(self.stop_btn)
 
         self.results_notebook = ttk.Notebook(results_card, style="Fluent.TNotebook")
         self.results_notebook.pack(fill="both", expand=True)

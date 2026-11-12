@@ -44,7 +44,7 @@
 - `Ctrl+Z` / `Ctrl+Y` / `Ctrl+C` / `Ctrl+X` / `Ctrl+V` / `Ctrl+A` ใช้ได้ทั้งตอนแป้นพิมพ์เป็นภาษาไทยและอังกฤษ และมีเมนูคลิกขวา Cut / Copy / Paste / Select All
 - แถบเครื่องมือเหนือ Editor: **📗 Load Excel**, **↩ Reset template**, **💾 Save as Job**, **▦ Tables** (ดูรายการ Table ของฐานข้อมูล)
 - **ยืนยันก่อนแก้ข้อมูล** — ก่อนรันคำสั่งที่ไม่ใช่ `SELECT` (UPDATE / INSERT / DELETE / DDL) จะแสดงรายการคำสั่ง พร้อม Profile, Host และ Database ให้ยืนยันก่อน (ค่าตั้งต้นคือ **No**) ใช้กับ Run, Run Job, Run all และ Run Group ส่วน `SELECT` จะไม่ถาม
-- **⏹ Stop** — กดได้ระหว่างที่มี Query / Job กำลังรัน (มีข้างปุ่ม Run, ในแถบสีเหลืองที่ขึ้นเหนือผลลัพธ์ระหว่างรัน และในหน้าต่าง Script Groups)
+- **⏹ Stop** — กดได้ระหว่างที่มี Query / Job กำลังรัน (อยู่ในแถบสีเหลืองที่ขึ้นเหนือผลลัพธ์ระหว่างรัน และในหน้าต่าง Script Groups)
   - Oracle: ยกเลิก Query ที่กำลังรันทันที (`ORA-01013: user requested cancel`)
   - Job ที่เหลือใน Run all / Run Group / Export จะถูกข้าม
   - PostgreSQL / MySQL / SQL Server: driver ยกเลิกกลางทางไม่ได้ Query ปัจจุบันจะรันจนจบ แล้วข้าม Job ที่เหลือ
@@ -93,7 +93,7 @@ popup ผลลัพธ์เปิดบนจอเดียวกับห�
 
 ### 6. Saved Jobs
 
-- **＋** (มุมขวาบนของแถบซ้าย) หรือ **💾 Save as Job** — บันทึก Query ปัจจุบัน (รวมสถานะ Excel parameter) เป็น Job ของ Profile ที่เลือก
+- **💾 Save as Job** (แถบเครื่องมือของ SQL Editor) — บันทึก Query ปัจจุบัน (รวมสถานะ Excel parameter) เป็น Job ของ Profile ที่เลือก
 - แต่ละ Job แสดงลำดับ ชื่อ และ SQL บรรทัดแรก (เอาเมาส์ชี้เพื่อดูชื่อเต็มและ SQL) มีปุ่ม **▶** (Run), **✎** (Edit) และ **🗑** (Delete) หน้า Edit มีเครื่องมือ Excel parameter ในตัว
 - ติ๊ก checkbox เพื่อเลือก Job หรือ **Select all** จะเห็นจำนวนที่เลือก และปุ่ม **🗑 Delete (n)** / **🗑 Delete all**
 - **▶ Run all** — ถ้าติ๊ก Job ไว้ ปุ่มจะเปลี่ยนเป็น **▶ Run selected (n)** และรันเฉพาะที่ติ๊ก ถ้าไม่ติ๊กเลยจะรันทุก Job ของ Profile รันทีละตัว Job ที่ error จะไม่หยุดการรัน ตอนจบแสดงสรุปจำนวน Success / Failed
