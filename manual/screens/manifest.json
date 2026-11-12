@@ -1,0 +1,1090 @@
+{
+  "overview": {
+    "size": [
+      1840,
+      1000
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Top bar",
+        "rect": [
+          0,
+          0,
+          1840,
+          74
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Sidebar",
+        "rect": [
+          0,
+          74,
+          340,
+          893
+        ]
+      },
+      {
+        "n": 3,
+        "label": "SQL editor",
+        "rect": [
+          362,
+          88,
+          1462,
+          294
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Results",
+        "rect": [
+          362,
+          394,
+          1462,
+          559
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Status bar",
+        "rect": [
+          0,
+          967,
+          1840,
+          33
+        ]
+      }
+    ]
+  },
+  "topbar": {
+    "size": [
+      1840,
+      1000
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Profile",
+        "rect": [
+          75,
+          13,
+          206,
+          47
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Target summary",
+        "rect": [
+          293,
+          9,
+          314,
+          55
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Details",
+        "rect": [
+          615,
+          15,
+          116,
+          42
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Connection badge",
+        "rect": [
+          756,
+          11,
+          190,
+          50
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Connect",
+        "rect": [
+          956,
+          15,
+          119,
+          42
+        ]
+      },
+      {
+        "n": 6,
+        "label": "New",
+        "rect": [
+          1471,
+          15,
+          84,
+          42
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Save",
+        "rect": [
+          1557,
+          15,
+          65,
+          42
+        ]
+      },
+      {
+        "n": 8,
+        "label": "Import",
+        "rect": [
+          1624,
+          15,
+          79,
+          42
+        ]
+      },
+      {
+        "n": 9,
+        "label": "Export",
+        "rect": [
+          1705,
+          15,
+          77,
+          42
+        ]
+      },
+      {
+        "n": 10,
+        "label": "More menu",
+        "rect": [
+          1782,
+          15,
+          42,
+          42
+        ]
+      }
+    ]
+  },
+  "sidebar": {
+    "size": [
+      340,
+      893
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Saved Jobs tab",
+        "rect": [
+          18,
+          10,
+          124,
+          29
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Script Groups tab",
+        "rect": [
+          162,
+          10,
+          133,
+          29
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Run all / Run selected",
+        "rect": [
+          12,
+          61,
+          163,
+          42
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Export",
+        "rect": [
+          181,
+          61,
+          93,
+          42
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Select all",
+        "rect": [
+          12,
+          119,
+          91,
+          25
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Delete (n)",
+        "rect": [
+          215,
+          111,
+          108,
+          42
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Row checkbox",
+        "rect": [
+          18,
+          177,
+          20,
+          20
+        ]
+      },
+      {
+        "n": 8,
+        "label": "Row run",
+        "rect": [
+          200,
+          177,
+          35,
+          36
+        ]
+      },
+      {
+        "n": 9,
+        "label": "Row edit",
+        "rect": [
+          238,
+          177,
+          38,
+          36
+        ]
+      },
+      {
+        "n": 10,
+        "label": "Row delete",
+        "rect": [
+          279,
+          177,
+          43,
+          36
+        ]
+      },
+      {
+        "n": 11,
+        "label": "Preset save",
+        "rect": [
+          66,
+          845,
+          94,
+          42
+        ]
+      },
+      {
+        "n": 12,
+        "label": "Preset load",
+        "rect": [
+          160,
+          845,
+          96,
+          42
+        ]
+      }
+    ]
+  },
+  "steps": {
+    "size": [
+      1840,
+      1000
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "New profile",
+        "rect": [
+          1471,
+          15,
+          84,
+          42
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Connect",
+        "rect": [
+          956,
+          15,
+          119,
+          42
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Load Excel / Run",
+        "rect": [
+          496,
+          103,
+          134,
+          42
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Load Excel / Run",
+        "rect": [
+          377,
+          100,
+          98,
+          49
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Save as Job",
+        "rect": [
+          792,
+          103,
+          139,
+          42
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Run selected / Export",
+        "rect": [
+          12,
+          135,
+          163,
+          42
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Run selected / Export",
+        "rect": [
+          181,
+          135,
+          93,
+          42
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Script Groups",
+        "rect": [
+          162,
+          84,
+          133,
+          29
+        ]
+      }
+    ]
+  },
+  "details": {
+    "size": [
+      1840,
+      1000
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Database type",
+        "rect": [
+          16,
+          114,
+          226,
+          47
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Host",
+        "rect": [
+          252,
+          114,
+          442,
+          47
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Port",
+        "rect": [
+          704,
+          114,
+          216,
+          47
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Database / Service",
+        "rect": [
+          930,
+          114,
+          442,
+          47
+        ]
+      },
+      {
+        "n": 5,
+        "label": "User",
+        "rect": [
+          1382,
+          114,
+          216,
+          47
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Password",
+        "rect": [
+          1608,
+          114,
+          216,
+          47
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Eye icon",
+        "rect": [
+          1792,
+          128,
+          26,
+          20
+        ]
+      },
+      {
+        "n": 8,
+        "label": "Details toggle",
+        "rect": [
+          615,
+          15,
+          116,
+          42
+        ]
+      },
+      {
+        "n": 9,
+        "label": "Save profile",
+        "rect": [
+          1557,
+          15,
+          65,
+          42
+        ]
+      }
+    ]
+  },
+  "load_excel": {
+    "size": [
+      1150,
+      700
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Sheet",
+        "rect": [
+          70,
+          91,
+          284,
+          44
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Parameter",
+        "rect": [
+          559,
+          91,
+          284,
+          44
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Column list",
+        "rect": [
+          29,
+          241,
+          327,
+          200
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Values",
+        "rect": [
+          409,
+          241,
+          317,
+          142
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Select All",
+        "rect": [
+          565,
+          397,
+          120,
+          42
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Clear",
+        "rect": [
+          464,
+          397,
+          93,
+          42
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Selected values",
+        "rect": [
+          770,
+          149,
+          211,
+          29
+        ]
+      },
+      {
+        "n": 8,
+        "label": "SQL preview",
+        "rect": [
+          20,
+          494,
+          1089,
+          118
+        ]
+      },
+      {
+        "n": 9,
+        "label": "Confirm",
+        "rect": [
+          889,
+          639,
+          241,
+          49
+        ]
+      },
+      {
+        "n": 10,
+        "label": "Cancel",
+        "rect": [
+          796,
+          639,
+          85,
+          49
+        ]
+      }
+    ]
+  },
+  "editor": {
+    "size": [
+      1462,
+      294
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Run",
+        "rect": [
+          15,
+          12,
+          98,
+          49
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Load Excel",
+        "rect": [
+          134,
+          15,
+          134,
+          42
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Reset template",
+        "rect": [
+          274,
+          15,
+          150,
+          42
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Save as Job",
+        "rect": [
+          430,
+          15,
+          139,
+          42
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Tables",
+        "rect": [
+          575,
+          15,
+          93,
+          42
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Excel strip",
+        "rect": [
+          50,
+          79,
+          284,
+          26
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Change values",
+        "rect": [
+          1339,
+          71,
+          112,
+          42
+        ]
+      },
+      {
+        "n": 8,
+        "label": "Editor",
+        "rect": [
+          49,
+          113,
+          1389,
+          178
+        ]
+      }
+    ]
+  },
+  "groups": {
+    "size": [
+      1060,
+      660
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "New Group",
+        "rect": [
+          128,
+          108,
+          131,
+          42
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Group list",
+        "rect": [
+          35,
+          158,
+          224,
+          345
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Rename",
+        "rect": [
+          35,
+          515,
+          112,
+          42
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Delete group",
+        "rect": [
+          153,
+          515,
+          106,
+          42
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Script list",
+        "rect": [
+          290,
+          143,
+          629,
+          231
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Up / Down",
+        "rect": [
+          927,
+          143,
+          113,
+          42
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Up / Down",
+        "rect": [
+          927,
+          189,
+          113,
+          42
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Edit",
+        "rect": [
+          927,
+          243,
+          113,
+          42
+        ]
+      },
+      {
+        "n": 8,
+        "label": "Remove",
+        "rect": [
+          927,
+          289,
+          113,
+          42
+        ]
+      },
+      {
+        "n": 9,
+        "label": "Add SQL",
+        "rect": [
+          748,
+          93,
+          112,
+          42
+        ]
+      },
+      {
+        "n": 10,
+        "label": "From Saved Jobs",
+        "rect": [
+          866,
+          93,
+          174,
+          42
+        ]
+      },
+      {
+        "n": 11,
+        "label": "SQL preview",
+        "rect": [
+          290,
+          414,
+          729,
+          158
+        ]
+      },
+      {
+        "n": 12,
+        "label": "Run Group",
+        "rect": [
+          20,
+          599,
+          151,
+          49
+        ]
+      },
+      {
+        "n": 13,
+        "label": "Export Group",
+        "rect": [
+          179,
+          599,
+          231,
+          49
+        ]
+      },
+      {
+        "n": 14,
+        "label": "Stop",
+        "rect": [
+          418,
+          599,
+          110,
+          49
+        ]
+      },
+      {
+        "n": 15,
+        "label": "Import Groups",
+        "rect": [
+          744,
+          28,
+          146,
+          42
+        ]
+      },
+      {
+        "n": 16,
+        "label": "Export Groups",
+        "rect": [
+          896,
+          28,
+          144,
+          42
+        ]
+      }
+    ]
+  },
+  "confirm": {
+    "size": [
+      570,
+      435
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Heading",
+        "rect": [
+          78,
+          20,
+          468,
+          67
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Statements",
+        "rect": [
+          26,
+          103,
+          518,
+          130
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Profile / Database",
+        "rect": [
+          24,
+          247,
+          522,
+          62
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Warning",
+        "rect": [
+          24,
+          319,
+          522,
+          26
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Cancel",
+        "rect": [
+          284,
+          374,
+          85,
+          49
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Run and commit",
+        "rect": [
+          377,
+          374,
+          169,
+          49
+        ]
+      }
+    ]
+  },
+  "results": {
+    "size": [
+      1462,
+      559
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Results Grid tab",
+        "rect": [
+          19,
+          21,
+          140,
+          38
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Execution Logs tab",
+        "rect": [
+          159,
+          11,
+          180,
+          48
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Error & Debug tab",
+        "rect": [
+          339,
+          11,
+          178,
+          48
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Open result windows",
+        "rect": [
+          1276,
+          9,
+          169,
+          25
+        ]
+      },
+      {
+        "n": 5,
+        "label": "Result set picker",
+        "rect": [
+          84,
+          78,
+          360,
+          30
+        ]
+      },
+      {
+        "n": 6,
+        "label": "Rows x columns",
+        "rect": [
+          458,
+          80,
+          398,
+          26
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Prev / Next",
+        "rect": [
+          902,
+          72,
+          74,
+          42
+        ]
+      },
+      {
+        "n": 7,
+        "label": "Prev / Next",
+        "rect": [
+          1065,
+          72,
+          77,
+          42
+        ]
+      },
+      {
+        "n": 8,
+        "label": "Export CSV",
+        "rect": [
+          1163,
+          72,
+          132,
+          42
+        ]
+      },
+      {
+        "n": 9,
+        "label": "Export Excel",
+        "rect": [
+          1301,
+          72,
+          140,
+          42
+        ]
+      },
+      {
+        "n": 10,
+        "label": "Grid",
+        "rect": [
+          22,
+          123,
+          1403,
+          399
+        ]
+      }
+    ]
+  },
+  "running": {
+    "size": [
+      1840,
+      1000
+    ],
+    "marks": [
+      {
+        "n": 1,
+        "label": "Banner text",
+        "rect": [
+          379,
+          405,
+          1314,
+          29
+        ]
+      },
+      {
+        "n": 2,
+        "label": "Progress",
+        "rect": [
+          379,
+          438,
+          1314,
+          18
+        ]
+      },
+      {
+        "n": 3,
+        "label": "Banner stop",
+        "rect": [
+          1715,
+          409,
+          94,
+          42
+        ]
+      },
+      {
+        "n": 4,
+        "label": "Status Running",
+        "rect": [
+          34,
+          971,
+          71,
+          26
+        ]
+      }
+    ]
+  }
+}

@@ -9,6 +9,9 @@ import re
 import sys
 import threading
 import traceback
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable, Optional
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -16,6 +19,14 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 # --- Third-party ---
 import pandas as pd
 from sqlalchemy import create_engine, inspect, text
+
+# Folder where settings/profiles/logs are kept. When packaged as a single
+# .exe (PyInstaller), __file__ points to a temp folder that is deleted on exit,
+# so use the folder that holds the .exe instead.
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ===================================================
 # Show query results the same way DBeaver does
@@ -53,6 +64,45 @@ def format_db_value(value, null_text=DB_NULL_TEXT):
         return value.strftime(DB_TIME_FORMAT)
     if isinstance(value, (bytes, bytearray, memoryview)):
         return bytes(value).hex().upper()
+    return str(value)
+
+
+def write_json_atomic(path, data, indent=2):
+    """Write JSON to a temp file, then swap it in: a crash or a locked file
+    never leaves `path` half-written or empty."""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=indent, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def preserve_unreadable_file(path):
+    """Copy a file that could not be read to <name>_unreadable_<time><ext>.
+
+    Returns the copy's path, or None when the copy failed too.
+    """
+    import shutil
+
+    base, ext = os.path.splitext(path)
+    dest = f"{base}_unreadable_{_dt.datetime.now():%Y%m%d_%H%M%S}{ext}"
+    try:
+        shutil.copy2(path, dest)
+        return dest
+    except Exception as e:
+        print(f"Cannot back up unreadable file {path}: {e}")
+        return None
+
+
+def excel_value_text(value):
+    """Text for a value read from an Excel sheet.
+
+    A number column with empty cells is read as float, so 1234 arrives as
+    1234.0 — show and use it as 1234 (what the user typed).
+    """
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e16:
+        return str(int(value))
     return str(value)
 
 
@@ -169,6 +219,485 @@ def unprotect_password(stored):
         # e.g. file copied from another Windows user/computer
         print(f"Cannot decrypt saved password (please re-enter it): {e}")
         return ""
+
+
+# ======================================================================
+# SQL classification (pure helpers — no Tk, no database)
+# ======================================================================
+# Text-based only: it decides how a statement is run (result set vs commit)
+# and what to ask the user. Database permissions remain the real guard.
+
+ALLOW_MULTI_STATEMENT_SQL = False
+
+
+class SqlRisk(Enum):
+    READ_ONLY = "READ ONLY"
+    DATA_CHANGE = "DATA CHANGE"
+    SCHEMA_CHANGE = "SCHEMA CHANGE"
+    ADMIN = "ADMIN"
+    UNKNOWN = "UNKNOWN"
+
+
+_SQL_RISK_ORDER = {
+    SqlRisk.READ_ONLY: 0,
+    SqlRisk.DATA_CHANGE: 1,
+    SqlRisk.UNKNOWN: 2,
+    SqlRisk.SCHEMA_CHANGE: 3,
+    SqlRisk.ADMIN: 4,
+}
+
+
+@dataclass(frozen=True)
+class SqlAssessment:
+    command: str
+    risk: SqlRisk
+    statement_count: int
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ConnectionInfo:
+    """Where a connected engine points. Never holds the password."""
+
+    profile: str
+    db_type: str
+    user: str
+    host: str
+    port: str
+    database: str
+
+    def target_label(self) -> str:
+        """Confirm dialog format: 'Oracle · host1 / SVC' (no host -> db_type only)."""
+        label = self.db_type
+        if self.host:
+            label += f" · {self.host}" + (f" / {self.database}" if self.database else "")
+        return label
+
+    def log_target(self) -> str:
+        """Run log format: 'user@host:port/database' (':port', '/database' only when set)."""
+        return (
+            f"{self.user}@{self.host}"
+            + (f":{self.port}" if self.port else "")
+            + (f"/{self.database}" if self.database else "")
+        )
+
+    def run_log_header(self) -> str:
+        """The '===== RUN ... =====' line written to the run log."""
+        return (
+            f"\n===== RUN  profile={self.profile or '-'}  "
+            f"{self.db_type}  {self.log_target()} =====\n"
+        )
+
+
+@dataclass(frozen=True)
+class RunTarget:
+    """Engine + its ConnectionInfo, captured once when a run starts."""
+
+    engine: Any
+    info: Optional[ConnectionInfo]  # None only for engines set without connect_database
+
+
+_SQL_WORD_RE = re.compile(r"[^\W\d][\w$#@]*|[#@][\w$#@]*")
+_SQL_NUMBER_RE = re.compile(r"[\w.]+")
+_SQL_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_]\w*)?\$")
+# An Oracle "/" terminator: a line holding only "/"
+_SQL_SLASH_LINE_RE = re.compile(r"(?m)^([ \t]*)/([ \t]*)$")
+_SQL_SLASH_MARK = "\x1e"
+
+_SQL_READ_ONLY_COMMANDS = {"SELECT", "SHOW", "DESCRIBE", "DESC", "VALUES"}
+_SQL_DATA_CHANGE_COMMANDS = {"INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE"}
+_SQL_SCHEMA_COMMANDS = {"CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME", "COMMENT"}
+_SQL_ADMIN_COMMANDS = {"GRANT", "REVOKE", "SHUTDOWN", "STARTUP"}
+_SQL_ADMIN_OBJECTS = {"DATABASE", "USER", "ROLE", "LOGIN", "SYSTEM", "TABLESPACE", "SCHEMA", "PROFILE"}
+_SQL_DDL_MODIFIERS = {
+    "OR", "REPLACE", "GLOBAL", "LOCAL", "PRIVATE", "TEMPORARY", "TEMP", "UNIQUE", "PUBLIC",
+    "EDITIONABLE", "NONEDITIONABLE", "FORCE", "NOFORCE", "IF", "NOT", "EXISTS", "UNLOGGED",
+}
+_SQL_PLSQL_OBJECTS = {"PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER", "TYPE"}
+
+
+def _scan_sql(sql):
+    """Yield (kind, value, depth, start, end) for SQL text outside comments.
+
+    kind: word (upper-cased), string, ident (quoted identifier), number,
+    punct, semi, sep (an Oracle "/" line marked with _SQL_SLASH_MARK).
+    Strings, quoted identifiers and comments are never split or searched.
+    """
+    i, n, depth = 0, len(sql), 0
+    while i < n:
+        c = sql[i]
+        if c.isspace():
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c in "'\"`":
+            j = i + 1
+            while j < n:
+                if sql[j] == c:
+                    if j + 1 < n and sql[j + 1] == c:  # doubled quote = escaped
+                        j += 2
+                        continue
+                    break
+                j += 1
+            end = min(j + 1, n)
+            yield ("string" if c == "'" else "ident", sql[i:end], depth, i, end)
+            i = end
+            continue
+        if c == "[":
+            j = sql.find("]", i + 1)
+            end = n if j < 0 else j + 1
+            yield ("ident", sql[i:end], depth, i, end)
+            i = end
+            continue
+        if c == "$":
+            m = _SQL_DOLLAR_TAG_RE.match(sql, i)
+            if m:  # PostgreSQL $tag$ ... $tag$ string
+                tag = m.group(0)
+                j = sql.find(tag, m.end())
+                end = n if j < 0 else j + len(tag)
+                yield ("string", sql[i:end], depth, i, end)
+                i = end
+                continue
+        if c == _SQL_SLASH_MARK:
+            yield ("sep", "/", depth, i, i + 1)
+            i += 1
+            continue
+        m = _SQL_WORD_RE.match(sql, i)
+        if m:
+            yield ("word", m.group(0).upper(), depth, i, m.end())
+            i = m.end()
+            continue
+        if c.isdigit():
+            m = _SQL_NUMBER_RE.match(sql, i)
+            yield ("number", m.group(0), depth, i, m.end())
+            i = m.end()
+            continue
+        if c == "(":
+            yield ("punct", c, depth, i, i + 1)
+            depth += 1
+        elif c == ")":
+            depth = max(0, depth - 1)
+            yield ("punct", c, depth, i, i + 1)
+        elif c == ";":
+            yield ("semi", c, depth, i, i + 1)
+        else:
+            yield ("punct", c, depth, i, i + 1)
+        i += 1
+
+
+def _is_plsql_block(words):
+    """True when ';' inside this statement does not end it (PL/SQL code)."""
+    if not words:
+        return False
+    if words[0] == "DECLARE":
+        return True
+    if words[0] == "BEGIN":
+        # BEGIN / BEGIN TRAN / BEGIN WORK are transaction statements
+        return len(words) > 1 and words[1] not in {"TRAN", "TRANSACTION", "WORK"}
+    if words[0] == "CREATE":
+        obj = next((w for w in words[1:] if w not in _SQL_DDL_MODIFIERS), "")
+        return obj in _SQL_PLSQL_OBJECTS
+    return False
+
+
+def split_sql_statements(sql):
+    """Split SQL into statements on ';' (or an Oracle '/' line) outside
+    strings and comments. PL/SQL blocks stay whole. Returns the original
+    text of each non-empty statement, without its terminator."""
+    sql = sql or ""
+    marked = _SQL_SLASH_LINE_RE.sub(lambda m: m.group(1) + _SQL_SLASH_MARK + m.group(2), sql)
+    statements = []
+    start, has_content, words = 0, False, []
+
+    def close(end):
+        if has_content:
+            statements.append(sql[start:end].strip())
+
+    for kind, value, _depth, s, e in _scan_sql(marked):
+        if kind == "sep" or (kind == "semi" and not _is_plsql_block(words)):
+            close(s)
+            start, has_content, words = e, False, []
+            continue
+        has_content = True
+        if kind == "word" and len(words) < 8:
+            words.append(value)
+    close(len(sql))
+    return statements
+
+
+def _classify_sql_statement(statement):
+    """(command, risk, reason) for one statement."""
+    tokens = list(_scan_sql(statement))
+    words = [(v, d) for k, v, d, _s, _e in tokens if k == "word"]
+    if not words:
+        return "", SqlRisk.UNKNOWN, "no SQL keyword found"
+    first, first_depth = words[0]
+    plain = [w for w, _d in words]
+
+    if first == "WITH":
+        # The statement's real command follows the CTE list at the same depth
+        for word, depth in words[1:]:
+            if depth == first_depth and word in (
+                {"SELECT"} | _SQL_DATA_CHANGE_COMMANDS
+            ):
+                first = word
+                break
+        else:
+            return "WITH", SqlRisk.UNKNOWN, "no command after WITH"
+
+    if first == "SELECT":
+        # SELECT ... INTO new_table (SQL Server / PostgreSQL) creates a table
+        top = [w for w, d in words if d == first_depth]
+        if "INTO" in top and ("FROM" not in top or top.index("INTO") < top.index("FROM")):
+            return "SELECT INTO", SqlRisk.SCHEMA_CHANGE, "SELECT ... INTO creates a table"
+        return "SELECT", SqlRisk.READ_ONLY, ""
+    if first in _SQL_READ_ONLY_COMMANDS:
+        return first, SqlRisk.READ_ONLY, ""
+    if first == "EXPLAIN":
+        if "ANALYZE" in plain[1:3] or "PLAN" in plain[1:2]:
+            return first, SqlRisk.UNKNOWN, "EXPLAIN ANALYZE / PLAN runs or writes"
+        return first, SqlRisk.READ_ONLY, ""
+    if first in _SQL_DATA_CHANGE_COMMANDS:
+        return first, SqlRisk.DATA_CHANGE, ""
+    if first in _SQL_ADMIN_COMMANDS:
+        return first, SqlRisk.ADMIN, ""
+    if first in _SQL_SCHEMA_COMMANDS:
+        if first in {"CREATE", "ALTER", "DROP"}:
+            obj = next((w for w in plain[1:] if w not in _SQL_DDL_MODIFIERS), "")
+            if obj in _SQL_ADMIN_OBJECTS:
+                return f"{first} {obj}", SqlRisk.ADMIN, ""
+            if first == "CREATE" and obj in _SQL_PLSQL_OBJECTS:
+                return f"{first} {obj}", SqlRisk.SCHEMA_CHANGE, ""
+        return first, SqlRisk.SCHEMA_CHANGE, ""
+    return first, SqlRisk.UNKNOWN, "effect cannot be determined from the text"
+
+
+def strip_sql_terminator(sql):
+    """Statement text as the driver wants it: no trailing Oracle '/' line and
+    no trailing ';' — except for PL/SQL blocks, whose final 'END;' needs it."""
+    sql = (sql or "").strip()
+    while sql.endswith("/") and not sql.endswith("*/"):
+        sql = sql[:-1].rstrip()
+    words = []
+    for kind, value, _depth, _s, _e in _scan_sql(sql):
+        if kind == "word":
+            words.append(value)
+            if len(words) >= 8:
+                break
+    if _is_plsql_block(words):
+        return sql
+    while sql.endswith(";"):
+        sql = sql[:-1].rstrip()
+    return sql
+
+
+def assess_sql(sql):
+    """Classify SQL text. Multi-statement text gets the riskiest category."""
+    statements = split_sql_statements(sql)
+    if not statements:
+        return SqlAssessment("", SqlRisk.UNKNOWN, 0, "empty SQL")
+    command, risk, reason = _classify_sql_statement(statements[0])
+    for statement in statements[1:]:
+        _cmd, other, other_reason = _classify_sql_statement(statement)
+        if _SQL_RISK_ORDER[other] > _SQL_RISK_ORDER[risk]:
+            risk, reason = other, other_reason
+    return SqlAssessment(command, risk, len(statements), reason)
+
+
+# ======================================================================
+# Table-data variables ({TABLE_<TABLE>_<COLUMN>} placeholders)
+# ======================================================================
+_TABLE_VAR_RE = re.compile(r"\{TABLE_([^{}\s]+)\}")
+
+
+def table_var_safe_name(name):
+    return str(name).upper().replace(" ", "_").replace("-", "_")
+
+
+def table_variable_name(table_name, column_name):
+    return f"{{TABLE_{table_var_safe_name(table_name)}_{table_var_safe_name(column_name)}}}"
+
+
+def format_sql_value(value):
+    """One value as a SQL literal: strings quoted (' doubled once), None/NaN as NULL."""
+    if value is None or (isinstance(value, float) and value != value):
+        return "NULL"
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return str(value)
+
+
+def format_sql_value_list(values):
+    return ", ".join(format_sql_value(v) for v in values)
+
+
+@dataclass(frozen=True)
+class TemplateRenderResult:
+    sql: str
+    replaced_tokens: tuple = ()
+    missing_tokens: tuple = ()
+    ambiguous_tokens: tuple = ()
+
+    @property
+    def ok(self):
+        return not self.missing_tokens and not self.ambiguous_tokens
+
+
+def find_table_variables(sql):
+    """Distinct {TABLE_...} tokens in order of first appearance."""
+    return tuple(dict.fromkeys(m.group(0) for m in _TABLE_VAR_RE.finditer(sql or "")))
+
+
+def _table_variable_index(tables):
+    """token -> list of column-value lists (more than one = ambiguous token)."""
+    index = {}
+    for table_name, table_data in (tables or {}).items():
+        if not isinstance(table_data, dict):
+            continue
+        columns = table_data.get("column_data") or {}
+        if not isinstance(columns, dict):
+            continue
+        for column_name, values in columns.items():
+            index.setdefault(table_variable_name(table_name, column_name), []).append(values)
+    return index
+
+
+def render_table_variables(sql, tables):
+    """Replace complete {TABLE_...} tokens with the column's values.
+
+    Never changes the input; when any token is missing (no data / no
+    values) or ambiguous, the returned sql is the original text unchanged.
+    """
+    index = _table_variable_index(tables)
+    replaced, missing, ambiguous = [], [], []
+
+    def _replace(match):
+        token = match.group(0)
+        entries = index.get(token)
+        if not entries:
+            missing.append(token)
+            return token
+        if len(entries) > 1:
+            ambiguous.append(token)
+            return token
+        values = entries[0]
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+        if not values:
+            missing.append(token)
+            return token
+        replaced.append(token)
+        return format_sql_value_list(values)
+
+    rendered = _TABLE_VAR_RE.sub(_replace, sql or "")
+    dedupe = lambda items: tuple(dict.fromkeys(items))  # noqa: E731
+    if missing or ambiguous:
+        rendered = sql or ""
+    return TemplateRenderResult(rendered, dedupe(replaced), dedupe(missing), dedupe(ambiguous))
+
+
+# ======================================================================
+# Saved query templates (query_templates.json)
+# ======================================================================
+MAX_TEMPLATE_COUNT = 1000
+MAX_TEMPLATE_NAME_LENGTH = 100
+MAX_TEMPLATE_SQL_LENGTH = 1_000_000
+
+
+def validate_query_templates(data):
+    """Check the whole templates file. Returns (templates, None) or (None, error).
+
+    All-or-nothing: one bad entry rejects the file so nothing is half-loaded.
+    """
+    if not isinstance(data, dict):
+        return None, "File must contain a JSON object of templates"
+    if len(data) > MAX_TEMPLATE_COUNT:
+        return None, f"Too many templates ({len(data)} > {MAX_TEMPLATE_COUNT})"
+    for name, entry in data.items():
+        label = repr(name)[:60]
+        if not isinstance(name, str) or not name.strip():
+            return None, f"Template {label}: name must be non-empty text"
+        if len(name) > MAX_TEMPLATE_NAME_LENGTH:
+            return None, f"Template {label}: name longer than {MAX_TEMPLATE_NAME_LENGTH} characters"
+        if not isinstance(entry, dict):
+            return None, f"Template {label}: must be an object with a 'query'"
+        query = entry.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return None, f"Template {label}: 'query' must be non-empty text"
+        if len(query) > MAX_TEMPLATE_SQL_LENGTH:
+            return None, f"Template {label}: SQL longer than {MAX_TEMPLATE_SQL_LENGTH:,} characters"
+        created = entry.get("created")
+        if created is not None and not isinstance(created, str):
+            return None, f"Template {label}: 'created' must be text"
+    return dict(data), None
+
+
+def query_template_label(name, query):
+    """Picker text: risk category in front, stored name unchanged."""
+    assessment = assess_sql(query)
+    category = "MULTI-STATEMENT" if assessment.statement_count > 1 else assessment.risk.value
+    return f"[{category}] {name}"
+
+
+# ======================================================================
+# SQL Server ODBC connection string
+# ======================================================================
+SQLSERVER_ODBC_DRIVER_PRIORITY = (
+    "ODBC Driver 18 for SQL Server",
+    "ODBC Driver 17 for SQL Server",
+    "SQL Server Native Client 11.0",
+    "SQL Server",
+)
+_SQLSERVER_MODERN_DRIVERS = {
+    "odbc driver 18 for sql server",
+    "odbc driver 17 for sql server",
+}
+
+
+def select_sqlserver_odbc_driver(installed, preferred=None):
+    """Best installed SQL Server driver (original spelling), newest first.
+
+    preferred: a driver name from app_settings.json that wins when installed.
+    """
+    by_lower = {str(d).lower(): d for d in installed}
+    for wanted in ((preferred,) if preferred else ()) + SQLSERVER_ODBC_DRIVER_PRIORITY:
+        if wanted.lower() in by_lower:
+            return by_lower[wanted.lower()]
+    raise RuntimeError(
+        "No SQL Server ODBC driver is installed. Install 'ODBC Driver 18 for SQL Server'.\n"
+        "Installed ODBC drivers: " + (", ".join(map(str, installed)) or "none")
+    )
+
+
+def _odbc_braced(value):
+    """ODBC value in braces so ; = { } in it are safe (} is doubled)."""
+    return "{" + str(value).replace("}", "}}") + "}"
+
+
+def build_sqlserver_odbc_connect(driver, host, port, database, user, password):
+    """ODBC connection string (contains the password — never log it).
+
+    Driver 17/18 traffic is encrypted; the server certificate is trusted as
+    is (TrustServerCertificate=yes) so servers with the default self-signed
+    certificate keep working like they did with the legacy driver.
+    """
+    parts = [
+        f"DRIVER={_odbc_braced(driver)}",
+        f"SERVER={host},{port}",
+        f"DATABASE={_odbc_braced(database or 'master')}",
+        f"UID={_odbc_braced(user)}",
+        f"PWD={_odbc_braced(password)}",
+    ]
+    if str(driver).lower() in _SQLSERVER_MODERN_DRIVERS:
+        parts += ["Encrypt=yes", "TrustServerCertificate=yes"]
+    return ";".join(parts)
 
 
 # ======================================================================
@@ -1452,9 +1981,9 @@ class DatabaseConnectorGUI:
 
         self.engine = None
         self.config_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "db_profiles.json"
+            APP_DIR, "db_profiles.json"
         )
-        self.jobs_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_jobs.json")
+        self.jobs_file = os.path.join(APP_DIR, "saved_jobs.json")
         self.saved_profiles = self.load_profiles()
         self.saved_jobs = self.load_jobs()
         self.job_results = {}
@@ -1462,7 +1991,7 @@ class DatabaseConnectorGUI:
         # NEW: Debug mode and table data
         self.debug_mode = tk.BooleanVar(value=True)
         self.last_error_details = None
-        self.table_data_file = os.path.join(os.path.dirname(__file__), "mail_table_data.json")
+        self.table_data_file = os.path.join(APP_DIR, "mail_table_data.json")
         self.loaded_table_data = None
 
         self.auto_sync_enabled = tk.BooleanVar(value=False)
@@ -1489,7 +2018,7 @@ class DatabaseConnectorGUI:
                 "open_result_popups", bool(self.open_result_popups.get())
             ),
         )
-        self._active_db_connections = set()
+        self._active_db_connections = {}  # pool record -> DBAPI connection in use
         self._active_db_lock = threading.Lock()
 
         self.load_table_mappings()
@@ -1596,6 +2125,8 @@ class DatabaseConnectorGUI:
         )
         more_btn.pack(side="right")
         self.delete_btn = more_btn  # "Delete profile" lives in this menu
+        self._profile_menu = more_menu  # entry 0 = "Delete profile" (locked while running)
+        self._profile_action_buttons = []
         for _text, _cmd in (
             ("Export", self.export_profiles_dialog),
             ("Import", self.import_profiles_dialog),
@@ -1604,6 +2135,8 @@ class DatabaseConnectorGUI:
         ):
             _b = _ghost(top_inner, _text, _cmd)
             _b.pack(side="right", padx=(2, 0))
+            if _text != "Export":
+                self._profile_action_buttons.append(_b)
 
         # ------------------------------------------------------------------
         # Connection details drawer (hidden until "Details" is pressed)
@@ -2171,12 +2704,7 @@ class DatabaseConnectorGUI:
         self.sql_context.bind("<Control-KeyPress>", _text_ctrl_key)
 
         # Keyboard shortcut binding
-        self.sql_context.bind(
-            "<Control-Return>",
-            lambda _event: (
-                self.execute_query() if self.execute_btn["state"] != "disabled" else None
-            ),
-        )
+        self.sql_context.bind("<Control-Return>", self._on_sql_ctrl_enter)
 
         # Update jobs list
         self.update_jobs_list()
@@ -2322,6 +2850,9 @@ class DatabaseConnectorGUI:
             return _orig_update_job_status(job_num, job, status, *args, **kwargs)
 
         def _ui_run_selected_job(jobs_override=None):
+            if self._is_busy():
+                # Refused (and logged) by run_selected_job — keep the running banner as is
+                return _orig_run_selected_job(jobs_override)
             try:
                 total = (
                     len(jobs_override) if jobs_override is not None else len(self.get_jobs_to_run())
@@ -2357,10 +2888,7 @@ class DatabaseConnectorGUI:
             try:
                 if not status_bar.winfo_exists():
                     return
-                busy_batch = getattr(self, "_batch_running", False)
-                busy_exec = "Loading" in str(self.execute_btn.cget("text"))
-                busy_export = "Exporting" in str(self.export_excel_btn.cget("text"))
-                busy = busy_batch or busy_exec or busy_export
+                busy = self._is_busy()
                 if busy and _run_clock["start"] is None:
                     _run_clock["start"] = time.time()
                 elif not busy:
@@ -2369,20 +2897,13 @@ class DatabaseConnectorGUI:
                 # Running banner
                 if busy:
                     elapsed = int(time.time() - (_run_clock["start"] or time.time()))
-                    clock = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
-                    prog = self._ui_progress
-                    if busy_batch and prog.get("total"):
-                        text = (
-                            f"กำลังรัน Job {max(prog.get('index', 0), 1)} / {prog['total']}"
-                            + (f" · {prog['name']}" if prog.get("name") else "")
-                            + f" · {clock}"
-                        )
+                    text, value = self._running_banner_state(elapsed)
+                    if value is not None:
                         if str(rb_progress.cget("mode")) != "determinate":
                             rb_progress.stop()
                             rb_progress.config(mode="determinate")
-                        rb_progress["value"] = 100 * max(prog.get("index", 1) - 1, 0) / prog["total"]
+                        rb_progress["value"] = value
                     else:
-                        text = ("กำลัง Export Excel" if busy_export else "กำลังรัน SQL") + f" · {clock}"
                         if str(rb_progress.cget("mode")) != "indeterminate":
                             rb_progress.config(mode="indeterminate")
                             rb_progress.start(12)
@@ -2525,6 +3046,8 @@ class DatabaseConnectorGUI:
 
     def import_profiles_dialog(self):
         """Import profiles from a user-selected JSON file"""
+        if self._block_if_busy("Import Profile"):
+            return
         # Ask user to select file
         file_path = filedialog.askopenfilename(
             title="Import Profiles", filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
@@ -2532,6 +3055,9 @@ class DatabaseConnectorGUI:
 
         if not file_path:
             return  # User cancelled
+        # Something may have started while the native file dialog was open
+        if self._block_if_busy("Import Profile"):
+            return
 
         try:
             # Load the file
@@ -3007,6 +3533,7 @@ class DatabaseConnectorGUI:
         # Clear current jobs display
         for widget in self.jobs_container.winfo_children():
             widget.destroy()
+        self._job_run_buttons = []  # ▶ of every card, locked while a run is in progress
 
         current_profile = self.profile_combo.get()
 
@@ -3021,7 +3548,7 @@ class DatabaseConnectorGUI:
         if not filtered_jobs:
             tk.Label(
                 self.jobs_container,
-                text="ยังไม่มี Job ของ Profile นี้\nเขียน SQL แล้วกด “＋” หรือ “Save as Job”",
+                text="ยังไม่มี Job ของ Profile นี้\nเขียน SQL แล้วกด “Save as Job”",
                 bg=UI["card"],
                 fg=UI["muted"],
                 font=UI_FONT_SM,
@@ -3054,7 +3581,8 @@ class DatabaseConnectorGUI:
 
         for idx, job in enumerate(filtered_jobs, 1):
 
-            real_idx = self.saved_jobs.index(job)
+            # By identity: two jobs with identical content are still two jobs
+            real_idx = next(i for i, saved in enumerate(self.saved_jobs) if saved is job)
             is_checked = id(job) in self._checked_job_ids
             row_bg = SELECTED_BG if is_checked else UI["card"]
 
@@ -3096,6 +3624,8 @@ class DatabaseConnectorGUI:
                 b = _small_btn(actions, text, command, kind, row_bg)
                 b._keep_bg = True
                 b.pack(side=tk.LEFT, padx=(3, 0))
+                if kind == "run":
+                    self._job_run_buttons.append(b)
 
             text_box = tk.Frame(job_frame, bg=row_bg)
             text_box.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=(6, 7))
@@ -3458,7 +3988,7 @@ class DatabaseConnectorGUI:
     # ===================================================
 
     def _script_groups_path(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "script_groups.json")
+        return os.path.join(APP_DIR, "script_groups.json")
 
     def load_script_groups(self):
         path = self._script_groups_path()
@@ -3470,10 +4000,19 @@ class DatabaseConnectorGUI:
             groups = data.get("groups", []) if isinstance(data, dict) else data
             return [g for g in groups if isinstance(g, dict) and g.get("name")]
         except Exception as e:
-            messagebox.showerror("Script Groups", f"Cannot read script_groups.json:\n{e}")
+            self._script_groups_save_blocked = self._handle_unreadable_file(
+                path, "Script Groups", e
+            )
             return []
 
     def save_script_groups(self):
+        if getattr(self, "_script_groups_save_blocked", False):
+            messagebox.showerror(
+                "Script Groups",
+                "script_groups.json could not be read when the app started, "
+                "so it is not overwritten. Restart the app to load your groups again.",
+            )
+            return
         path = self._script_groups_path()
         clean = []
         for group in self.script_groups:
@@ -3483,18 +4022,42 @@ class DatabaseConnectorGUI:
             ]
             clean.append(dict(group, scripts=scripts))
         try:
-            # Keep the previous version as script_groups_backup.json, then write
-            # to a temp file and swap it in, so a crash never leaves a broken file
-            if os.path.exists(path):
-                import shutil
-
-                shutil.copy2(path, os.path.splitext(path)[0] + "_backup.json")
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "groups": clean}, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, path)
+            if not getattr(self, "_script_groups_backup_done", False):
+                self._backup_script_groups_once(path)
+            write_json_atomic(path, {"version": 1, "groups": clean}, indent=2)
         except Exception as e:
             messagebox.showerror("Script Groups", f"Cannot save script_groups.json:\n{e}")
+
+    def _backup_script_groups_once(self, path: str) -> None:
+        """First save of the session only: copy `path` to <name>_backup.json when it
+        exists and is readable JSON.
+
+        The session is marked as done only when this step ends without error
+        (copied, or nothing to back up). If the copy fails the error is raised
+        (the save is refused) and the next save tries the backup again.
+        """
+        if os.path.exists(path) and self._is_readable_json(path):
+            import shutil
+
+            shutil.copy2(path, os.path.splitext(path)[0] + "_backup.json")
+        # no file / broken file: nothing to back up, the previous backup stays
+        self._script_groups_backup_done = True
+
+    @staticmethod
+    def _is_readable_json(path: str) -> bool:
+        """False for a broken file (not JSON / not UTF-8) or a missing one.
+
+        Any other OSError (e.g. the file is locked by OneDrive) is raised: the
+        save is then refused and the next save tries the backup again.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+            return True
+        except FileNotFoundError:  # gone meanwhile: nothing to back up
+            return False
+        except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
+            return False
 
     def _ask_group_text(self, parent, title, label, initial=""):
         """Small modal prompt; returns the stripped text or None."""
@@ -3910,7 +4473,7 @@ class DatabaseConnectorGUI:
             for btn in (edit_btn, delete_script_btn, up_btn, down_btn):
                 set_enabled(btn, has_script)
             for btn in (run_btn, export_btn):
-                set_enabled(btn, has_scripts)
+                set_enabled(btn, has_scripts and not self._is_busy())
 
         def on_script_select(_event=None):
             group = current_group()
@@ -4066,9 +4629,7 @@ class DatabaseConnectorGUI:
             if not self.engine:
                 messagebox.showerror("Error", "Please connect to database first", parent=dialog)
                 return
-            if getattr(self, "_batch_running", False):
-                messagebox.showinfo("Script Groups", "Another run is still in progress", parent=dialog)
-                return
+            # run_selected_job refuses (and logs why) while another run is in progress
             self.run_selected_job(jobs_override=group_jobs(group))
 
         def export_group():
@@ -4162,7 +4723,10 @@ class DatabaseConnectorGUI:
                     raise ValueError("no 'groups' list in this file")
                 incoming = [
                     g for g in incoming
-                    if isinstance(g, dict) and g.get("name") and isinstance(g.get("scripts", []), list)
+                    if isinstance(g, dict)
+                    and isinstance(g.get("name"), str)
+                    and g["name"].strip()
+                    and isinstance(g.get("scripts", []), list)
                 ]
                 for g in incoming:
                     for sc in g.get("scripts", []):
@@ -4210,10 +4774,12 @@ class DatabaseConnectorGUI:
             last_name = None
             for g in incoming:
                 name = g["name"]
-                old = existing.get(name.lower())
+                # pop: each existing group is replaced at most once, even when
+                # the file holds the same name twice
+                old = existing.pop(name.lower(), None)
                 if old is not None and replace:
                     self.script_groups.remove(old)
-                elif old is not None:
+                elif name.lower() in taken:
                     n = 2
                     while f"{name} ({n})".lower() in taken:
                         n += 1
@@ -4260,6 +4826,13 @@ class DatabaseConnectorGUI:
 
         run_btn = _btn(run_bar, "▶  Run Group", run_group, "#27ae60", size="md", side="left", padx=(0, 8))
         export_btn = _btn(run_bar, "⇩  Export Group to Excel", export_group, size="md", side="left")
+
+        def group_run_idle_state():
+            group = current_group()
+            return "normal" if group is not None and group.get("scripts") else "disabled"
+
+        for btn in (run_btn, export_btn):
+            self._register_run_lock_button(btn, group_run_idle_state)
         stop_group_btn = ui_rbutton(run_bar, "⏹  Stop", self.stop_running_queries, "danger", "md")
         stop_group_btn.pack(side="left", padx=8)
         self._register_stop_button(stop_group_btn)
@@ -4334,6 +4907,13 @@ class DatabaseConnectorGUI:
             preset_name = name_entry.get().strip()
             if not preset_name:
                 messagebox.showwarning("Warning", "Please enter preset name", parent=dialog)
+                return
+            if re.search(r'[\\/:*?"<>|]', preset_name):
+                messagebox.showwarning(
+                    "Warning",
+                    'Preset name cannot contain any of: \\ / : * ? " < > |',
+                    parent=dialog,
+                )
                 return
 
             preset_file = os.path.join(
@@ -4440,15 +5020,17 @@ class DatabaseConnectorGUI:
             try:
                 with open(preset_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    preset_name = preset_file.replace("preset_", "").replace(".json", "")
-                    job_count = len(data.get("jobs", []))
-                    created = data.get("created", "N/A")
+                    preset_name = preset_file[len("preset_") : -len(".json")]
+                    jobs_in_file = data.get("jobs", [])
+                    if not isinstance(jobs_in_file, list):
+                        raise ValueError("'jobs' is not a list")
+                    created = str(data.get("created", "N/A"))
                     preset_listbox.insert(
-                        "end", f"{preset_name} ({job_count} jobs) - {created[:10]}"
+                        "end", f"{preset_name} ({len(jobs_in_file)} jobs) - {created[:10]}"
                     )
                     preset_data[preset_listbox.size() - 1] = (preset_name, preset_path, data)
-            except:
-                pass
+            except Exception as e:
+                print(f"Preset {preset_file} skipped: {e}")
 
         def load_selected():
             selection = preset_listbox.curselection()
@@ -5209,9 +5791,7 @@ class DatabaseConnectorGUI:
                     self.sql_context.insert(cursor_pos, variable_name + " ")
                     inserted_items.append(f"Variable: {variable_name}")
                 else:
-                    formatted_vals = [
-                        f"'{v}'" if isinstance(v, str) else str(v) for v in column_values
-                    ]
+                    formatted_vals = [format_sql_value(v) for v in column_values]
                     # Normalize column name: strip spaces for SQL matching
                     col_lower = col_name.lower().replace(" ", "")
                     if len(formatted_vals) == 1:
@@ -5264,7 +5844,7 @@ class DatabaseConnectorGUI:
             success_msg += "\n".join(inserted_items)
 
             if insert_mode == "variable" and self.auto_sync_enabled.get():
-                success_msg += "\n\n🔄 Auto-sync enabled - variables will update automatically"
+                success_msg += "\n\n🔄 Auto-sync enabled - variables use the latest data on every Run"
 
             messagebox.showinfo("Success", success_msg, parent=dialog)
             dialog.destroy()
@@ -5340,22 +5920,41 @@ class DatabaseConnectorGUI:
 
             # File has been modified
             if current_mtime > self.last_table_data_mtime:
+                # Parse into a local first: a half-written or invalid file
+                # keeps the last good data and is retried on the next check
+                try:
+                    with open(self.table_data_file, "r", encoding="utf-8") as f:
+                        new_data = json.load(f)
+                except (OSError, ValueError) as error:
+                    print(f"Auto-sync: table data file not readable yet: {error}")
+                    self.schedule_next_sync_check()
+                    return
+                if not isinstance(new_data, dict) or not isinstance(new_data.get("tables"), dict):
+                    print("Auto-sync: table data file has no 'tables' — keeping previous data")
+                    self.schedule_next_sync_check()
+                    return
+
                 self.last_table_data_mtime = current_mtime
+                self.loaded_table_data = new_data
 
-                # Reload table data
-                with open(self.table_data_file, "r", encoding="utf-8") as f:
-                    self.loaded_table_data = json.load(f)
-
-                # Auto-replace variables in current query
-                updated_count = self.auto_replace_table_variables()
-
-                if updated_count > 0:
-                    self.results_text.insert(tk.END, f"🔄 Auto-sync triggered!\n")
-                    self.results_text.insert(tk.END, f"   Updated {updated_count} variable(s)\n")
+                # The editor keeps its {TABLE_...} variables; they are filled on Run
+                result = self.auto_replace_table_variables()
+                if find_table_variables(self.sql_context.get(1.0, tk.END)):
+                    self.results_text.insert(tk.END, "🔄 Auto-sync: table data reloaded\n")
                     self.results_text.insert(
-                        tk.END, f"   Time: {pd.Timestamp.now().strftime('%H:%M:%S')}\n\n"
+                        tk.END,
+                        f"   {len(result.replaced_tokens)} variable(s) in the editor will use "
+                        f"the new values on Run\n",
                     )
-                    self.results_text.see(tk.END)
+                    problems = result.missing_tokens + result.ambiguous_tokens
+                    if problems:
+                        self.results_text.insert(
+                            tk.END, f"   ⚠️ No data / ambiguous: {', '.join(problems)}\n"
+                        )
+                self.results_text.insert(
+                    tk.END, f"   Time: {pd.Timestamp.now().strftime('%H:%M:%S')}\n\n"
+                )
+                self.results_text.see(tk.END)
 
             # Schedule next check
             self.schedule_next_sync_check()
@@ -5364,55 +5963,19 @@ class DatabaseConnectorGUI:
             print(f"Auto-sync error: {e}")
             self.schedule_next_sync_check()
 
-    def auto_replace_table_variables(self):
-        """Automatically replace table variables with current data"""
-        try:
-            if not self.loaded_table_data:
-                return 0
+    def auto_replace_table_variables(self, apply_to_editor=False):
+        """Fill {TABLE_...} variables in the editor SQL with the loaded table data.
 
-            tables = self.loaded_table_data.get("tables", {})
-            sql_query = self.sql_context.get(1.0, tk.END)
-
-            import re
-
-            updated_count = 0
-
-            # Find all {TABLE_*} variables
-            pattern = r"\{TABLE_([A-Z0-9_]+)_([A-Z0-9_]+)\}"
-            matches = re.findall(pattern, sql_query)
-
-            for table_part, column_part in matches:
-                # Find matching table and column
-                for table_name, table_data in tables.items():
-                    safe_table = table_name.upper().replace(" ", "_").replace("-", "_")
-
-                    if safe_table == table_part:
-                        column_data_dict = table_data.get("column_data", {})
-
-                        for col_name, col_values in column_data_dict.items():
-                            safe_col = col_name.upper().replace(" ", "_").replace("-", "_")
-
-                            if safe_col == column_part:
-                                # Found match - replace variable
-                                old_var = f"{{TABLE_{table_part}_{column_part}}}"
-                                new_values = ", ".join(
-                                    [f"'{v}'" if isinstance(v, str) else str(v) for v in col_values]
-                                )
-
-                                sql_query = sql_query.replace(old_var, new_values)
-                                updated_count += 1
-                                break
-
-            # Update query if changes made
-            if updated_count > 0:
-                self.sql_context.delete(1.0, tk.END)
-                self.sql_context.insert(1.0, sql_query)
-
-            return updated_count
-
-        except Exception as e:
-            print(f"Auto-replace error: {e}")
-            return 0
+        Returns a TemplateRenderResult. The editor is left unchanged (so the
+        variables keep working on the next sync) unless apply_to_editor is
+        True and every variable could be filled.
+        """
+        sql_query = self.sql_context.get(1.0, "end-1c")
+        result = render_table_variables(sql_query, self._current_table_data_tables())
+        if apply_to_editor and result.ok and result.replaced_tokens:
+            self.sql_context.delete(1.0, tk.END)
+            self.sql_context.insert(1.0, result.sql)
+        return result
 
     def save_table_mappings(self):
         """Save table-to-column mappings"""
@@ -5541,12 +6104,23 @@ class DatabaseConnectorGUI:
         """Load saved query template"""
         templates_file = os.path.join(os.path.dirname(self.config_file), "query_templates.json")
 
-        try:
-            if os.path.exists(templates_file):
+        if os.path.exists(templates_file):
+            # Validate the whole file first; on any problem keep the templates
+            # already in memory and leave the editor alone
+            try:
                 with open(templates_file, "r", encoding="utf-8") as f:
-                    self.query_templates = json.load(f)
-        except:
-            pass
+                    loaded = json.load(f)
+                templates, error = validate_query_templates(loaded)
+            except (OSError, ValueError) as read_error:
+                templates, error = None, f"Cannot read file: {read_error}"
+            if templates is None:
+                print(f"query_templates.json rejected: {error}")
+                messagebox.showerror(
+                    "Invalid Templates File",
+                    f"query_templates.json was not loaded:\n\n{error}\n\n{templates_file}",
+                )
+            else:
+                self.query_templates = templates
 
         if not self.query_templates:
             messagebox.showinfo("No Templates", "No saved templates found")
@@ -5571,8 +6145,10 @@ class DatabaseConnectorGUI:
         template_listbox.pack(side="left", fill="both", expand=True)
         scrollbar.config(command=template_listbox.yview)
 
-        for template_name in self.query_templates.keys():
-            template_listbox.insert("end", f"📄 {template_name}")
+        for template_name, template_data in self.query_templates.items():
+            template_listbox.insert(
+                "end", f"📄 {query_template_label(template_name, template_data['query'])}"
+            )
 
         def load_selected():
             selection = template_listbox.curselection()
@@ -5588,7 +6164,10 @@ class DatabaseConnectorGUI:
             self.sql_context.delete(1.0, tk.END)
             self.sql_context.insert(1.0, template_data["query"])
 
-            self.results_text.insert(tk.END, f"📋 Loaded template: {selected_name}\n\n")
+            self.results_text.insert(
+                tk.END,
+                f"📋 Loaded template: {query_template_label(selected_name, template_data['query'])}\n\n",
+            )
             self.results_text.see(tk.END)
 
             messagebox.showinfo("Success", f"Template '{selected_name}' loaded!", parent=dialog)
@@ -5687,17 +6266,23 @@ class DatabaseConnectorGUI:
         loading_dialog.button_frame = button_frame
         loading_dialog.sql_query = sql_query
 
-        # Reset execute button if user closes loading dialog via X
+        # Closing the dialog only hides the progress: the query keeps running,
+        # so Run stays disabled until it finishes (use Stop to cancel it)
         def _on_loading_close():
             loading_dialog.destroy()
-            self.execute_btn.config(state="normal", text="▶  Run")
 
         loading_dialog.protocol("WM_DELETE_WINDOW", _on_loading_close)
 
         return loading_dialog
 
-    def _execute_query_background(self, sql_query, loading_dialog):
-        """NEW: Execute query in background with comprehensive error logging"""
+    def _execute_query_background(self, sql_query, loading_dialog, engine: Any = None) -> None:
+        """NEW: Execute query in background with comprehensive error logging.
+
+        engine: the run's engine, taken on the main thread (None -> self.engine).
+        The worker never reads self.engine.
+        """
+        if engine is None:
+            engine = self.engine
 
         def execute_in_background():
             error_details = None
@@ -5708,7 +6293,8 @@ class DatabaseConnectorGUI:
                     print(f"\n{'='*100}")
                     print(f"🔍 DEBUG: Starting query execution")
                     print(f"Query: {sql_query}")
-                    print(f"Engine: {self.engine}")
+                    # Not the engine/URL itself: a SQL Server URL holds the password
+                    print(f"Engine: {engine.dialect.name}")
                     print(f"{'='*100}\n")
 
                 # Check if it's a SELECT query or data modification
@@ -5717,7 +6303,7 @@ class DatabaseConnectorGUI:
                         print("🔍 DEBUG: Detected SELECT query")
 
                     # Execute SELECT query and get results
-                    df = self.read_sql_dataframe(sql_query)
+                    df = self.read_sql_dataframe(sql_query, engine=engine)
 
                     if self.debug_mode.get():
                         print(f"✅ DEBUG: Query successful - {len(df)} rows, {df.shape[1]} columns")
@@ -5729,10 +6315,7 @@ class DatabaseConnectorGUI:
                         print("🔍 DEBUG: Detected data modification query")
 
                     # Execute UPDATE/INSERT/DELETE statement
-                    with self.engine.connect() as conn:
-                        result = conn.execute(text(sql_query))
-                        conn.commit()
-                        rows_affected = result.rowcount
+                    rows_affected = self._execute_modification(sql_query, engine=engine)
 
                     if self.debug_mode.get():
                         print(f"✅ DEBUG: Modification successful - {rows_affected} rows affected")
@@ -5781,6 +6364,14 @@ class DatabaseConnectorGUI:
 
     def on_query_error_enhanced(self, error_details, loading_dialog):
         """NEW: Enhanced error handling with detailed debugging and retry option"""
+        try:
+            dialog_open = bool(loading_dialog.winfo_exists())
+        except tk.TclError:
+            dialog_open = False
+        if not dialog_open:
+            # The user closed the loading dialog while the query ran
+            self.on_query_error(error_details["message"], loading_dialog)
+            return
         try:
             # Update loading dialog to show error
             loading_dialog.progress.stop()
@@ -6301,9 +6892,7 @@ class DatabaseConnectorGUI:
                     variable_name = f"{{TABLE_{safe_table_name}_{safe_col_name}}}"
                     preview_text.insert(tk.END, f"  Variable: {variable_name}\n")
                 else:
-                    values_str = ", ".join(
-                        [f"'{v}'" if isinstance(v, str) else str(v) for v in column_values[:3]]
-                    )
+                    values_str = format_sql_value_list(column_values[:3])
                     if len(column_values) > 3:
                         values_str += ", ..."
                     preview_text.insert(tk.END, f"  Raw data: {values_str}\n")
@@ -6384,9 +6973,7 @@ class DatabaseConnectorGUI:
                     inserted_items.append(f"Variable: {variable_name}")
                 else:
                     # Insert as raw data
-                    values_str = ", ".join(
-                        [f"'{v}'" if isinstance(v, str) else str(v) for v in column_values]
-                    )
+                    values_str = format_sql_value_list(column_values)
 
                     self.sql_context.insert(cursor_pos, values_str + " ")
                     preview_str = values_str[:100] + "..." if len(values_str) > 100 else values_str
@@ -6397,7 +6984,7 @@ class DatabaseConnectorGUI:
             success_msg += "\n".join(inserted_items)
 
             if insert_mode == "variable":
-                success_msg += "\n\n💡 Use 'Replace Variables' if needed"
+                success_msg += "\n\n💡 Variables are filled with the table data when you Run"
 
             messagebox.showinfo("Data Inserted", success_msg, parent=dialog)
             dialog.destroy()
@@ -6449,13 +7036,19 @@ class DatabaseConnectorGUI:
             else:
                 return f"mysql+pymysql://{user}:{encoded_password}@{host}:{port_clean}"
         elif db_type == "Microsoft SQL Server":
-            # Use ODBC connection string format to avoid DSN length issues
-            if database:
-                conn_str = f"DRIVER={{SQL Server}};SERVER={host},{port_clean};DATABASE={database};UID={user};PWD={password}"
-            else:
-                # Connect to master database by default when no database specified
-                # This allows querying all databases in the server
-                conn_str = f"DRIVER={{SQL Server}};SERVER={host},{port_clean};DATABASE=master;UID={user};PWD={password}"
+            # Use ODBC connection string format to avoid DSN length issues.
+            # Newest installed driver wins; app_settings.json may name one
+            # ("sqlserver_odbc_driver") to force a specific driver.
+            import pyodbc
+
+            driver = select_sqlserver_odbc_driver(
+                pyodbc.drivers(), self._load_app_settings().get("sqlserver_odbc_driver")
+            )
+            self.sqlserver_odbc_driver = driver
+            # No database → master, so all databases on the server can be queried
+            conn_str = build_sqlserver_odbc_connect(
+                driver, host, port_clean, database, user, password
+            )
             return f"mssql+pyodbc:///?odbc_connect={quote_plus(conn_str)}"
         elif db_type == "Oracle":
             # Oracle connection string format - use oracledb (thin mode - no Oracle Client needed)
@@ -6479,6 +7072,8 @@ class DatabaseConnectorGUI:
         return {}
 
     def connect_database(self):
+        if self._block_if_busy("Connect"):
+            return
         db_type = self.db_type.get()
         user = self.db_user.get()
         password = self.db_password.get()
@@ -6494,13 +7089,14 @@ class DatabaseConnectorGUI:
             )
             return
 
+        engine = None
         try:
             self.results_text.insert(tk.END, f"Connecting to {db_type} database...\n")
             self.results_text.see(tk.END)
             connection_string = self.get_connection_string(
                 db_type, user, password, host, port, database
             )
-            self.engine = create_engine(
+            engine = create_engine(
                 connection_string,
                 connect_args=self.get_connect_args(db_type),
                 # Check a pooled connection before each use and reconnect if the
@@ -6509,24 +7105,84 @@ class DatabaseConnectorGUI:
                 # Never reuse a connection older than 30 minutes
                 pool_recycle=1800,
             )
-            self._track_engine_connections(self.engine)
-            with self.engine.connect() as connection:
+            self._track_engine_connections(engine)
+            with engine.connect() as connection:
                 connection.execute(
                     text("SELECT 1 FROM DUAL" if db_type == "Oracle" else "SELECT 1")
                 )
-
-            self.status_label.config(text=f"✅ Connected ({db_type})", foreground="#27ae60")
-            self.execute_btn.config(state="normal")
-            self.inspect_btn.config(state="normal")
-            db_info = f"{db_type} database" + (f": {database}" if database else "")
-            self.results_text.insert(tk.END, f"✅ Successfully connected to {db_info}\n\n")
-            self.results_text.see(tk.END)
-            messagebox.showinfo("Success", f"Connected to {db_type} database successfully!")
         except Exception as error:
+            # The failed engine is never used; the previous connection is
+            # closed too, so Run cannot go to a target the status says is gone
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
+            self._replace_engine(None)
+            self.execute_btn.config(state="disabled")
+            self.inspect_btn.config(state="disabled")
             self.status_label.config(text="❌ Connection Failed", foreground="#e74c3c")
             self.results_text.insert(tk.END, f"❌ Connection Error: {error}\n\n")
             self.results_text.see(tk.END)
             self._show_connection_error(error)
+            return
+
+        info = ConnectionInfo(
+            profile=self.profile_combo.get() or "",
+            db_type=db_type,
+            user=user.strip(),
+            host=host.strip(),
+            port=port,
+            database=database.strip(),
+        )
+        self._replace_engine(engine, info)
+        try:
+            self.status_label.config(text=f"✅ Connected ({db_type})", foreground="#27ae60")
+            self.execute_btn.config(state="normal")
+            self.inspect_btn.config(state="normal")
+            db_info = f"{db_type} database" + (f": {database}" if database else "")
+            self.results_text.insert(tk.END, f"✅ Successfully connected to {db_info}\n")
+            if db_type == "Microsoft SQL Server":
+                driver = getattr(self, "sqlserver_odbc_driver", "")
+                encrypted = str(driver).lower() in _SQLSERVER_MODERN_DRIVERS
+                self.results_text.insert(
+                    tk.END,
+                    f"   ODBC driver: {driver} ({'encrypted' if encrypted else 'not encrypted'})\n",
+                )
+            self.results_text.insert(tk.END, "\n")
+            self.results_text.see(tk.END)
+            messagebox.showinfo("Success", f"Connected to {db_type} database successfully!")
+        except tk.TclError:
+            pass
+
+    def _replace_engine(self, engine, info: Optional[ConnectionInfo] = None) -> None:
+        """Make `engine` the current one (with its ConnectionInfo) and close the
+        pool of the previous one. engine None -> no run target.
+
+        dispose() only closes idle pooled connections; a query still running
+        on the old engine keeps its connection until it finishes.
+        """
+        old, self.engine = self.engine, engine
+        self._run_target = RunTarget(engine, info) if engine is not None else None
+        if old is not None and old is not engine:
+            try:
+                old.dispose()
+            except Exception:
+                pass
+
+    def _capture_run_target(self) -> Optional[RunTarget]:
+        """Main thread, once per run: the engine to use and where it points.
+
+        RunTarget(self.engine, None) when the engine has no ConnectionInfo;
+        None when not connected.
+        """
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return None
+        target = getattr(self, "_run_target", None)
+        if target is not None and target.engine is engine:
+            return target
+        return RunTarget(engine, None)
 
     def _show_connection_error(self, error):
         """Connection failed: show the database message and what to check."""
@@ -6563,25 +7219,29 @@ class DatabaseConnectorGUI:
         elif choice == "retry":
             self.root.after(50, self.connect_database)
 
-    def read_sql_dataframe(self, sql_query):
+    def read_sql_dataframe(self, sql_query: str, engine: Any = None) -> pd.DataFrame:
         """Run a SELECT through the driver cursor and keep values as returned.
 
         Unlike pd.read_sql_query this keeps column names exactly as the
         database sends them (Oracle: upper case), fetches Oracle NUMBER as
         Decimal (no float rounding of long numbers), reads LOBs as text and
         keeps NULL as None — so the result matches DBeaver.
+
+        engine: the run's engine; None -> self.engine (backward compatible).
         """
+        if engine is None:
+            engine = self.engine
         sql = sql_query.strip()
         # DBeaver accepts a trailing ';' or '/', the driver does not
         while sql.endswith(";") or (sql.endswith("/") and not sql.endswith("*/")):
             sql = sql[:-1].rstrip()
 
-        raw_connection = self.engine.raw_connection()
+        raw_connection = engine.raw_connection()
         try:
             dbapi_connection = getattr(raw_connection, "driver_connection", None) or raw_connection
             cursor = raw_connection.cursor()
             try:
-                if self.engine.dialect.name == "oracle":
+                if engine.dialect.name == "oracle":
                     import oracledb
 
                     def _output_type_handler(cur, metadata):
@@ -6620,22 +7280,99 @@ class DatabaseConnectorGUI:
         )
         return df
 
+    def _execute_modification(self, sql_query: str, engine: Any = None) -> int:
+        """Run a non-SELECT statement, commit, and return the affected row count.
+
+        The SQL goes to the driver as written (no SQLAlchemy text() parsing,
+        so ':NEW' in a trigger or ' :x' in a string is not a bind parameter;
+        no_parameters also leaves '%' alone for MySQL). A trailing ';' or
+        Oracle '/' line is removed like DBeaver does (kept for PL/SQL 'END;').
+
+        engine: the run's engine; None -> self.engine (backward compatible).
+        """
+        if engine is None:
+            engine = self.engine
+        sql = strip_sql_terminator(sql_query)
+        with engine.connect() as conn:
+            result = conn.exec_driver_sql(sql, execution_options={"no_parameters": True})
+            rows_affected = result.rowcount
+            conn.commit()
+        return rows_affected
+
     def is_select_query(self, query):
-        """Check if query is a SELECT statement"""
-        query_upper = query.strip().upper()
-        # Remove comments
-        query_upper = " ".join(
-            [line for line in query_upper.split("\n") if not line.strip().startswith("--")]
-        )
-        # Check if it starts with SELECT, WITH (for CTEs), or contains SELECT in first word
-        return (
-            query_upper.startswith("SELECT")
-            or query_upper.startswith("WITH")
-            or query_upper.startswith("(SELECT")
-        )
+        """True when the SQL is read-only and is run as a result set.
+
+        Understands comments, strings, CTEs (WITH ... SELECT vs
+        WITH ... UPDATE/DELETE) and multiple statements — see assess_sql.
+        """
+        return assess_sql(query or "").risk is SqlRisk.READ_ONLY
+
+    def _prepare_run_sql(self, jobs):
+        """Main thread, before any run: fill {TABLE_...} variables and check
+        that each SQL is a single statement.
+
+        jobs: list of {"name", "query"}. Returns the SQL to execute for each
+        job (same order), or None after showing an error. Saved queries and
+        the editor text are never changed.
+        """
+        tables = None
+        prepared, problems = [], []
+        for job in jobs:
+            name = job.get("name") or "SQL Editor"
+            sql = job.get("query", "") or ""
+            if find_table_variables(sql):
+                if tables is None:
+                    tables = self._current_table_data_tables()
+                result = render_table_variables(sql, tables)
+                if not result.ok:
+                    detail = []
+                    if result.missing_tokens:
+                        detail.append("no data: " + ", ".join(result.missing_tokens))
+                    if result.ambiguous_tokens:
+                        detail.append("ambiguous: " + ", ".join(result.ambiguous_tokens))
+                    problems.append(f"• {name} — table variable " + "; ".join(detail))
+                    continue
+                sql = result.sql
+                self.results_text.insert(
+                    tk.END,
+                    f"🔄 {name}: filled {len(result.replaced_tokens)} table variable(s) "
+                    f"from table data\n",
+                )
+            if not ALLOW_MULTI_STATEMENT_SQL and assess_sql(sql).statement_count > 1:
+                problems.append(f"• {name} — contains more than one SQL statement")
+                continue
+            prepared.append(sql)
+
+        if problems:
+            messagebox.showerror(
+                "Cannot Run SQL",
+                "These SQL statements were not run:\n\n"
+                + "\n".join(problems[:10])
+                + ("\n..." if len(problems) > 10 else "")
+                + "\n\nRun one statement at a time. Table variables need data "
+                "from the table-data file (open the table data dialog first).",
+            )
+            return None
+        return prepared
+
+    def _current_table_data_tables(self):
+        """Tables of the loaded table-data file (loads the file once if needed)."""
+        data = self.loaded_table_data
+        if not isinstance(data, dict):
+            try:
+                with open(self.table_data_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as error:
+                print(f"Cannot read table data file: {error}")
+                return None
+            if not isinstance(data, dict):
+                return None
+            self.loaded_table_data = data
+        tables = data.get("tables")
+        return tables if isinstance(tables, dict) else None
 
     def _app_settings_path(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
+        return os.path.join(APP_DIR, "app_settings.json")
 
     def _load_app_settings(self):
         try:
@@ -6672,19 +7409,23 @@ class DatabaseConnectorGUI:
         return cb
 
     def _track_engine_connections(self, engine):
-        """Remember which DB connections are in use, so Stop can cancel them."""
+        """Remember which DB connections are in use, so Stop can cancel them.
+
+        Entries are keyed by the pool record, not the DBAPI connection: at
+        check-in an invalidated connection arrives as None, which used to
+        leave the entry behind (app looked busy forever). Connections still
+        running on a previous engine are kept, so Stop can still cancel them
+        after a reconnect.
+        """
         from sqlalchemy import event
 
-        with self._active_db_lock:
-            self._active_db_connections.clear()
-
-        def _on_checkout(dbapi_connection, _record, _proxy):
+        def _on_checkout(dbapi_connection, record, _proxy):
             with self._active_db_lock:
-                self._active_db_connections.add(dbapi_connection)
+                self._active_db_connections[record] = dbapi_connection
 
-        def _on_checkin(dbapi_connection, _record):
+        def _on_checkin(_dbapi_connection, record):
             with self._active_db_lock:
-                self._active_db_connections.discard(dbapi_connection)
+                self._active_db_connections.pop(record, None)
 
         event.listen(engine, "checkout", _on_checkout)
         event.listen(engine, "checkin", _on_checkin)
@@ -6699,10 +7440,64 @@ class DatabaseConnectorGUI:
             or "Exporting" in str(self.export_excel_btn.cget("text"))
         )
 
-    def _start_stoppable_run(self):
+    def _is_busy(self) -> bool:
+        """A run is in progress: a query/batch/export is running, a single job
+        (▶) is running, or the Tables button shows 'Loading'."""
+        return (
+            self._is_query_running()
+            or bool(getattr(self, "_running_job_ids", None))
+            or "Loading" in str(self.inspect_btn.cget("text"))
+        )
+
+    def _log_blocked(self, action: str) -> None:
+        """Write why `action` was refused to Execution Logs. No popup."""
+        self.results_text.insert(
+            tk.END,
+            f"⏳ {action}: ทำไม่ได้ระหว่างที่มีงานรันอยู่ — "
+            "รอให้งานเสร็จหรือกด ⏹ Stop ก่อน\n",
+        )
+        self.results_text.see(tk.END)
+
+    def _running_banner_state(self, elapsed_seconds: int) -> "tuple[str, Optional[float]]":
+        """Text of the yellow banner and the determinate progress (0-100),
+        or None for an indeterminate bar. Reads only flags/button text."""
+        clock = f"{elapsed_seconds // 60:02d}:{elapsed_seconds % 60:02d}"
+        prog = getattr(self, "_ui_progress", None) or {}
+        if getattr(self, "_batch_running", False) and prog.get("total"):
+            index = prog.get("index", 0) or 0
+            text = (
+                f"กำลังรัน Job {max(index, 1)} / {prog['total']}"
+                + (f" · {prog['name']}" if prog.get("name") else "")
+                + f" · {clock}"
+            )
+            return text, 100 * max(index - 1, 0) / prog["total"]
+        if "Exporting" in str(self.export_excel_btn.cget("text")):
+            return f"กำลัง Export Excel · {clock}", None
+        if getattr(self, "_running_job_ids", None) and prog.get("kind") == "job":
+            name = prog.get("name")
+            return (f"กำลังรัน Job · {name} · {clock}" if name else f"กำลังรัน Job · {clock}"), None
+        return f"กำลังรัน SQL · {clock}", None
+
+    def _block_if_busy(self, action: str) -> bool:
+        """True (after logging the reason) when a run is in progress."""
+        if not self._is_busy():
+            return False
+        self._log_blocked(action)
+        return True
+
+    def _on_sql_ctrl_enter(self, _event=None) -> None:
+        """Ctrl+Enter = Run button: does nothing while Run is disabled
+        (logs the reason when a run is in progress)."""
+        if str(self.execute_btn["state"]) == "disabled":
+            if self._is_busy():
+                self._log_blocked("Run")
+            return
+        self.execute_query()
+
+    def _start_stoppable_run(self, target: Optional[RunTarget] = None) -> None:
         """Called when a run starts: forget any earlier Stop request."""
         self._stop_event.clear()
-        self._log_run_context()
+        self._log_run_context(target)
 
     # ---------------------------------------------------------------
     # Run log file (logs/run_YYYY-MM-DD.log) — never contains passwords
@@ -6710,7 +7505,7 @@ class DatabaseConnectorGUI:
     RUN_LOG_KEEP_DAYS = 90
 
     def _init_run_log(self):
-        self._log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        self._log_dir = os.path.join(APP_DIR, "logs")
         self._log_buffer = ""
         self._log_lock = threading.Lock()
         try:
@@ -6760,20 +7555,20 @@ class DatabaseConnectorGUI:
                 print(f"Run log: cannot write: {e}")
         self._refresh_log_file_label()
 
-    def _log_run_context(self):
-        """Log who/where a run goes to (profile and target, no password)."""
-        try:
-            user = self.db_user.get().strip()
-            host = self.db_host.get().strip()
-            port = self.db_port.get().strip()
-            database = self.db_name.get().strip()
-            target = f"{user}@{host}" + (f":{port}" if port else "") + (f"/{database}" if database else "")
-            self._write_run_log(
-                f"\n===== RUN  profile={self.profile_combo.get() or '-'}  "
-                f"{self.db_type.get()}  {target} =====\n"
-            )
-        except tk.TclError:
-            pass
+    def _log_run_context(self, target: Optional[RunTarget] = None) -> None:
+        """Log who/where a run goes to (profile and target, no password).
+
+        Uses the run's ConnectionInfo (snapshot taken at Connect), never the
+        screen fields. target None -> _capture_run_target(); no info -> '-'.
+        """
+        if target is None:
+            target = self._capture_run_target()
+        info = target.info if target is not None else None
+        if info is not None:
+            header = info.run_log_header()
+        else:
+            header = "\n===== RUN  profile=-  -  - =====\n"
+        self._write_run_log(header)
 
     def open_log_folder(self):
         try:
@@ -6784,11 +7579,11 @@ class DatabaseConnectorGUI:
 
     def stop_running_queries(self):
         """Stop button: cancel the query in progress and skip remaining jobs."""
-        if not self._is_query_running():
+        if not self._is_busy():
             return
         self._stop_event.set()
         with self._active_db_lock:
-            connections = list(self._active_db_connections)
+            connections = list(self._active_db_connections.values())
         cancelled = 0
         for dbapi_connection in connections:
             cancel = getattr(dbapi_connection, "cancel", None)  # Oracle (python-oracledb)
@@ -6814,9 +7609,16 @@ class DatabaseConnectorGUI:
         button.config(state="disabled")
 
     def _refresh_stop_buttons(self):
-        """Poll: Stop buttons are enabled only while something runs."""
+        """Poll: Stop buttons are enabled only while something runs; run/connect/
+        profile controls are locked meanwhile."""
         try:
-            state = "normal" if self._is_query_running() else "disabled"
+            busy = self._is_busy()
+        except Exception as e:  # never let a failed check stop this poll
+            print(f"Busy check failed: {e}")
+            self.root.after(300, self._refresh_stop_buttons)
+            return
+        try:
+            state = "normal" if busy else "disabled"
             alive = []
             for button in self._stop_buttons:
                 try:
@@ -6829,37 +7631,132 @@ class DatabaseConnectorGUI:
             self._stop_buttons = alive
         except tk.TclError:
             return
+        try:
+            self._apply_run_lock(busy)
+        except Exception as e:  # never let the lock step stop this poll
+            print(f"Run lock refresh failed: {e}")
         self.root.after(300, self._refresh_stop_buttons)
 
-    def _confirm_data_change(self, jobs):
+    def _register_run_lock_button(self, button, idle_state: Callable[[], str]) -> None:
+        """Lock `button` while a run is in progress; idle_state() gives its state when idle."""
+        self.__dict__.setdefault("_run_lock_extra", []).append((button, idle_state))
+
+    @staticmethod
+    def _set_widget_state(widget, state: str) -> bool:
+        """config(state=...) only when it differs. False when the widget is gone."""
+        try:
+            if str(widget.cget("state")) != state:
+                widget.config(state=state)
+            return True
+        except tk.TclError:
+            return False
+
+    @staticmethod
+    def _widget_alive(widget) -> bool:
+        try:
+            return bool(widget.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _apply_run_lock(self, busy: bool) -> None:
+        """Set every run/connect/profile control to disabled while busy, else its idle state."""
+        off = "disabled"
+        connected = "normal" if getattr(self, "engine", None) is not None else off
+        fixed = [
+            ("connect_btn", "normal"),
+            ("profile_combo", "readonly"),
+            ("execute_btn", connected),
+            ("inspect_btn", connected),
+            ("run_all_btn", "normal"),
+            ("export_excel_btn", "normal"),
+        ]
+        for name, idle in fixed:
+            widget = getattr(self, name, None)
+            if widget is not None:
+                self._set_widget_state(widget, off if busy else idle)
+        for button in getattr(self, "_profile_action_buttons", []):
+            self._set_widget_state(button, off if busy else "normal")
+
+        menu = getattr(self, "_profile_menu", None)
+        if menu is not None:
+            try:
+                menu.entryconfig(0, state=off if busy else "normal")
+            except tk.TclError:
+                pass
+
+        self._job_run_buttons = [
+            button
+            for button in getattr(self, "_job_run_buttons", [])
+            if self._widget_alive(button)
+            and self._set_widget_state(button, off if busy else "normal")
+        ]
+        self._run_lock_extra = [
+            (button, idle_state)
+            for button, idle_state in getattr(self, "_run_lock_extra", [])
+            if self._widget_alive(button)
+            and self._set_extra_lock_state(button, idle_state, busy)
+        ]
+
+    def _set_extra_lock_state(self, button, idle_state: Callable[[], str], busy: bool) -> bool:
+        """Lock state for a registered button. False (drop it) when its window is gone."""
+        try:
+            state = "disabled" if busy else idle_state()
+        except tk.TclError:
+            return False  # e.g. the Script Groups listbox was destroyed
+        return self._set_widget_state(button, state)
+
+    @staticmethod
+    def _confirm_destination(target: Optional[RunTarget]) -> tuple:
+        """(profile, database label) for the confirm dialog, from the run's
+        ConnectionInfo — never from the screen fields. No info -> ('-', '-')."""
+        info = target.info if target is not None else None
+        if info is None:
+            return "-", "-"
+        return info.profile or "-", info.target_label()
+
+    def _confirm_data_change(self, jobs, target: Optional[RunTarget] = None) -> bool:
         """Ask before running statements that are not SELECT (they are committed).
 
         jobs: list of {"name", "query"}. Returns True when nothing needs
         confirming or the user agreed; SELECT-only runs are never prompted.
+        target: the run's engine + destination; None -> _capture_run_target().
         """
-        changes = [job for job in jobs if not self.is_select_query(job.get("query", ""))]
+        changes, risks = [], {}
+        for job in jobs:
+            assessment = assess_sql(job.get("query", "") or "")
+            if assessment.risk is not SqlRisk.READ_ONLY:
+                changes.append(job)
+                risks[id(job)] = assessment.risk
         if not changes:
             return True
+        found = set(risks.values())
+        notes = []
+        if SqlRisk.SCHEMA_CHANGE in found:
+            notes.append("DDL (CREATE/ALTER/DROP/TRUNCATE) — บาง database commit ทันทีและย้อนกลับไม่ได้")
+        if SqlRisk.ADMIN in found:
+            notes.append("ADMIN (user / grant / system) — ตรวจสอบสิทธิ์และเป้าหมายให้แน่ใจ")
+        if SqlRisk.UNKNOWN in found:
+            notes.append("UNKNOWN (procedure / block / คำสั่งอื่น) — ระบุผลกระทบจากข้อความ SQL ไม่ได้")
 
-        target = self.db_type.get()
-        host = self.db_host.get().strip()
-        database = self.db_name.get().strip()
-        if host:
-            target += f" · {host}" + (f" / {database}" if database else "")
+        if target is None:
+            target = self._capture_run_target()
+        profile, target_text = self._confirm_destination(target)
 
         lines = []
         for job in changes[:10]:
             first_line = " ".join(str(job.get("query", "")).split())[:70]
-            lines.append(f"• {job.get('name') or 'SQL Editor'}:  {first_line}")
+            lines.append(
+                f"• [{risks[id(job)].value}] {job.get('name') or 'SQL Editor'}:  {first_line}"
+            )
         if len(changes) > 10:
             lines.append(f"... and {len(changes) - 10} more")
-        profile = self.profile_combo.get() or "-"
 
         def body(frame):
             _box_outer, box = ui_round_frame(frame, fill="#FEF3C7", radius=8, pad=2)
             _box_outer.pack(fill="x")
             for job in changes[:6]:
-                tk.Label(box, text=job.get("name") or "SQL Editor", bg="#FEF3C7", fg=UI["text"],
+                tk.Label(box, text=f"[{risks[id(job)].value}]  {job.get('name') or 'SQL Editor'}",
+                         bg="#FEF3C7", fg=UI["text"],
                          font=UI_FONT_SEMI, anchor="w").pack(fill="x", padx=12, pady=(8, 0))
                 sql = " ".join(str(job.get("query", "")).split())
                 tk.Label(box, text=sql if len(sql) <= 90 else sql[:89] + "…", bg="#FEF3C7",
@@ -6870,13 +7767,17 @@ class DatabaseConnectorGUI:
             tk.Frame(box, bg="#FEF3C7", height=8).pack()
             info = tk.Frame(frame, bg=UI["card"])
             info.pack(fill="x", pady=(12, 0))
-            for r, (k, v) in enumerate((("Profile", profile), ("Database", target))):
+            for r, (k, v) in enumerate((("Profile", profile), ("Database", target_text))):
                 tk.Label(info, text=k, bg=UI["card"], fg=UI["muted"], font=UI_FONT_SM).grid(
                     row=r, column=0, sticky="w", padx=(0, 16), pady=1)
                 tk.Label(info, text=v, bg=UI["card"], fg=UI["text"], font=UI_FONT_SEMI).grid(
                     row=r, column=1, sticky="w", pady=1)
             tk.Label(frame, text="ⓘ  ย้อนกลับไม่ได้หลัง commit", bg=UI["card"], fg=UI["danger"],
                      font=UI_FONT_SM, anchor="w").pack(fill="x", pady=(10, 0))
+            for note in notes:
+                tk.Label(frame, text="⚠  " + note, bg=UI["card"], fg=UI["danger"],
+                         font=UI_FONT_SM, anchor="w", justify="left", wraplength=520).pack(
+                    fill="x", pady=(2, 0))
 
         return bool(ui_dialog(
             self.root,
@@ -6890,11 +7791,14 @@ class DatabaseConnectorGUI:
             focus_value=False,
             message=f"{len(changes)} statement(s) will CHANGE DATA and be committed immediately:\n\n"
             + "\n".join(lines)
-            + f"\n\nProfile : {profile}\nDatabase: {target}",
+            + "".join(f"\n⚠ {note}" for note in notes)
+            + f"\n\nProfile : {profile}\nDatabase: {target_text}",
         ))
 
     def execute_query(self):
         """Execute the SQL query with comprehensive error handling and retry capability"""
+        if self._block_if_busy("Run"):
+            return
         if not self.engine:
             messagebox.showerror("Error", "Please connect to database first")
             return
@@ -6904,12 +7808,19 @@ class DatabaseConnectorGUI:
             messagebox.showerror("Error", "Please enter a SQL query")
             return
 
-        if not self._confirm_data_change([{"name": None, "query": sql_query}]):
+        self.results_text.delete("1.0", tk.END)
+        prepared = self._prepare_run_sql([{"name": None, "query": sql_query}])
+        if prepared is None:
             return
-        self._start_stoppable_run()
+        sql_query = prepared[0]  # table variables filled; the editor keeps the template
+
+        # The run's engine + destination, taken once here and used to the end
+        target = self._capture_run_target()
+        if not self._confirm_data_change([{"name": None, "query": sql_query}], target=target):
+            return
+        self._start_stoppable_run(target=target)
 
         # Show loading message
-        self.results_text.delete("1.0", tk.END)
         self.results_text.insert(tk.END, f"⏳ Executing query...\n")
         self.results_text.insert(tk.END, f"SQL: {sql_query}\n\n")
         self.results_text.insert(tk.END, "⚠️ Please wait, loading data...\n")
@@ -6923,7 +7834,7 @@ class DatabaseConnectorGUI:
         loading_dialog = self._create_loading_dialog_with_retry(sql_query)
 
         # Execute query in background thread
-        self._execute_query_background(sql_query, loading_dialog)
+        self._execute_query_background(sql_query, loading_dialog, engine=target.engine)
 
     def on_modification_success(self, rows_affected, sql_query, loading_dialog):
         """Handle successful UPDATE/INSERT/DELETE execution"""
@@ -6931,15 +7842,15 @@ class DatabaseConnectorGUI:
             # Close loading dialog
             loading_dialog.destroy()
 
-            # Determine operation type
-            query_upper = sql_query.strip().upper()
-            if query_upper.startswith("UPDATE"):
+            # Determine operation type (skips leading comments and WITH ...)
+            command = assess_sql(sql_query).command
+            if command == "UPDATE":
                 operation = "UPDATE"
                 icon = "✏️"
-            elif query_upper.startswith("INSERT"):
+            elif command == "INSERT":
                 operation = "INSERT"
                 icon = "➕"
-            elif query_upper.startswith("DELETE"):
+            elif command == "DELETE":
                 operation = "DELETE"
                 icon = "🗑️"
             else:
@@ -7559,8 +8470,18 @@ class DatabaseConnectorGUI:
 
     def sort_treeview(self, tree, col, reverse):
         """Sort treeview by column"""
+        def _key(item):
+            value = item[0]
+            try:  # numbers sort as numbers ("9" before "10"); text after them
+                number = float(value.replace(",", ""))
+                if number == number:  # not NaN
+                    return (0, number, "")
+            except ValueError:
+                pass
+            return (1, 0.0, value)
+
         data = [(tree.set(child, col), child) for child in tree.get_children("")]
-        data.sort(reverse=reverse)
+        data.sort(key=_key, reverse=reverse)
         for index, (val, child) in enumerate(data):
             tree.move(child, "", index)
         tree.heading(col, command=lambda: self.sort_treeview(tree, col, not reverse))
@@ -7616,9 +8537,17 @@ class DatabaseConnectorGUI:
 
     def list_tables(self):
         """List all schemas and tables in the database"""
+        if self._block_if_busy("Tables"):
+            return
         if not self.engine:
             messagebox.showerror("Error", "Please connect to database first")
             return
+
+        # The engine + database type of this run, taken once on the main thread;
+        # the worker below never reads self.engine or the screen db_type
+        target = self._capture_run_target()
+        engine = target.engine
+        db_type = target.info.db_type if target.info is not None else self.db_type.get()
 
         # Check if user wants to list all databases or just current connection
         current_db_name = self.db_name.get().strip()
@@ -7630,30 +8559,12 @@ class DatabaseConnectorGUI:
         self.inspect_btn.config(state="disabled", text="⏳ Loading...")
         self.root.update()
 
-        # Create loading dialog
-        loading_dialog = tk.Toplevel(self.root)
-        loading_dialog.title("Loading Tables...")
-        loading_dialog.geometry("300x250")
-        loading_dialog.transient(self.root)
-        loading_dialog.grab_set()
-
-        # Center dialog
-        loading_dialog.update_idletasks()
-        x = (loading_dialog.winfo_screenwidth() // 2) - (loading_dialog.winfo_width() // 2)
-        y = (loading_dialog.winfo_screenheight() // 2) - (loading_dialog.winfo_height() // 2)
-        loading_dialog.geometry(f"+{x}+{y}")
-
-        ttk.Label(loading_dialog, text="⏳ Loading tables...", font=("Arial", 11, "bold")).pack(
-            pady=10
-        )
-        progress = ttk.Progressbar(loading_dialog, mode="indeterminate", length=250)
-        progress.pack(pady=10)
-        progress.start(10)
+        # Create loading dialog (with its own Stop button: the dialog grabs input)
+        loading_dialog = self._create_list_tables_loading_dialog()
 
         # Execute in background thread
         def fetch_tables_in_background():
             try:
-                db_type = self.db_type.get()
                 table_list = []
 
                 # Check if we should list all databases or just current
@@ -7663,7 +8574,7 @@ class DatabaseConnectorGUI:
 
                     # Get database list
                     try:
-                        with self.engine.connect() as conn:
+                        with engine.connect() as conn:
                             if db_type == "PostgreSQL":
                                 result = conn.execute(
                                     text(
@@ -7719,7 +8630,7 @@ class DatabaseConnectorGUI:
                             print(f"📁 Processing database: {database}")
                             if db_type == "Oracle":
                                 # For Oracle, use current connection with schema
-                                inspector = inspect(self.engine)
+                                inspector = inspect(engine)
                                 try:
                                     tables = inspector.get_table_names(schema=database)
                                     for table in tables:
@@ -7835,7 +8746,7 @@ class DatabaseConnectorGUI:
                             pass
                 else:
                     # List tables from currently connected database only
-                    inspector = inspect(self.engine)
+                    inspector = inspect(engine)
                     schemas = inspector.get_schema_names()
 
                     for schema in schemas:
@@ -7881,6 +8792,37 @@ class DatabaseConnectorGUI:
         # Start background thread
         thread = threading.Thread(target=fetch_tables_in_background, daemon=True)
         thread.start()
+
+    def _create_list_tables_loading_dialog(self) -> "tk.Toplevel":
+        """The 'Loading Tables...' window plus a ⏹ Stop button.
+
+        The window grabs input, so the main window's Stop cannot be clicked;
+        this button calls stop_running_queries and is enabled/disabled by the
+        _refresh_stop_buttons poll (dropped from the list once the window closes).
+        """
+        loading_dialog = tk.Toplevel(self.root)
+        loading_dialog.title("Loading Tables...")
+        loading_dialog.geometry("300x250")
+        loading_dialog.transient(self.root)
+        loading_dialog.grab_set()
+
+        # Center dialog
+        loading_dialog.update_idletasks()
+        x = (loading_dialog.winfo_screenwidth() // 2) - (loading_dialog.winfo_width() // 2)
+        y = (loading_dialog.winfo_screenheight() // 2) - (loading_dialog.winfo_height() // 2)
+        loading_dialog.geometry(f"+{x}+{y}")
+
+        ttk.Label(loading_dialog, text="⏳ Loading tables...", font=("Arial", 11, "bold")).pack(
+            pady=10
+        )
+        progress = ttk.Progressbar(loading_dialog, mode="indeterminate", length=250)
+        progress.pack(pady=10)
+        progress.start(10)
+
+        stop_btn = ui_rbutton(loading_dialog, "⏹  Stop", self.stop_running_queries, "danger", "sm")
+        stop_btn.pack(pady=(4, 10))
+        self._register_stop_button(stop_btn)
+        return loading_dialog
 
     def on_list_tables_success(self, table_list, loading_dialog, has_database=True):
         """Handle successful table listing"""
@@ -7980,6 +8922,9 @@ class DatabaseConnectorGUI:
 
                 jobs = json.load(f)
 
+            if not isinstance(jobs, list) or not all(isinstance(job, dict) for job in jobs):
+                raise ValueError("saved_jobs.json must contain a list of jobs")
+
             modified = False
 
             for job in jobs:
@@ -7997,22 +8942,50 @@ class DatabaseConnectorGUI:
 
             # บันทึกกลับเฉพาะกรณีพบข้อมูลเก่า
             if modified:
-
-                with open(self.jobs_file, "w", encoding="utf-8") as f:
-
-                    json.dump(jobs, f, indent=4, ensure_ascii=False)
+                write_json_atomic(self.jobs_file, jobs, indent=4)
 
             return jobs
 
         except Exception as e:
             print(f"Error loading jobs: {e}")
+            self._jobs_save_blocked = self._handle_unreadable_file(self.jobs_file, "Saved Jobs", e)
             return []
+
+    def _handle_unreadable_file(self, path, label, error):
+        """A settings file exists but cannot be read: keep a copy of it.
+
+        Returns True when no copy could be made — saving must then be
+        refused, otherwise the next save would overwrite the only copy.
+        """
+        backup = preserve_unreadable_file(path)
+        if backup:
+            detail = f"A copy of the file was kept as:\n{backup}"
+        else:
+            detail = (
+                "The file could not be copied either, so it will NOT be overwritten "
+                "in this session. Close the app, check the file (e.g. OneDrive sync), "
+                "and start the app again."
+            )
+        try:
+            messagebox.showwarning(
+                f"{label} not loaded",
+                f"Cannot read {os.path.basename(path)}:\n{error}\n\n{detail}",
+            )
+        except tk.TclError:
+            pass
+        return backup is None
 
     def save_jobs(self):
         """Save jobs to file"""
+        if getattr(self, "_jobs_save_blocked", False):
+            messagebox.showerror(
+                "Error",
+                "saved_jobs.json could not be read when the app started, so it is not "
+                "overwritten. Restart the app to load your jobs again.",
+            )
+            return
         try:
-            with open(self.jobs_file, "w", encoding="utf-8") as f:
-                json.dump(self.saved_jobs, f, indent=2, ensure_ascii=False)
+            write_json_atomic(self.jobs_file, self.saved_jobs)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save jobs:\n{str(e)}")
 
@@ -8146,6 +9119,9 @@ class DatabaseConnectorGUI:
 
     def run_job(self, job):
         """Run single saved job"""
+        # A second click (or ▶ of another card) while any run is in progress
+        if self._block_if_busy("Run Job"):
+            return
 
         if not self.engine:
             messagebox.showerror("Error", "Please connect to database first")
@@ -8157,20 +9133,23 @@ class DatabaseConnectorGUI:
             messagebox.showwarning("Warning", "SQL Query is empty")
             return
 
-        # ▶ stays clickable while the query runs: a second click (or a
-        # double-click) used to start a second run and open a second window
         running_jobs = self.__dict__.setdefault("_running_job_ids", set())
-        if id(job) in running_jobs:
-            self.results_text.insert(
-                tk.END, f"⏳ {job.get('name', '')} is already running — please wait\n"
-            )
-            self.results_text.see(tk.END)
-            return
 
-        if not self._confirm_data_change([job]):
+        prepared = self._prepare_run_sql([job])
+        if prepared is None:
+            return
+        sql_query = prepared[0]  # the saved job keeps its original SQL
+        # The run's engine + destination, taken once here and used to the end
+        target = self._capture_run_target()
+        if not self._confirm_data_change(
+            [{"name": job.get("name"), "query": sql_query}], target=target
+        ):
             return
         running_jobs.add(id(job))
-        self._start_stoppable_run()
+        # Yellow banner: "กำลังรัน Job · <name> · mm:ss" (cleared in finish)
+        self._ui_progress = {"total": 0, "index": 0, "name": job.get("name", ""), "kind": "job"}
+        self._start_stoppable_run(target=target)
+        engine = target.engine
 
         # หาเลขลำดับของ Job ตาม Saved Jobs
         current_profile = self.profile_combo.get()
@@ -8180,7 +9159,7 @@ class DatabaseConnectorGUI:
         job_index = 1
 
         for idx, j in enumerate(profile_jobs, start=1):
-            if j == job:
+            if j is job:
                 job_index = idx
                 break
 
@@ -8197,9 +9176,14 @@ class DatabaseConnectorGUI:
 
         def finish(status, result_data=None, query_type="select", error=None, query_time=0):
             running_jobs.discard(id(job))
-            self.execute_btn.config(state="normal")
-            self.inspect_btn.config(state="normal")
-            self.save_job_btn.config(state="normal")
+            # Success, error and Stop all end here: drop the single-job banner info
+            if not running_jobs and getattr(self, "_ui_progress", {}).get("kind") == "job":
+                self._ui_progress = {"total": 0, "index": 0, "name": "", "kind": None}
+            # A Run all started meanwhile keeps the buttons disabled until it ends
+            if not getattr(self, "_batch_running", False) and not running_jobs:
+                self.execute_btn.config(state="normal")
+                self.inspect_btn.config(state="normal")
+                self.save_job_btn.config(state="normal")
             self._start_job_result_report()
             self.update_job_status(
                 job_index,
@@ -8229,13 +9213,10 @@ class DatabaseConnectorGUI:
             start_time = time.perf_counter()
             try:
                 if self.is_select_query(sql_query):
-                    result_data = self.read_sql_dataframe(sql_query)
+                    result_data = self.read_sql_dataframe(sql_query, engine=engine)
                     query_type = "select"
                 else:
-                    with self.engine.connect() as conn:
-                        result = conn.execute(text(sql_query))
-                        conn.commit()
-                        result_data = result.rowcount
+                    result_data = self._execute_modification(sql_query, engine=engine)
                     query_type = "modify"
 
                 elapsed = time.perf_counter() - start_time
@@ -8254,6 +9235,9 @@ class DatabaseConnectorGUI:
 
         jobs_override: run exactly these jobs instead (used by Script Groups).
         """
+        # Extra clicks / Run Group while any run is in progress are refused here
+        if self._block_if_busy("Run all"):
+            return
         if jobs_override is not None:
             profile_jobs = list(jobs_override)
             list_numbers = {id(job): number for number, job in enumerate(profile_jobs, start=1)}
@@ -8275,14 +9259,21 @@ class DatabaseConnectorGUI:
             messagebox.showerror("Error", "Please connect to database first")
             return
 
-        # Ignore extra clicks while a run is in progress (each click would
-        # otherwise start another run and open another set of popups)
-        if getattr(self, "_batch_running", False):
+        prepared = self._prepare_run_sql(profile_jobs)
+        if prepared is None:
             return
-
-        if not self._confirm_data_change(profile_jobs):
+        # SQL to execute per job (table variables filled); saved jobs are unchanged
+        run_sql = {id(job): sql for job, sql in zip(profile_jobs, prepared)}
+        # The run's engine + destination, taken once here: every job of this
+        # run uses this engine even if self.engine changes meanwhile
+        target = self._capture_run_target()
+        run_engine = target.engine
+        if not self._confirm_data_change(
+            [{"name": job.get("name"), "query": run_sql[id(job)]} for job in profile_jobs],
+            target=target,
+        ):
             return
-        self._start_stoppable_run()
+        self._start_stoppable_run(target=target)
         self._batch_running = True
         self.run_all_btn.config(state="disabled")
 
@@ -8328,11 +9319,12 @@ class DatabaseConnectorGUI:
                     self.root.after(0, lambda i=idx, j=job: self.update_job_status(i, j, "running"))
                     time_module.sleep(0.1)
 
+                    job_sql = run_sql[id(job)]
                     try:
                         # Check if it's a SELECT query or data modification
-                        if self.is_select_query(job["query"]):
+                        if self.is_select_query(job_sql):
                             # Execute SELECT query
-                            df = self.read_sql_dataframe(job["query"])
+                            df = self.read_sql_dataframe(job_sql, engine=run_engine)
                             elapsed_time = time_module.time() - start_time
 
                             # Store result
@@ -8366,10 +9358,7 @@ class DatabaseConnectorGUI:
                             success_count += 1
                         else:
                             # Execute UPDATE/INSERT/DELETE statement
-                            with self.engine.connect() as conn:
-                                result = conn.execute(text(job["query"]))
-                                conn.commit()
-                                rows_affected = result.rowcount
+                            rows_affected = self._execute_modification(job_sql, engine=run_engine)
                             elapsed_time = time_module.time() - start_time
 
                             # Store result
@@ -8431,18 +9420,7 @@ class DatabaseConnectorGUI:
 
                         # Check if this is a data modification query (UPDATE/INSERT/DELETE)
                         # If so, stop execution immediately
-                        if not self.is_select_query(job["query"]):
-                            query_upper = job["query"].strip().upper()
-                            if query_upper.startswith("UPDATE"):
-                                operation = "UPDATE"
-                            elif query_upper.startswith("INSERT"):
-                                operation = "INSERT"
-                            elif query_upper.startswith("DELETE"):
-                                operation = "DELETE"
-                            else:
-                                operation = "Data Modification"
-
-                            # Show critical error message
+                        if not self.is_select_query(job_sql):
                             # Stop execution - break the loop
                             break
 
@@ -8696,6 +9674,8 @@ class DatabaseConnectorGUI:
 
     def export_jobs_to_excel(self, jobs_override=None, file_prefix=None):
         """Export ผลลัพธ์ของทุก Job ลง Excel - 1 Job = 1 Sheet (ชื่อ Sheet = ชื่อ Job)"""
+        if self._block_if_busy("Export"):
+            return
         import re
         import time as time_module
 
@@ -8714,6 +9694,11 @@ class DatabaseConnectorGUI:
             messagebox.showerror("Export Error", err)
             return
 
+        jobs_to_export = jobs_override if jobs_override is not None else self.get_jobs_to_run()
+        if not jobs_to_export:
+            messagebox.showwarning("Export Excel", "No jobs to export")
+            return
+
         # เลือกที่บันทึกไฟล์
         default_name = f"jobs_export_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         if file_prefix:
@@ -8728,11 +9713,16 @@ class DatabaseConnectorGUI:
         if not file_path:
             return  # User cancelled
 
-        jobs = jobs_override if jobs_override is not None else self.get_jobs_to_run()
-        jobs = self._reuse_last_run_results(jobs)
+        # The run's engine + destination, taken once here and used by the worker
+        target = self._capture_run_target()
+        export_engine = target.engine
+        jobs = self._reuse_last_run_results(jobs_to_export)
         if jobs is None:
             return  # User cancelled
-        self._start_stoppable_run()
+        # Something may have started while the file / reuse dialogs were open
+        if self._block_if_busy("Export"):
+            return
+        self._start_stoppable_run(target=target)
 
         # ---- เขียน log เริ่มต้นลง Results ----
         self.results_text.delete("1.0", tk.END)
@@ -8779,6 +9769,13 @@ class DatabaseConnectorGUI:
                 f"Success: {ok} | Failed: {failed} | Skipped: {skipped}",
             )
 
+        # Table data for {TABLE_...} variables, read here on the main thread
+        export_tables = (
+            self._current_table_data_tables()
+            if any(find_table_variables(j.get("query", "")) for j in jobs)
+            else None
+        )
+
         def worker():
             import re
 
@@ -8818,7 +9815,23 @@ class DatabaseConnectorGUI:
 
                         try:
                             preloaded_df = job.get("_export_dataframe")
-                            if preloaded_df is None and not self.is_select_query(query):
+                            if preloaded_df is None and find_table_variables(query):
+                                rendered = render_table_variables(query, export_tables)
+                                if not rendered.ok:
+                                    raise ValueError(
+                                        "Table variable has no data / is ambiguous: "
+                                        + ", ".join(
+                                            rendered.missing_tokens + rendered.ambiguous_tokens
+                                        )
+                                    )
+                                query = rendered.sql
+                            if preloaded_df is None and (
+                                not self.is_select_query(query)
+                                or (
+                                    not ALLOW_MULTI_STATEMENT_SQL
+                                    and assess_sql(query).statement_count > 1
+                                )
+                            ):
                                 skipped += 1
                                 log(
                                     "   Status: ⏭️ Skipped (ไม่ใช่ SELECT - ไม่รันซ้ำเพื่อความปลอดภัย)\n\n"
@@ -8837,7 +9850,7 @@ class DatabaseConnectorGUI:
                             df = (
                                 preloaded_df.copy()
                                 if preloaded_df is not None
-                                else self.read_sql_dataframe(query)
+                                else self.read_sql_dataframe(query, engine=export_engine)
                             )
                             query_elapsed = time_module.time() - query_start
 
@@ -9010,10 +10023,11 @@ class DatabaseConnectorGUI:
                             # ใส่ Border เฉพาะ Header + Data เท่านั้น
                             data_last_row = max(len(df) + 1, 1)
                             for row in ws.iter_rows(min_row=1, max_row=data_last_row):
-                                data_last_row = max(len(df) + 1, 1)
-
-                            for row in ws.iter_rows(min_row=1, max_row=data_last_row):
                                 for cell in row:
+                                    # openpyxl turns text starting with "=" into a
+                                    # formula; database values are always plain text
+                                    if cell.data_type == "f":
+                                        cell.data_type = "s"
                                     cell.number_format = excel_number_format(cell.value)
                                     cell.border = all_border
 
@@ -9044,6 +10058,12 @@ class DatabaseConnectorGUI:
                             pd.DataFrame(
                                 {"Status": ["Failed"], "Error": [str(job_err)], "Query": [query]}
                             ).to_excel(writer, sheet_name=sheet, index=False)
+
+                    if not writer.sheets:
+                        # Stopped before the first job: a workbook needs one sheet
+                        pd.DataFrame(
+                            {"Status": ["Stopped"], "Message": ["Export was stopped before any job ran"]}
+                        ).to_excel(writer, sheet_name="Export", index=False)
 
             except Exception as e:
                 fatal_error = f"{type(e).__name__}: {str(e)}"
@@ -9144,6 +10164,8 @@ class DatabaseConnectorGUI:
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("db_profiles.json must contain a JSON object")
                 # กรอง last_used_profile ออก (ไม่ใช่ profile จริง)
                 profiles = {
                     k: dict(v)
@@ -9154,9 +10176,24 @@ class DatabaseConnectorGUI:
                     if "db_password" in profile:
                         profile["db_password"] = unprotect_password(profile["db_password"])
                 return profiles
-            except:
+            except Exception as e:
+                print(f"Error loading profiles: {e}")
+                self._profiles_save_blocked = self._handle_unreadable_file(
+                    self.config_file, "Profiles", e
+                )
                 return {}
         return {}
+
+    def _profiles_save_refused(self, show=True):
+        if not getattr(self, "_profiles_save_blocked", False):
+            return False
+        if show:
+            messagebox.showerror(
+                "Save Error",
+                "db_profiles.json could not be read when the app started, so it is not "
+                "overwritten. Restart the app to load your profiles again.",
+            )
+        return True
 
     def _profiles_for_disk(self, last_used_profile=None):
         """สร้างข้อมูลสำหรับเขียนไฟล์ - password ถูกเข้ารหัส, คง last_used_profile เดิมไว้"""
@@ -9175,6 +10212,8 @@ class DatabaseConnectorGUI:
 
     def save_profiles(self):
         """บันทึก profiles ลงไฟล์ - ENHANCED with debugging"""
+        if self._profiles_save_refused():
+            return
         try:
             # Ensure directory exists
             config_dir = os.path.dirname(self.config_file)
@@ -9182,10 +10221,7 @@ class DatabaseConnectorGUI:
                 os.makedirs(config_dir)
 
             data = self._profiles_for_disk()
-
-            # Save with explicit encoding
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            write_json_atomic(self.config_file, data)
 
         except Exception as e:
             error_msg = f"❌ Cannot save profile!\n\nError: {str(e)}\n\nPath: {self.config_file}"
@@ -9194,11 +10230,11 @@ class DatabaseConnectorGUI:
 
     def save_last_used_profile(self, profile_name):
         """บันทึก profile ล่าสุดที่ใช้"""
+        if self._profiles_save_refused(show=False):
+            return
         try:
             data = self._profiles_for_disk(last_used_profile=profile_name)
-
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            write_json_atomic(self.config_file, data)
         except Exception as e:
             print(f"Failed to save last used profile: {str(e)}")
 
@@ -9216,16 +10252,33 @@ class DatabaseConnectorGUI:
     def update_profile_list(self):
 
         profile_names = list(self.saved_profiles.keys())
+        previous = self.profile_combo.get()
+        app_ready = hasattr(self, "jobs_container")
 
         self.profile_combo["values"] = profile_names
 
-        if profile_names:
+        if previous in profile_names:
+            # Keep the profile whose connection is loaded (import / save)
+            self.profile_combo.set(previous)
+        elif profile_names:
             self.profile_combo.current(0)
+            if previous and app_ready:
+                # The loaded profile is gone (deleted / replaced on import):
+                # load the newly shown one so its jobs and connection match
+                self.load_profile_data(profile_names[0])
+        else:
+            self.profile_combo.set("")
+            if previous and app_ready:
+                self._reset_profile_connection_state(self.engine)
 
-        if hasattr(self, "jobs_container"):
+        if app_ready:
             self.update_jobs_list()
 
     def on_profile_selected(self, event=None):
+        if self._block_if_busy("เปลี่ยน Profile"):
+            # Put the picker back on the profile that is actually loaded
+            self.profile_combo.set(getattr(self, "_active_profile", ""))
+            return
 
         profile_name = self.profile_combo.get()
 
@@ -9254,14 +10307,19 @@ class DatabaseConnectorGUI:
         if self.engine is not engine_at_switch:
             return  # user already reconnected after the switch — keep the new connection
 
-        busy = any(
-            "Loading" in str(b.cget("text")) for b in (self.execute_btn, self.inspect_btn)
-        ) or (self.engine is not None and str(self.execute_btn["state"]) == "disabled")
+        busy = (
+            any("Loading" in str(b.cget("text")) for b in (self.execute_btn, self.inspect_btn))
+            or (self.engine is not None and str(self.execute_btn["state"]) == "disabled")
+            # Export Excel / Run all / single jobs use the engine from a thread
+            or self._is_query_running()
+            or bool(getattr(self, "_running_job_ids", None))
+        )
         if busy:
             self.root.after(500, lambda: self._reset_profile_connection_state(engine_at_switch))
             return
 
         engine, self.engine = self.engine, None
+        self._run_target = None
         if engine is not None:
             try:
                 engine.dispose()
@@ -9309,6 +10367,7 @@ class DatabaseConnectorGUI:
                     saved_sql = self.DEFAULT_SQL_QUERY
                 self.sql_context.insert(1.0, saved_sql)
 
+            self._active_profile = profile_name
             self.results_text.insert(tk.END, f"📂 Loaded profile: {profile_name}\n\n")
 
             self.update_jobs_list()
@@ -9326,9 +10385,17 @@ class DatabaseConnectorGUI:
                 self.profile_combo.current(profile_names.index(last_profile))
                 self.load_profile_data(last_profile)
                 self.results_text.insert(tk.END, f"✅ Auto-loaded last profile: {last_profile}\n\n")
+                return
+        # No last profile: the picker shows the first one — load it, so its
+        # jobs list and the connection fields belong to the same profile
+        shown = self.profile_combo.get()
+        if shown and shown in self.saved_profiles:
+            self.load_profile_data(shown)
 
     def save_profile_dialog(self):
         """แสดง dialog สำหรับบันทึก profile"""
+        if self._block_if_busy("บันทึก Profile"):
+            return
         dialog = tk.Toplevel(self.root)
         dialog.title("Save Profile")
         dialog.geometry("400x250")
@@ -9393,6 +10460,7 @@ class DatabaseConnectorGUI:
             profile_names = list(self.saved_profiles.keys())
             if profile_name in profile_names:
                 self.profile_combo.current(profile_names.index(profile_name))
+            self._active_profile = profile_name
 
             self.results_text.insert(tk.END, f"💾 Saved profile: {profile_name}\n\n")
             self.results_text.see(tk.END)
@@ -9409,6 +10477,8 @@ class DatabaseConnectorGUI:
 
     def new_profile_dialog(self):
         """แสดง dialog สำหรับสร้าง Profile ใหม่ (กรอกข้อมูลการเชื่อมต่อทั้งหมด)"""
+        if self._block_if_busy("สร้าง Profile"):
+            return
         port_defaults = {
             "PostgreSQL": "5432",
             "MySQL": "3306",
@@ -9674,6 +10744,8 @@ class DatabaseConnectorGUI:
 
     def delete_profile(self):
         """ลบ profile ที่เลือก"""
+        if self._block_if_busy("ลบ Profile"):
+            return
         profile_name = self.profile_combo.get()
         if not profile_name:
             messagebox.showwarning("Warning", "กรุณาเลือก Profile ที่ต้องการลบ")
@@ -9759,9 +10831,9 @@ class DatabaseConnectorGUI:
             # Convert to string and clean unwanted quotes
             cleaned_value = str(value).strip()
 
-            # Remove quotes accidentally coming from Excel
-            cleaned_value = cleaned_value.rstrip("'")
-            cleaned_value = cleaned_value.rstrip('"')
+            # Remove quotes accidentally coming from Excel (both ends, so
+            # 'ABC' does not become the broken literal '''ABC')
+            cleaned_value = cleaned_value.strip("'\"")
 
             if isinstance(value, numbers.Number) and not isinstance(value, bool):
 
@@ -9849,7 +10921,10 @@ class DatabaseConnectorGUI:
                 continue
 
             if parameter.startswith(":"):
-                token_pattern = r"(?P<quote>['\"]?)" + re.escape(parameter) + r"(?P=quote)"
+                # (?!\w): ":ACC" must not also match inside ":ACC_TYPE"
+                token_pattern = (
+                    r"(?P<quote>['\"]?)" + re.escape(parameter) + r"(?![A-Za-z0-9_])(?P=quote)"
+                )
             else:
                 parameter_name = parameter.strip("{}").strip()
                 token_pattern = (
@@ -10834,7 +11909,7 @@ class DatabaseConnectorGUI:
                 # dict keeps Excel order and dedupes in O(n)
                 column_values[column_name] = list(
                     dict.fromkeys(
-                        str(value)
+                        excel_value_text(value)
                         for value in dataframe[column_lookup[column_name]].dropna().tolist()
                     )
                 )

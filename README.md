@@ -24,9 +24,9 @@
 
 ### 1. Connection Profiles
 
-- **＋ New** — เปิดหน้าต่างสร้าง Profile ใหม่: เลือกชนิดฐานข้อมูลจากการ์ด (Port เปลี่ยนให้ตามชนิด) กรอกข้อมูล แล้วกด **🔌 ทดสอบการเชื่อมต่อ** ก่อน **＋ สร้าง Profile** ได้
-- **Save** — บันทึกค่าที่แก้ในช่อง Details กลับเข้า Profile
-- **Import / Export** — นำเข้า/ส่งออก Profile เป็นไฟล์ JSON (Import มี Preview ให้เลือก **Merge** หรือ **Replace**)
+- **＋ New**: เปิดหน้าต่างสร้าง Profile ใหม่ ให้เลือกชนิดฐานข้อมูลจากการ์ด (Port เปลี่ยนให้ตามชนิด) กรอกข้อมูล แล้วกด **🔌 ทดสอบการเชื่อมต่อ** ก่อน **＋ สร้าง Profile** ได้
+- **Save**: บันทึกค่าที่แก้ในช่อง Details กลับเข้า Profile
+- **Import / Export**: นำเข้า/ส่งออก Profile เป็นไฟล์ JSON (Import มี Preview ให้เลือก **Merge** หรือ **Replace**)
 - เมนู **⋯** มี **Delete profile** และ **Config file location** (แสดงตำแหน่งไฟล์ config พร้อมปุ่มเปิดโฟลเดอร์ / คัดลอก path)
 - ใต้ชื่อ Profile แสดง Host และ Database / Service ที่จะต่อ
 - โหลด Profile ที่ใช้ล่าสุดให้อัตโนมัติเมื่อเปิดโปรแกรม
@@ -37,18 +37,19 @@
 
 ### 2. SQL Editor
 
-- **▶ Run** หรือ `Ctrl+Enter` — รัน Query ใน background thread (UI ไม่ค้าง) มีหน้าต่าง Loading พร้อมปุ่ม **Retry / Show Details** เมื่อเกิด error
+- **▶ Run** หรือ `Ctrl+Enter`: รัน Query ใน background thread (UI ไม่ค้าง) มีหน้าต่าง Loading พร้อมปุ่ม **Retry / Show Details** เมื่อเกิด error
 - รองรับ `SELECT` / `WITH` (แสดงผลเป็นตาราง) และ `INSERT` / `UPDATE` / `DELETE` / DDL (แสดงจำนวน rows affected)
 - ตัด `;` หรือ `/` ท้าย Query ให้อัตโนมัติ (เหมือน DBeaver)
 - มีเลขบรรทัดและสี syntax (keyword, string, parameter, comment) สีใช้แสดงผลอย่างเดียว ไม่แก้ข้อความ SQL
 - `Ctrl+Z` / `Ctrl+Y` / `Ctrl+C` / `Ctrl+X` / `Ctrl+V` / `Ctrl+A` ใช้ได้ทั้งตอนแป้นพิมพ์เป็นภาษาไทยและอังกฤษ และมีเมนูคลิกขวา Cut / Copy / Paste / Select All
 - แถบเครื่องมือเหนือ Editor: **📗 Load Excel**, **↩ Reset template**, **💾 Save as Job**, **▦ Tables** (ดูรายการ Table ของฐานข้อมูล)
-- **ยืนยันก่อนแก้ข้อมูล** — ก่อนรันคำสั่งที่ไม่ใช่ `SELECT` (UPDATE / INSERT / DELETE / DDL) จะแสดงรายการคำสั่ง พร้อม Profile, Host และ Database ให้ยืนยันก่อน (ค่าตั้งต้นคือ **No**) ใช้กับ Run, Run Job, Run all และ Run Group ส่วน `SELECT` จะไม่ถาม
-- **⏹ Stop** — กดได้ระหว่างที่มี Query / Job กำลังรัน (อยู่ในแถบสีเหลืองที่ขึ้นเหนือผลลัพธ์ระหว่างรัน และในหน้าต่าง Script Groups)
+- **ยืนยันก่อนแก้ข้อมูล**: ก่อนรันคำสั่งที่ไม่ใช่ `SELECT` (UPDATE / INSERT / DELETE / DDL) จะแสดงรายการคำสั่ง พร้อม Profile, Host และ Database ให้ยืนยันก่อน (ค่าตั้งต้นคือ **No**) ใช้กับ Run, Run Job, Run all และ Run Group ส่วน `SELECT` จะไม่ถาม
+- **⏹ Stop**: กดได้ทุกครั้งที่มี Query / Job กำลังรัน รวมการรัน Job เดี่ยวด้วยปุ่ม ▶ และระหว่างโหลดรายการ Table (อยู่ในแถบสีเหลืองที่ขึ้นเหนือผลลัพธ์ระหว่างรัน, ในหน้าต่าง Script Groups และในหน้าต่าง Loading ของ **▦ Tables**) ยกเว้น SQL Editor (▶ Run / `Ctrl+Enter`): ปิดหน้าต่าง Loading ก่อน แล้วกด Stop ในแถบเหลือง
   - Oracle: ยกเลิก Query ที่กำลังรันทันที (`ORA-01013: user requested cancel`)
   - Job ที่เหลือใน Run all / Run Group / Export จะถูกข้าม
   - PostgreSQL / MySQL / SQL Server: driver ยกเลิกกลางทางไม่ได้ Query ปัจจุบันจะรันจนจบ แล้วข้าม Job ที่เหลือ
-- ระหว่างรันหลาย Job แถบสีเหลืองเหนือผลลัพธ์จะบอกว่ากำลังรัน Job ไหน (Job i / N) พร้อม progress bar
+- แถบสีเหลืองเหนือผลลัพธ์ขึ้นทุกครั้งที่มี Query / Job รัน: รันหลาย Job จะบอกว่ากำลังรัน Job ไหน (Job i / N) พร้อม progress bar, รัน Job เดี่ยวด้วยปุ่ม ▶ จะแสดงชื่อ Job
+- ระหว่างรันจะกด Connect, เปลี่ยน / แก้ / ลบ / Import Profile หรือเริ่มงานอื่น (Run, ▶, Run all, Export, Run Group, Tables) ไม่ได้ ปุ่มเหล่านี้เป็นสีเทาจนกว่างานจะจบจริง (หลังกด Stop: เมื่อ query ถูกยกเลิกหรือ query ปัจจุบันรันเสร็จ) ถ้าสั่งทางอื่น (เช่น `Ctrl+Enter`) จะเขียนเหตุผลไว้ใน Execution Logs
 
 ### 3. Excel Parameters (แทนค่าใน SQL จากไฟล์ Excel)
 
@@ -63,7 +64,7 @@
 3. ① เลือกคอลัมน์ → ② เลือกค่า (มีช่องค้นหา, **☑ Select All** และ **ล้างที่เลือก**) → ③ ตรวจค่าที่เลือกและดู "SQL ที่จะได้" → **✓ Confirm · ใส่ค่าใน SQL**
 4. ค่าตัวเลขใส่ตรง ๆ ค่าข้อความใส่ `'...'` และ escape `'` ให้อัตโนมัติ
 5. หลังใส่ค่าแล้ว จะมีแถบสีฟ้าเหนือ Editor บอก parameter ที่ใส่อยู่ กด **✎ เปลี่ยนค่า** เพื่อเลือกค่าใหม่ได้
-6. **↩ Reset template** — หน้าจอแบบเดียวกับ Load Excel: ① เลือกคอลัมน์/parameter ② ติ๊กค่าในคอลัมน์นั้นที่ต้องการเอาออก ③ ดูค่าที่จะ Reset และ SQL หลัง Reset แล้วกด **↩ Confirm · Reset ค่าที่เลือก** (เลือกได้หลายคอลัมน์; ถ้าเอาออกครบทุกค่า คอลัมน์นั้นจะกลับเป็น placeholder เดิม) หรือกด **Reset All Parameters**
+6. **↩ Reset template** ใช้หน้าจอแบบเดียวกับ Load Excel: ① เลือกคอลัมน์/parameter ② ติ๊กค่าในคอลัมน์นั้นที่ต้องการเอาออก ③ ดูค่าที่จะ Reset และ SQL หลัง Reset แล้วกด **↩ Confirm · Reset ค่าที่เลือก** (เลือกได้หลายคอลัมน์; ถ้าเอาออกครบทุกค่า คอลัมน์นั้นจะกลับเป็น placeholder เดิม) หรือกด **Reset All Parameters**
 
 อ่านไฟล์ Excel ได้แม้ไฟล์กำลังเปิดอยู่ใน Excel ค่า parameter ที่เลือกจะถูกเก็บไว้กับ Job ด้วย
 
@@ -71,13 +72,13 @@
 
 แท็บผลลัพธ์ด้านล่างมี 3 แท็บ
 
-- **📊 Results Grid** — ตารางผลลัพธ์ แบ่งหน้าละ 1,000 แถว (ปุ่ม ◀ / Next ▶) และ **📗 Export Excel** / **📄 Export CSV** ได้ทันที
+- **📊 Results Grid**: ตารางผลลัพธ์ แบ่งหน้าละ 1,000 แถว (ปุ่ม ◀ / Next ▶) และ **📗 Export Excel** / **📄 Export CSV** ได้ทันที
   - เมื่อรันหลาย Job จะมีปุ่มเลือกชุดผลลัพธ์ (มี ▾) ให้สลับดูผลของแต่ละ Job
   - เคลียร์ผลเก่าทุกครั้งที่เริ่มรันใหม่ และแสดงข้อความเมื่อ Job ล้มเหลวหรือไม่มี result set
-- **📋 Execution Logs** — log การเชื่อมต่อ การรัน Job และการ Export
+- **📋 Execution Logs**: log การเชื่อมต่อ การรัน Job และการ Export
   - บันทึกลงไฟล์ `logs/run_YYYY-MM-DD.log` ด้วย (วันละไฟล์ มีเวลากำกับทุกบรรทัด) ทุกการรันมีบรรทัดหัวบอก Profile / User / Host / Database และบันทึก SQL ของแต่ละ Job แต่**ไม่บันทึกรหัสผ่าน**
   - ไฟล์ log ที่เก่ากว่า 90 วันจะถูกลบอัตโนมัติ, ปุ่ม **📂 Open Log Folder** เปิดโฟลเดอร์ log
-- **🐛 Error & Debug** — รายละเอียด error ล่าสุด (Error type, message, SQL, traceback) พร้อมปุ่ม Copy ถ้ามี error ใหม่ที่ยังไม่ได้เปิดดู ชื่อแท็บจะมีจุด ● ต่อท้าย
+- **🐛 Error & Debug**: รายละเอียด error ล่าสุด (Error type, message, SQL, traceback) พร้อมปุ่ม Copy ถ้ามี error ใหม่ที่ยังไม่ได้เปิดดู ชื่อแท็บจะมีจุด ● ต่อท้าย
 
 ช่อง **Open result windows** มุมขวาบนของแท็บผลลัพธ์: ติ๊ก = เปิดผลของแต่ละ Query เป็น popup แยกด้วย (ค่าเริ่มต้น), ไม่ติ๊ก = ดูผลใน Results Grid อย่างเดียว (โปรแกรมจำค่าไว้ใน `app_settings.json`)
 
@@ -93,13 +94,13 @@ popup ผลลัพธ์เปิดบนจอเดียวกับห�
 
 ### 6. Saved Jobs
 
-- **💾 Save as Job** (แถบเครื่องมือของ SQL Editor) — บันทึก Query ปัจจุบัน (รวมสถานะ Excel parameter) เป็น Job ของ Profile ที่เลือก
+- **💾 Save as Job** (แถบเครื่องมือของ SQL Editor): บันทึก Query ปัจจุบัน (รวมสถานะ Excel parameter) เป็น Job ของ Profile ที่เลือก
 - แต่ละ Job แสดงลำดับ ชื่อ และ SQL บรรทัดแรก (เอาเมาส์ชี้เพื่อดูชื่อเต็มและ SQL) มีปุ่ม **▶** (Run), **✎** (Edit) และ **🗑** (Delete) หน้า Edit มีเครื่องมือ Excel parameter ในตัว
 - ติ๊ก checkbox เพื่อเลือก Job หรือ **Select all** จะเห็นจำนวนที่เลือก และปุ่ม **🗑 Delete (n)** / **🗑 Delete all**
-- **▶ Run all** — ถ้าติ๊ก Job ไว้ ปุ่มจะเปลี่ยนเป็น **▶ Run selected (n)** และรันเฉพาะที่ติ๊ก ถ้าไม่ติ๊กเลยจะรันทุก Job ของ Profile รันทีละตัว Job ที่ error จะไม่หยุดการรัน ตอนจบแสดงสรุปจำนวน Success / Failed
+- **▶ Run all**: ถ้าติ๊ก Job ไว้ ปุ่มจะเปลี่ยนเป็น **▶ Run selected (n)** และรันเฉพาะที่ติ๊ก ถ้าไม่ติ๊กเลยจะรันทุก Job ของ Profile รันทีละตัว Job ที่ error จะไม่หยุดการรัน ตอนจบแสดงสรุปจำนวน Success / Failed
   - ระหว่างรันจะกดซ้ำไม่ได้ และ popup ผลลัพธ์ของรอบก่อนจะถูกปิดให้อัตโนมัติ
-- **Preset: 💾 Save / 📂 Load** (ล่างสุดของแถบซ้าย) — บันทึก/โหลดชุด Job ทั้งชุด
-- **▤ Script Groups** — เก็บ Script เป็นกลุ่ม (ดูหัวข้อ 8)
+- **Preset: 💾 Save / 📂 Load** (ล่างสุดของแถบซ้าย): บันทึก/โหลดชุด Job ทั้งชุด
+- **▤ Script Groups**: เก็บ Script เป็นกลุ่ม (ดูหัวข้อ 8)
 
 ### 7. Export Excel (Jobs)
 
@@ -124,16 +125,17 @@ popup ผลลัพธ์เปิดบนจอเดียวกับห�
 
 - กดแท็บ **▤ Script Groups** → **＋ New Group** → ตั้งชื่อกลุ่ม (**✎ Rename** / **🗑 Delete** ได้)
 - เพิ่ม Script เข้ากลุ่ม
-  - **＋ Add SQL** — เขียน SQL ใหม่ในหน้าต่างแยก (มี 📗 Load Excel / ↩ Reset SQL Template เหมือนหน้า Edit Job)
-  - **🕘 From Saved Jobs** — คัดลอก Job เดิมเข้ากลุ่ม (เลือกได้หลายตัว) Job ต้นฉบับยังอยู่ที่เดิม
-- **↑ ↓ / ✎ Edit / 🗑 Remove** — สลับลำดับ แก้ไข และลบ Script (รันตามลำดับที่เห็น)
+  - **＋ Add SQL**: เขียน SQL ใหม่ในหน้าต่างแยก (มี 📗 Load Excel / ↩ Reset SQL Template เหมือนหน้า Edit Job)
+  - **🕘 From Saved Jobs**: คัดลอก Job เดิมเข้ากลุ่ม (เลือกได้หลายตัว) Job ต้นฉบับยังอยู่ที่เดิม
+- **↑ ↓ / ✎ Edit / 🗑 Remove**: สลับลำดับ แก้ไข และลบ Script (รันตามลำดับที่เห็น)
 - Script ในแต่ละกลุ่มเป็นสำเนาของกลุ่มนั้น ถ้ามี Script เดียวกันอยู่ในกลุ่มที่ 1 และ 2 ก็แก้แยกกันได้
-- **▶ Run Group** — รันทุก Script ในกลุ่ม (ทำงานเหมือน Run all)
-- **⇩ Export Group to Excel** — ได้ไฟล์ `<ชื่อกลุ่ม>_YYYYMMDD_HHMMSS.xlsx` (1 Script = 1 Sheet)
-- **⇩ Export Groups / ⇧ Import Groups** — สำรองหรือย้ายกลุ่มไปเครื่องอื่นเป็นไฟล์ JSON
+- **▶ Run Group**: รันทุก Script ในกลุ่ม (ทำงานเหมือน Run all)
+- **⇩ Export Group to Excel**: ได้ไฟล์ `<ชื่อกลุ่ม>_YYYYMMDD_HHMMSS.xlsx` (1 Script = 1 Sheet)
+- **⇩ Export Groups / ⇧ Import Groups**: สำรองหรือย้ายกลุ่มไปเครื่องอื่นเป็นไฟล์ JSON
   - Export ได้ทุกกลุ่มของ Profile หรือเฉพาะกลุ่มที่เลือก
   - Import เข้า Profile ที่เลือกอยู่ ถ้าชื่อกลุ่มซ้ำเลือกได้ว่า **แทนที่** หรือ **เก็บทั้งคู่** (ตัวที่นำเข้าได้ชื่อใหม่)
-- ทุกครั้งที่บันทึก จะเก็บเวอร์ชันก่อนหน้าไว้ที่ `script_groups_backup.json`
+- การบันทึกครั้งแรกของแต่ละครั้งที่เปิดโปรแกรม จะเก็บเวอร์ชันก่อนหน้า (ถ้าไฟล์เดิมอ่านได้) ไว้ที่ `script_groups_backup.json` ถ้า backup ไม่สำเร็จ (เช่นไฟล์ถูกล็อก) จะไม่บันทึกและลอง backup ใหม่ในการบันทึกครั้งถัดไป
+- ถ้าอ่าน `script_groups.json` ไม่ได้ตอนเปิดโปรแกรม จะเก็บสำเนาไว้ที่ `script_groups_unreadable_<เวลา>.json`
 
 ## การติดตั้ง
 
@@ -154,7 +156,7 @@ python database_connect_gui.py
 
 โปรแกรมเปิดแบบเต็มจอ และบันทึก Profile ที่ใช้ล่าสุดเมื่อปิดหน้าต่าง
 
-เปิดได้ทีละหน้าต่างเดียว ถ้าสั่งรันซ้ำตอนที่โปรแกรมเปิดอยู่แล้ว (เช่นกด Run แล้วกด Debug ใน VS Code) จะไม่เปิดหน้าต่างใหม่ แต่ดึงหน้าต่างเดิมขึ้นมาด้านหน้าแทน
+เปิดได้ทีละหน้าต่างเดียว ถ้าสั่งรันซ้ำตอนที่โปรแกรมเปิดอยู่แล้ว (เช่นกด Run แล้วกด Debug ใน VS Code) โปรแกรมจะดึงหน้าต่างเดิมขึ้นมาด้านหน้าแทนการเปิดหน้าต่างใหม่
 
 ## ขั้นตอนการใช้งาน
 
@@ -188,7 +190,7 @@ database_connect_gui/
 ├── preset_<name>.json         # Job presets
 ├── query_templates.json       # Query templates (สร้างเมื่อใช้งาน)
 ├── script_groups.json         # Script Groups (แยกตาม profile)
-├── script_groups_backup.json  # Script Groups เวอร์ชันก่อนหน้า (สำรองอัตโนมัติ)
+├── script_groups_backup.json  # Script Groups ก่อนการบันทึกครั้งแรกของแต่ละครั้งที่เปิดโปรแกรม (สำรองอัตโนมัติ)
 ├── app_settings.json          # ค่าตั้งของโปรแกรม (เช่น Open result windows)
 └── logs/run_YYYY-MM-DD.log    # Log การรัน (เก็บ 90 วัน)
 ```
