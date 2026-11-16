@@ -151,7 +151,7 @@ class SaveBlockedTests(unittest.TestCase):
             with mock.patch.object(app, "messagebox") as mb, mock.patch.object(
                 app, "write_json_atomic"
             ) as atomic:
-                self.assertIsNone(stub.save_script_groups())
+                self.assertIs(stub.save_script_groups(), False)
 
             for p, (content, mtime) in before.items():
                 self.assertEqual(read(p), content, p)

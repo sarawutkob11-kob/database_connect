@@ -268,7 +268,7 @@ class IdleBehaviourTests(unittest.TestCase):
     def test_run_job_idle_confirm_cancel_does_not_add_id(self):
         stub = make_stub()
         stub._confirm_data_change.return_value = False
-        job = {"name": "J1", "query": "DELETE FROM t"}
+        job = {"name": "J1", "query": "DELETE FROM t", "profile": "P1"}
         with _Patched() as p:
             stub.run_job(job)
         p.thread.assert_not_called()
@@ -277,7 +277,7 @@ class IdleBehaviourTests(unittest.TestCase):
     def test_run_job_idle_without_running_ids_attribute(self):
         stub = make_stub()
         del stub._running_job_ids
-        job = {"name": "J1", "query": "SELECT 1"}
+        job = {"name": "J1", "query": "SELECT 1", "profile": "P1"}
         with _Patched() as p:
             stub.run_job(job)
         p.thread.assert_called_once()
@@ -287,7 +287,7 @@ class IdleBehaviourTests(unittest.TestCase):
         stub = make_stub()
         stub.engine = None
         with _Patched() as p:
-            stub.run_job({"name": "J", "query": "SELECT 1"})
+            stub.run_job({"name": "J", "query": "SELECT 1", "profile": "P1"})
         p.mb.showerror.assert_called_once()
         p.thread.assert_not_called()
 

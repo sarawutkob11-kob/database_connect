@@ -3,8 +3,10 @@
 Run:  python -m unittest discover -s tests -p "test_*.py"
 """
 
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -239,10 +241,16 @@ class PrepareRunSqlTests(unittest.TestCase):
     """_prepare_run_sql fills variables / blocks multi-statement SQL without Tk."""
 
     def make_stub(self, tables):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = os.path.join(folder.name, "mail_table_data.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": "T1", "tables": tables}, f)
         stub = type("Stub", (), {})()
         stub.results_text = _FakeText()
-        stub.loaded_table_data = {"tables": tables}
-        stub.table_data_file = "unused.json"
+        stub.loaded_table_data = None
+        stub.last_table_data_mtime = None
+        stub.table_data_file = path
         stub._current_table_data_tables = (
             lambda: app.DatabaseConnectorGUI._current_table_data_tables(stub)
         )

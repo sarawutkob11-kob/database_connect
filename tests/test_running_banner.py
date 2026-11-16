@@ -250,7 +250,7 @@ class RunJobProgressTests(unittest.TestCase):
 
     def test_progress_set_on_start(self):
         stub = self._stub()
-        job = {"name": "Daily Balance", "query": "SELECT 1"}
+        job = {"name": "Daily Balance", "query": "SELECT 1", "profile": "P1"}
         self._start(stub, job)
         self.assertEqual(stub._ui_progress,
                          {"total": 0, "index": 0, "name": "Daily Balance", "kind": "job"})
@@ -271,7 +271,7 @@ class RunJobProgressTests(unittest.TestCase):
             with self.subTest(outcome=name):
                 stub = self._stub()
                 stub.read_sql_dataframe = mock.Mock(**behaviour)
-                job = {"name": "J", "query": "SELECT 1"}
+                job = {"name": "J", "query": "SELECT 1", "profile": "P1"}
                 worker = self._start(stub, job)
                 self._finish(stub, worker)
                 self.assertEqual(stub._running_job_ids, set())
@@ -284,7 +284,7 @@ class RunJobProgressTests(unittest.TestCase):
     def test_batch_progress_not_reset_by_finish(self):
         stub = self._stub()
         stub.read_sql_dataframe = mock.Mock(side_effect=RuntimeError("x"))
-        job = {"name": "J", "query": "SELECT 1"}
+        job = {"name": "J", "query": "SELECT 1", "profile": "P1"}
         worker = self._start(stub, job)
         batch_progress = {"total": 3, "index": 2, "name": "B", "kind": "jobs"}
         stub._ui_progress = batch_progress
@@ -295,7 +295,7 @@ class RunJobProgressTests(unittest.TestCase):
     def test_not_reset_while_another_job_id_remains(self):
         stub = self._stub()
         stub.read_sql_dataframe = mock.Mock(return_value=mock.MagicMock())
-        job = {"name": "J", "query": "SELECT 1"}
+        job = {"name": "J", "query": "SELECT 1", "profile": "P1"}
         worker = self._start(stub, job)
         other_id = object()
         stub._running_job_ids.add(id(other_id))  # another single job still running

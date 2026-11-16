@@ -241,7 +241,7 @@ class RunJobEngineTests(unittest.TestCase):
         stub = make_stub(self.a)
         ci = app.ConnectionInfo("P1", "SQLite", "u", "h", "", "")
         stub._run_target = app.RunTarget(self.a, ci)
-        job = {"name": "J1", "query": "SELECT a FROM t"}
+        job = {"name": "J1", "query": "SELECT a FROM t", "profile": "P1"}
         with mock.patch.object(app.threading, "Thread"):
             stub.run_job(job)
         confirm_target = stub._confirm_data_change.call_args.kwargs["target"]
@@ -257,14 +257,14 @@ class RunJobEngineTests(unittest.TestCase):
         with mock.patch.object(GUI, "_capture_run_target", autospec=True,
                                side_effect=real) as cap, \
                 mock.patch.object(app.threading, "Thread"):
-            stub.run_job({"name": "J", "query": "SELECT 1"})
+            stub.run_job({"name": "J", "query": "SELECT 1", "profile": "P1"})
         self.assertEqual(cap.call_count, 1)
 
     def test_confirm_cancel_starts_nothing(self):
         stub = make_stub(self.a)
         stub._confirm_data_change.return_value = False
         with mock.patch.object(app.threading, "Thread") as th:
-            stub.run_job({"name": "J", "query": "DELETE FROM t"})
+            stub.run_job({"name": "J", "query": "DELETE FROM t", "profile": "P1"})
         th.assert_not_called()
         stub._start_stoppable_run.assert_not_called()
         self.assertEqual(values(self.a), ["from_A"])

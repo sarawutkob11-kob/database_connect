@@ -1,5 +1,6 @@
 # --- Standard library ---
 import base64
+import copy
 import ctypes
 import datetime as _dt
 import decimal
@@ -11,7 +12,7 @@ import threading
 import traceback
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -107,6 +108,30 @@ def excel_value_text(value):
 
 
 EXCEL_MAX_EXACT_DIGITS = 15  # Excel keeps only 15 significant digits
+EXCEL_MAX_DATA_ROWS = 1_048_575
+
+
+def _ensure_excel_row_limit(row_count: int) -> None:
+    """Reject export results that exceed Excel's worksheet data-row limit."""
+    if row_count > EXCEL_MAX_DATA_ROWS:
+        raise ValueError(
+            f"Excel worksheet limit is {EXCEL_MAX_DATA_ROWS:,} data rows; "
+            f"got {row_count:,}."
+        )
+
+
+EXCEL_MAX_CELL_CHARS = 32_767
+
+
+def _excel_text_too_long(value: object) -> bool:
+    """True when `value` is a str over Excel's cell limit, counted in UTF-16 code units."""
+    if not isinstance(value, str):
+        return False
+    if len(value) <= EXCEL_MAX_CELL_CHARS // 2:  # every code point is at most 2 units
+        return False
+    if len(value) > EXCEL_MAX_CELL_CHARS:  # every code point is at least 1 unit
+        return True
+    return len(value.encode("utf-16-le", "surrogatepass")) // 2 > EXCEL_MAX_CELL_CHARS
 
 
 def excel_db_value(value):
@@ -209,7 +234,13 @@ def protect_password(plain):
 
 
 def unprotect_password(stored):
-    """Decrypt a stored password. Plain-text (old format) values are returned as-is."""
+    """Decrypt a stored password. Plain-text (old format) values are returned as-is.
+
+    Returns "" when the ciphertext cannot be decrypted (e.g. created by another
+    Windows user/computer) so the ciphertext never reaches a password field,
+    a connection or an export. Callers that must keep the stored value use
+    PROFILE_STORED_PASSWORD_KEY.
+    """
     if not stored or not str(stored).startswith(_DPAPI_PREFIX):
         return stored
     try:
@@ -219,6 +250,39 @@ def unprotect_password(stored):
         # e.g. file copied from another Windows user/computer
         print(f"Cannot decrypt saved password (please re-enter it): {e}")
         return ""
+
+
+# Internal (in-memory only) profile key holding a stored DPAPI password that
+# could not be decrypted. Written back on save while the password stays empty,
+# never shown in the UI, used to connect, or exported.
+PROFILE_STORED_PASSWORD_KEY = "_stored_db_password"
+
+
+def decrypt_profile_password(profile: dict) -> None:
+    """Decrypt profile["db_password"] in place; keep undecryptable ciphertext aside."""
+    profile.pop(PROFILE_STORED_PASSWORD_KEY, None)
+    stored = profile.get("db_password")
+    if not stored:
+        return
+    plain = unprotect_password(stored)
+    if not plain and str(stored).startswith(_DPAPI_PREFIX):
+        profile[PROFILE_STORED_PASSWORD_KEY] = stored
+    profile["db_password"] = plain
+
+
+def profile_password_for_disk(profile: dict) -> dict:
+    """Copy of a profile ready for db_profiles.json (password encrypted).
+
+    An empty password with a kept undecryptable ciphertext writes the
+    ciphertext back, so saving does not wipe it.
+    """
+    profile_copy = dict(profile)
+    stored = profile_copy.pop(PROFILE_STORED_PASSWORD_KEY, None)
+    if profile_copy.get("db_password"):
+        profile_copy["db_password"] = protect_password(profile_copy["db_password"])
+    elif stored:
+        profile_copy["db_password"] = stored
+    return profile_copy
 
 
 # ======================================================================
@@ -300,9 +364,16 @@ class RunTarget:
 _SQL_WORD_RE = re.compile(r"[^\W\d][\w$#@]*|[#@][\w$#@]*")
 _SQL_NUMBER_RE = re.compile(r"[\w.]+")
 _SQL_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_]\w*)?\$")
-# An Oracle "/" terminator: a line holding only "/"
-_SQL_SLASH_LINE_RE = re.compile(r"(?m)^([ \t]*)/([ \t]*)$")
+# An Oracle "/" terminator: a line holding only "/" (LF or CRLF line endings;
+# the "\r" is not captured, so the marked text keeps the same length)
+_SQL_SLASH_LINE_RE = re.compile(r"(?m)^([ \t]*)/([ \t]*)(?=\r?$)")
 _SQL_SLASH_MARK = "\x1e"
+
+
+def _mark_oracle_slash_lines(sql: str) -> str:
+    """Replace the '/' of every line holding only '/' with _SQL_SLASH_MARK.
+    Same length as `sql`, so token offsets match the original text."""
+    return _SQL_SLASH_LINE_RE.sub(lambda m: m.group(1) + _SQL_SLASH_MARK + m.group(2), sql)
 
 _SQL_READ_ONLY_COMMANDS = {"SELECT", "SHOW", "DESCRIBE", "DESC", "VALUES"}
 _SQL_DATA_CHANGE_COMMANDS = {"INSERT", "UPDATE", "DELETE", "MERGE", "UPSERT", "REPLACE"}
@@ -326,6 +397,11 @@ def _scan_sql(sql):
     i, n, depth = 0, len(sql), 0
     while i < n:
         c = sql[i]
+        # Before isspace(): the marker itself is a whitespace character
+        if c == _SQL_SLASH_MARK:
+            yield ("sep", "/", depth, i, i + 1)
+            i += 1
+            continue
         if c.isspace():
             i += 1
             continue
@@ -365,10 +441,6 @@ def _scan_sql(sql):
                 yield ("string", sql[i:end], depth, i, end)
                 i = end
                 continue
-        if c == _SQL_SLASH_MARK:
-            yield ("sep", "/", depth, i, i + 1)
-            i += 1
-            continue
         m = _SQL_WORD_RE.match(sql, i)
         if m:
             yield ("word", m.group(0).upper(), depth, i, m.end())
@@ -392,6 +464,61 @@ def _scan_sql(sql):
         i += 1
 
 
+_SQL_BRACED_PLACEHOLDER_RE = re.compile(
+    r"\{\{?\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}?"
+)
+_SQL_COLON_PLACEHOLDER_RE = re.compile(r":[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _detect_sql_placeholders(sql):
+    """Return placeholders found in SQL tokens, excluding comments and literals."""
+    tokens = list(_scan_sql(sql))
+    token_ends = {token[4] for token in tokens}
+    placeholders = []
+    covered_until = -1
+
+    for index, (kind, value, _depth, start, end) in enumerate(tokens):
+        if start < covered_until:
+            continue
+        if kind == "string":
+            # A '...' literal whose whole content is one placeholder
+            if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+                inner = value[1:-1]
+                if (
+                    _SQL_COLON_PLACEHOLDER_RE.fullmatch(inner)
+                    or _SQL_BRACED_PLACEHOLDER_RE.fullmatch(inner)
+                ):
+                    placeholders.append(inner)
+            continue
+        if kind != "punct":
+            continue
+
+        if value == ":" and index + 1 < len(tokens):
+            next_kind, _next_value, _next_depth, next_start, next_end = tokens[index + 1]
+            previous = tokens[index - 1] if index else None
+            previous_is_attached_value = (
+                previous is not None
+                and previous[4] == start
+                and (previous[0] in {"word", "number"} or previous[1] == ":")
+            )
+            name = sql[next_start:next_end]
+            if (
+                next_kind == "word"
+                and next_start == end
+                and not previous_is_attached_value
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+            ):
+                placeholders.append(sql[start:next_end])
+                covered_until = next_end
+        elif value == "{":
+            match = _SQL_BRACED_PLACEHOLDER_RE.match(sql, start)
+            if match and match.end() in token_ends:
+                placeholders.append(match.group(0))
+                covered_until = match.end()
+
+    return list(dict.fromkeys(placeholders))
+
+
 def _is_plsql_block(words):
     """True when ';' inside this statement does not end it (PL/SQL code)."""
     if not words:
@@ -412,7 +539,7 @@ def split_sql_statements(sql):
     strings and comments. PL/SQL blocks stay whole. Returns the original
     text of each non-empty statement, without its terminator."""
     sql = sql or ""
-    marked = _SQL_SLASH_LINE_RE.sub(lambda m: m.group(1) + _SQL_SLASH_MARK + m.group(2), sql)
+    marked = _mark_oracle_slash_lines(sql)
     statements = []
     start, has_content, words = 0, False, []
 
@@ -511,6 +638,133 @@ def assess_sql(sql):
     return SqlAssessment(command, risk, len(statements), reason)
 
 
+# ----------------------------------------------------------------------
+# Auto WHERE: where extra "<column> IN (...)" conditions may go
+# ----------------------------------------------------------------------
+_WHERE_MAIN_COMMANDS = {"SELECT", "UPDATE", "DELETE", "INSERT", "MERGE"}
+_WHERE_SUPPORTED_COMMANDS = {"SELECT", "UPDATE", "DELETE"}
+_WHERE_SET_OPERATORS = {"UNION", "INTERSECT", "EXCEPT", "MINUS"}
+# Clauses that come after the WHERE condition: (word, word that must follow or None)
+_WHERE_TAIL_PAIRS = {"GROUP": "BY", "ORDER": "BY", "CONNECT": "BY", "START": "WITH"}
+_WHERE_TAIL_WORDS = {"HAVING", "LIMIT", "OFFSET", "FETCH", "FOR", "RETURNING", "WINDOW", "OPTION"}
+
+
+@dataclass(frozen=True)
+class _WhereLayout:
+    # Offset right after the last token of the main statement's filter part
+    # (before trailing clauses / terminators / comments)
+    insert_at: int
+    # (start, end) of the existing top-level WHERE condition; None when there is none
+    condition: Optional[Tuple[int, int]]
+
+
+def _where_main_index(body: list) -> int:
+    """Index in `body` of the main SELECT / UPDATE / DELETE word (ValueError otherwise)."""
+    kind, value, depth = body[0][0], body[0][1], body[0][2]
+    if kind != "word" or depth != 0:
+        raise ValueError("Auto WHERE: the SQL must start with SELECT / UPDATE / DELETE / WITH")
+    main = 0
+    if value == "WITH":
+        main = next(
+            (i for i, t in enumerate(body)
+             if i > 0 and t[0] == "word" and t[2] == 0 and t[1] in _WHERE_MAIN_COMMANDS),
+            None,
+        )
+        if main is None:
+            raise ValueError("Auto WHERE: no SELECT / UPDATE / DELETE found after WITH")
+    command = body[main][1]
+    if command not in _WHERE_SUPPORTED_COMMANDS:
+        raise ValueError(f"Auto WHERE supports SELECT / UPDATE / DELETE only (found {command})")
+    return main
+
+
+def _where_tail_clause(body: list, top: list, search_from: int) -> Optional[int]:
+    """Index in `body` of the first trailing clause (GROUP BY, ORDER BY, ...) after
+    position `search_from` of `top`, or None."""
+    for pos in range(search_from + 1, len(top)):
+        kind, value = body[top[pos]][0], body[top[pos]][1]
+        if kind != "word":
+            continue
+        if value in _WHERE_TAIL_WORDS:
+            return top[pos]
+        follow = _WHERE_TAIL_PAIRS.get(value)
+        if follow and pos + 1 < len(top):
+            nxt = body[top[pos + 1]]
+            if nxt[0] == "word" and nxt[1] == follow:
+                return top[pos]
+    return None
+
+
+def _sql_where_layout(sql: str) -> _WhereLayout:
+    """Where Auto WHERE may add conditions to `sql` (pure).
+
+    Only tokens at depth 0 of the main statement count, so WHERE inside a
+    subquery / CTE / string / comment is ignored. Raises ValueError (the
+    message says why) whenever the place is not certain.
+    """
+    tokens = list(_scan_sql(_mark_oracle_slash_lines(sql or "")))
+    opened = sum(1 for t in tokens if t[0] == "punct" and t[1] == "(")
+    closed = sum(1 for t in tokens if t[0] == "punct" and t[1] == ")")
+    if opened != closed:
+        raise ValueError("Auto WHERE: unbalanced parentheses")
+
+    body = list(tokens)
+    while body and body[-1][0] in ("semi", "sep"):
+        body.pop()
+    if not body:
+        raise ValueError("Auto WHERE: SQL is empty")
+    # Statement type first, so a PL/SQL block reports "found BEGIN / DECLARE"
+    main = _where_main_index(body)
+    if any(t[0] in ("semi", "sep") for t in body):
+        raise ValueError("Auto WHERE: the SQL has more than one statement")
+
+    command = body[main][1]
+    top = [i for i in range(main, len(body)) if body[i][2] == 0]
+    top_words = [(pos, body[i][1]) for pos, i in enumerate(top) if body[i][0] == "word"]
+    set_ops = sorted({w for _p, w in top_words if w in _WHERE_SET_OPERATORS})
+    if set_ops:
+        raise ValueError(f"Auto WHERE: cannot add conditions to a {' / '.join(set_ops)} query")
+    wheres = [pos for pos, w in top_words if w == "WHERE"]
+    if len(wheres) > 1:
+        raise ValueError("Auto WHERE: more than one top-level WHERE")
+
+    if wheres:
+        search_from = wheres[0]
+    elif command == "SELECT":
+        search_from = next((pos for pos, w in top_words if w == "FROM"), None)
+        if search_from is None:
+            raise ValueError("Auto WHERE: SELECT without FROM")
+    elif command == "UPDATE":
+        search_from = next((pos for pos, w in top_words if w == "SET"), None)
+        if search_from is None:
+            raise ValueError("Auto WHERE: UPDATE without SET")
+    else:  # DELETE
+        search_from = 0
+
+    clause = _where_tail_clause(body, top, search_from)
+    last = (clause if clause is not None else len(body)) - 1
+    insert_at = body[last][4]
+    if not wheres:
+        return _WhereLayout(insert_at, None)
+    where_index = top[wheres[0]]
+    if where_index >= last:
+        raise ValueError("Auto WHERE: WHERE has no condition")
+    return _WhereLayout(insert_at, (body[where_index + 1][3], insert_at))
+
+
+def _where_main_command(sql: str) -> Optional[str]:
+    """SELECT / UPDATE / DELETE of the statement Auto WHERE works on, or None
+    when it cannot be told (same rules as _sql_where_layout)."""
+    body = [t for t in _scan_sql(_mark_oracle_slash_lines(sql or ""))
+            if t[0] not in ("semi", "sep")]
+    if not body:
+        return None
+    try:
+        return body[_where_main_index(body)][1]
+    except ValueError:
+        return None
+
+
 # ======================================================================
 # Table-data variables ({TABLE_<TABLE>_<COLUMN>} placeholders)
 # ======================================================================
@@ -548,6 +802,20 @@ class TemplateRenderResult:
     @property
     def ok(self):
         return not self.missing_tokens and not self.ambiguous_tokens
+
+
+def table_data_source_text(data: Optional[dict], mtime: Optional[float]) -> str:
+    """One log line naming the table data used: JSON timestamp + file mtime."""
+    timestamp = data.get("timestamp") if isinstance(data, dict) else None
+    try:
+        modified = (
+            _dt.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            if mtime is not None
+            else "-"
+        )
+    except (OSError, OverflowError, ValueError, TypeError):
+        modified = "-"
+    return f"📅 Table data: timestamp {timestamp or '-'} · file modified {modified}\n"
 
 
 def find_table_variables(sql):
@@ -644,6 +912,124 @@ def query_template_label(name, query):
     assessment = assess_sql(query)
     category = "MULTI-STATEMENT" if assessment.statement_count > 1 else assessment.risk.value
     return f"[{category}] {name}"
+
+
+# ======================================================================
+# Script Groups import / export (pure helpers, no Tk)
+# ======================================================================
+SCRIPT_GROUPS_FILE_TYPE = "script_groups"
+SCRIPT_GROUPS_FILE_VERSION = 1
+
+
+def _script_groups_now() -> str:
+    """Current time as 'YYYY-MM-DD HH:MM:SS'."""
+    return pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _export_script(script: dict) -> dict:
+    """Copy of a script without runtime keys ('_*' and 'run_index')."""
+    return {k: v for k, v in script.items() if not k.startswith("_") and k != "run_index"}
+
+
+def build_script_groups_export(groups: list, profile: str, now: Optional[str] = None) -> dict:
+    """Payload written to a Script Groups export file."""
+    return {
+        "type": SCRIPT_GROUPS_FILE_TYPE,
+        "version": SCRIPT_GROUPS_FILE_VERSION,
+        "exported": now or _script_groups_now(),
+        "profile": profile,
+        "groups": [
+            {
+                "name": g["name"],
+                "created": g.get("created"),
+                "scripts": [_export_script(sc) for sc in g.get("scripts", [])],
+            }
+            for g in groups
+        ],
+    }
+
+
+def script_groups_export_filename(label: Optional[str], stamp: str) -> str:
+    """Default export file name; unsafe path characters become '_'."""
+    text = "" if label is None else str(label)
+    safe = re.sub(r'[\\/:*?"<>|]', "_", text).strip() or "groups"
+    return f"script_groups_{safe}_{stamp}.json"
+
+
+def parse_script_groups_import(data: Any) -> list:
+    """Importable groups from loaded JSON data (dict with 'groups' or a bare list).
+
+    Invalid group entries are dropped; raises ValueError when there is no
+    groups list or a script has no SQL.
+    """
+    incoming = data.get("groups") if isinstance(data, dict) else data
+    if not isinstance(incoming, list):
+        raise ValueError("no 'groups' list in this file")
+    incoming = [
+        g for g in incoming
+        if isinstance(g, dict)
+        and isinstance(g.get("name"), str)
+        and g["name"].strip()
+        and isinstance(g.get("scripts", []), list)
+    ]
+    for g in incoming:
+        for sc in g.get("scripts", []):
+            if not isinstance(sc, dict) or not sc.get("query"):
+                raise ValueError(f"group '{g['name']}' has a script without SQL")
+    return incoming
+
+
+def _profile_group_names(script_groups: list, profile: str) -> dict:
+    """{lower-case name: group} for the groups of one profile."""
+    return {g["name"].lower(): g for g in script_groups if g.get("profile") == profile}
+
+
+def script_group_name_clashes(script_groups: list, incoming: list, profile: str) -> list:
+    """Incoming group names (file spelling) that already exist in the profile, case-insensitive."""
+    existing = _profile_group_names(script_groups, profile)
+    return [g["name"] for g in incoming if g["name"].lower() in existing]
+
+
+def merge_imported_script_groups(
+    script_groups: list,
+    incoming: list,
+    profile: str,
+    replace: bool,
+    now: Optional[str] = None,
+) -> Optional[str]:
+    """Add incoming groups to script_groups in place; return the last name added.
+
+    replace=True swaps out a same-name group of the profile (each at most once);
+    otherwise the imported copy gets a ' (n)' suffix. Other profiles are untouched.
+    """
+    now = now or _script_groups_now()
+    existing = _profile_group_names(script_groups, profile)
+    taken = set(existing)
+    last_name = None
+    for g in incoming:
+        name = g["name"]
+        # pop: each existing group is replaced at most once, even when
+        # the file holds the same name twice
+        old = existing.pop(name.lower(), None)
+        if old is not None and replace:
+            script_groups.remove(old)
+        elif name.lower() in taken:
+            n = 2
+            while f"{name} ({n})".lower() in taken:
+                n += 1
+            name = f"{name} ({n})"
+        taken.add(name.lower())
+        script_groups.append(
+            {
+                "name": name,
+                "profile": profile,
+                "created": g.get("created") or now,
+                "imported": now,
+                "scripts": json.loads(json.dumps(g.get("scripts", []), default=str)),
+            }
+        )
+        last_name = name
+    return last_name
 
 
 # ======================================================================
@@ -2410,6 +2796,14 @@ class DatabaseConnectorGUI:
         ).pack(side="left", padx=(4, 6))
         _ghost(presets_inner, "💾  Save", self.save_preset_dialog, bg=UI["surface"]).pack(side="left")
         _ghost(presets_inner, "📂  Load", self.load_preset_dialog, bg=UI["surface"]).pack(side="left")
+        groups_io = tk.Frame(presets, bg=UI["surface"])
+        groups_io.pack(fill="x", padx=8, pady=(0, 6))
+        _ghost(
+            groups_io, "⇧  Import Groups", self.sidebar_import_script_groups, bg=UI["surface"]
+        ).pack(side="left")
+        _ghost(
+            groups_io, "⇩  Export Groups", self.sidebar_export_script_groups, bg=UI["surface"]
+        ).pack(side="left")
         presets.pack(side="bottom", fill="x", before=jobs_frame)
 
         # Jobs list (scrollable)
@@ -3009,6 +3403,7 @@ class DatabaseConnectorGUI:
             export_profiles = {}
             for name, profile in self.saved_profiles.items():
                 profile_copy = dict(profile)
+                profile_copy.pop(PROFILE_STORED_PASSWORD_KEY, None)
                 if not include_passwords:
                     profile_copy["db_password"] = ""
                 export_profiles[name] = profile_copy
@@ -3286,6 +3681,7 @@ class DatabaseConnectorGUI:
         def do_import():
             try:
                 merge_mode = merge_var.get()
+                active_profile = self.profile_combo.get()
                 previous_profiles = dict(self.saved_profiles)
 
                 if not merge_mode:
@@ -3305,19 +3701,28 @@ class DatabaseConnectorGUI:
                 # Import profiles
                 for profile_name, profile_data in imported_profiles.items():
                     profile_data = dict(profile_data)
-                    imported_password = unprotect_password(profile_data.get("db_password", ""))
-                    existing_password = previous_profiles.get(profile_name, {}).get(
-                        "db_password", ""
-                    )
-                    # File exported without passwords -> keep the password we already have
-                    profile_data["db_password"] = imported_password or existing_password
+                    decrypt_profile_password(profile_data)
+                    profile_data.pop(PROFILE_STORED_PASSWORD_KEY, None)
+                    existing = previous_profiles.get(profile_name, {})
+                    if not profile_data.get("db_password"):
+                        # No usable password in the file -> keep the one we already have
+                        profile_data["db_password"] = existing.get("db_password", "")
+                        if existing.get(PROFILE_STORED_PASSWORD_KEY):
+                            profile_data[PROFILE_STORED_PASSWORD_KEY] = existing[
+                                PROFILE_STORED_PASSWORD_KEY
+                            ]
                     self.saved_profiles[profile_name] = profile_data
 
                 # Save to file
-                self.save_profiles()
+                if not self.save_profiles():
+                    self.saved_profiles.clear()
+                    self.saved_profiles.update(previous_profiles)
+                    return
 
                 # Update UI
                 self.update_profile_list()
+                if active_profile in imported_profiles:
+                    self.load_profile_data(active_profile)
 
                 # Update results
                 self.results_text.insert(tk.END, f"📥 Profiles imported successfully!\n")
@@ -3933,6 +4338,7 @@ class DatabaseConnectorGUI:
                 return
 
             saved_job = self.saved_jobs[job_idx]
+            saved_job_before = copy.deepcopy(saved_job)
             saved_job["name"] = new_name
             saved_job["query"] = new_query
             saved_job.pop("sql_template", None)
@@ -3946,7 +4352,10 @@ class DatabaseConnectorGUI:
                 )
             )
 
-            self.save_jobs()
+            if not self.save_jobs():
+                saved_job.clear()
+                saved_job.update(saved_job_before)
+                return
             self.update_jobs_list()
 
             self.results_text.delete("1.0", tk.END)
@@ -4005,14 +4414,15 @@ class DatabaseConnectorGUI:
             )
             return []
 
-    def save_script_groups(self):
+    def save_script_groups(self) -> bool:
+        """True = written to disk; False = blocked or write/backup failed (error already shown)."""
         if getattr(self, "_script_groups_save_blocked", False):
             messagebox.showerror(
                 "Script Groups",
                 "script_groups.json could not be read when the app started, "
                 "so it is not overwritten. Restart the app to load your groups again.",
             )
-            return
+            return False
         path = self._script_groups_path()
         clean = []
         for group in self.script_groups:
@@ -4027,6 +4437,8 @@ class DatabaseConnectorGUI:
             write_json_atomic(path, {"version": 1, "groups": clean}, indent=2)
         except Exception as e:
             messagebox.showerror("Script Groups", f"Cannot save script_groups.json:\n{e}")
+            return False
+        return True
 
     def _backup_script_groups_once(self, path: str) -> None:
         """First save of the session only: copy `path` to <name>_backup.json when it
@@ -4042,6 +4454,158 @@ class DatabaseConnectorGUI:
             shutil.copy2(path, os.path.splitext(path)[0] + "_backup.json")
         # no file / broken file: nothing to back up, the previous backup stays
         self._script_groups_backup_done = True
+
+    def _ensure_script_groups_loaded(self) -> list:
+        """Load script_groups.json on first use in this session; return the groups."""
+        if not hasattr(self, "script_groups"):
+            self.script_groups = self.load_script_groups()
+        return self.script_groups
+
+    def export_script_groups(
+        self, parent: Any, groups: list, profile: str, selected: Optional[dict] = None
+    ) -> Optional[str]:
+        """Export `groups` of `profile` to a JSON file chosen by the user.
+
+        With a `selected` group and more than one group, ask whether to export
+        all groups or only the selected one. Returns the written path or None.
+        """
+        if not groups:
+            messagebox.showinfo("Export Groups", "This profile has no groups to export", parent=parent)
+            return None
+        scope_all = True
+        if selected is not None and len(groups) > 1:
+            answer = messagebox.askyesnocancel(
+                "Export Groups",
+                f"Export ALL {len(groups)} groups of profile '{profile}'?\n\n"
+                f"Yes = all groups\nNo = only '{selected['name']}'",
+                parent=parent,
+            )
+            if answer is None:
+                return None
+            scope_all = answer
+        chosen = groups if scope_all else [selected]
+        label = profile if scope_all else selected["name"]
+        stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        file_path = filedialog.asksaveasfilename(
+            parent=parent,
+            title="Export Script Groups",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            initialfile=script_groups_export_filename(label, stamp),
+        )
+        if not file_path:
+            return None
+        data = build_script_groups_export(chosen, profile)
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            messagebox.showerror("Export Groups", f"Cannot write file:\n{e}", parent=parent)
+            return None
+        count = sum(len(g["scripts"]) for g in data["groups"])
+        self.results_text.insert(
+            tk.END, f"📤 Exported {len(chosen)} group(s), {count} script(s) → {file_path}\n"
+        )
+        self.results_text.see(tk.END)
+        messagebox.showinfo(
+            "Export Groups",
+            f"Exported {len(chosen)} group(s), {count} script(s)\n\n{file_path}",
+            parent=parent,
+        )
+        return file_path
+
+    def import_script_groups(self, parent: Any) -> Optional[str]:
+        """Import groups from a JSON file into the current profile.
+
+        Name clashes: Yes = replace, No = keep both (renamed copy), Cancel = stop.
+        Returns the last imported group name, or None when nothing was imported
+        (including when saving failed and the import was rolled back).
+        """
+        self._ensure_script_groups_loaded()
+        profile = self.profile_combo.get()
+        if not profile:
+            messagebox.showwarning("Import Groups", "Please select a profile first", parent=parent)
+            return None
+        file_path = filedialog.askopenfilename(
+            parent=parent,
+            title="Import Script Groups",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return None
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            incoming = parse_script_groups_import(data)
+        except Exception as e:
+            messagebox.showerror("Import Groups", f"Not a valid Script Groups file:\n{e}", parent=parent)
+            return None
+        if not incoming:
+            messagebox.showinfo("Import Groups", "No groups found in this file", parent=parent)
+            return None
+        replace = self._ask_import_mode(parent, incoming, profile)
+        if replace is None:
+            return None
+        snapshot = copy.deepcopy(self.script_groups)
+        last_name = merge_imported_script_groups(self.script_groups, incoming, profile, replace)
+        if not self.save_script_groups():
+            # keep the same list object: open windows hold a reference to it
+            self.script_groups[:] = snapshot
+            self._refresh_script_groups_window(None)
+            return None
+        self._refresh_script_groups_window(last_name)
+        self.results_text.insert(tk.END, f"📥 Imported {len(incoming)} group(s) from {file_path}\n")
+        self.results_text.see(tk.END)
+        return last_name
+
+    def _ask_import_mode(self, parent: Any, incoming: list, profile: str) -> Optional[bool]:
+        """Confirm an import: True = replace clashes, False = keep both, None = cancel."""
+        clashes = script_group_name_clashes(self.script_groups, incoming, profile)
+        summary = "\n".join(
+            f"• {g['name']}  ({len(g.get('scripts', []))} scripts)"
+            + ("  ← already exists" if g["name"] in clashes else "")
+            for g in incoming[:15]
+        )
+        if len(incoming) > 15:
+            summary += f"\n... and {len(incoming) - 15} more"
+        if clashes:
+            return messagebox.askyesnocancel(
+                "Import Groups",
+                f"Import {len(incoming)} group(s) into profile '{profile}':\n\n{summary}\n\n"
+                f"{len(clashes)} group name(s) already exist.\n"
+                "Yes = replace them\nNo = keep both (imported copy gets a new name)\n"
+                "Cancel = do not import",
+                parent=parent,
+            )
+        if messagebox.askyesno(
+            "Import Groups",
+            f"Import {len(incoming)} group(s) into profile '{profile}'?\n\n{summary}",
+            parent=parent,
+        ):
+            return False
+        return None
+
+    def _refresh_script_groups_window(self, select_name: Optional[str] = None) -> None:
+        """Refresh the open Script Groups window, if any, selecting `select_name`."""
+        callback = getattr(self, "_script_groups_refresh", None)
+        if callback is None:
+            return
+        window = getattr(self, "_script_groups_window", None)
+        if window is None or not window.winfo_exists():
+            self._script_groups_refresh = None
+            return
+        callback(select_name)
+
+    def sidebar_export_script_groups(self) -> Optional[str]:
+        """Sidebar "Export Groups": export ALL groups of the current profile."""
+        self._ensure_script_groups_loaded()
+        profile = self.profile_combo.get()
+        groups = [g for g in self.script_groups if g.get("profile") == profile]
+        return self.export_script_groups(self.root, groups, profile)
+
+    def sidebar_import_script_groups(self) -> Optional[str]:
+        """Sidebar "Import Groups": import into the current profile."""
+        return self.import_script_groups(self.root)
 
     @staticmethod
     def _is_readable_json(path: str) -> bool:
@@ -4297,8 +4861,7 @@ class DatabaseConnectorGUI:
 
     def show_script_groups_dialog(self):
         """Manage Script Groups of the current profile; run / export a whole group."""
-        if not hasattr(self, "script_groups"):
-            self.script_groups = self.load_script_groups()
+        self._ensure_script_groups_loaded()
 
         existing = getattr(self, "_script_groups_window", None)
         if existing is not None and existing.winfo_exists():
@@ -4487,6 +5050,20 @@ class DatabaseConnectorGUI:
                 g is not ignore and g["name"].lower() == name.lower() for g in state["groups"]
             )
 
+        def save_or_rollback(
+            snapshot: list,  # deep copy of self.script_groups
+            select_name: Optional[str],
+            select_index: Optional[int],
+        ) -> bool:
+            """Save; on failure put self.script_groups back (in place) and redraw from it."""
+            if self.save_script_groups():
+                return True
+            self.script_groups[:] = snapshot
+            refresh_groups(select_name=select_name)
+            if select_index is not None:
+                refresh_scripts(select_index=select_index)
+            return False
+
         # ---- group actions -------------------------------------------------
         def new_group():
             if not self.profile_combo.get():
@@ -4498,6 +5075,10 @@ class DatabaseConnectorGUI:
             if name_taken(name):
                 messagebox.showwarning("Script Groups", f"Group '{name}' already exists", parent=dialog)
                 return
+            previous = current_group()
+            prev_name = previous["name"] if previous else None
+            prev_index = current_script_index()
+            snapshot = copy.deepcopy(self.script_groups)
             self.script_groups.append(
                 {
                     "name": name,
@@ -4506,7 +5087,8 @@ class DatabaseConnectorGUI:
                     "scripts": [],
                 }
             )
-            self.save_script_groups()
+            if not save_or_rollback(snapshot, prev_name, prev_index):
+                return
             refresh_groups(select_name=name)
 
         def rename_group():
@@ -4519,8 +5101,12 @@ class DatabaseConnectorGUI:
             if name_taken(name, ignore=group):
                 messagebox.showwarning("Script Groups", f"Group '{name}' already exists", parent=dialog)
                 return
+            prev_name = group["name"]
+            prev_index = current_script_index()
+            snapshot = copy.deepcopy(self.script_groups)
             group["name"] = name
-            self.save_script_groups()
+            if not save_or_rollback(snapshot, prev_name, prev_index):
+                return
             refresh_groups(select_name=name)
 
         def delete_group():
@@ -4535,8 +5121,12 @@ class DatabaseConnectorGUI:
                 parent=dialog,
             ):
                 return
+            prev_name = group["name"]
+            prev_index = current_script_index()
+            snapshot = copy.deepcopy(self.script_groups)
             self.script_groups.remove(group)
-            self.save_script_groups()
+            if not save_or_rollback(snapshot, prev_name, prev_index):
+                return
             refresh_groups()
 
         # ---- script actions ------------------------------------------------
@@ -4548,8 +5138,12 @@ class DatabaseConnectorGUI:
             if not result:
                 return
             result["created"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            prev_name = group["name"]
+            prev_index = current_script_index()
+            snapshot = copy.deepcopy(self.script_groups)
             group["scripts"].append(result)
-            self.save_script_groups()
+            if not save_or_rollback(snapshot, prev_name, prev_index):
+                return
             refresh_groups()
             refresh_scripts(select_index=len(group["scripts"]) - 1)
 
@@ -4564,13 +5158,17 @@ class DatabaseConnectorGUI:
             chosen = self._pick_jobs_dialog(dialog, jobs)
             if not chosen:
                 return
+            prev_name = group["name"]
+            prev_index = current_script_index()
+            snapshot = copy.deepcopy(self.script_groups)
             for job in chosen:
                 copy_ = json.loads(json.dumps({k: v for k, v in job.items() if not k.startswith("_")}, default=str))
                 copy_.pop("run_index", None)
                 copy_.pop("profile", None)
                 copy_["created"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
                 group["scripts"].append(copy_)
-            self.save_script_groups()
+            if not save_or_rollback(snapshot, prev_name, prev_index):
+                return
             refresh_groups()
             refresh_scripts(select_index=len(group["scripts"]) - 1)
 
@@ -4583,10 +5181,13 @@ class DatabaseConnectorGUI:
             result = self._edit_group_script_dialog(dialog, "Edit Script", script)
             if not result:
                 return
+            prev_name = group["name"]
+            snapshot = copy.deepcopy(self.script_groups)
             script.pop("sql_template", None)
             script.pop("excel_parameters", None)
             script.update(result)
-            self.save_script_groups()
+            if not save_or_rollback(snapshot, prev_name, index):
+                return
             refresh_scripts(select_index=index)
 
         def delete_script():
@@ -4601,8 +5202,11 @@ class DatabaseConnectorGUI:
                 parent=dialog,
             ):
                 return
+            prev_name = group["name"]
+            snapshot = copy.deepcopy(self.script_groups)
             del group["scripts"][index]
-            self.save_script_groups()
+            if not save_or_rollback(snapshot, prev_name, index):
+                return
             refresh_groups()
             refresh_scripts(select_index=index)
 
@@ -4614,8 +5218,11 @@ class DatabaseConnectorGUI:
             target = index + step
             scripts = group["scripts"]
             if 0 <= target < len(scripts):
+                prev_name = group["name"]
+                snapshot = copy.deepcopy(self.script_groups)
                 scripts[index], scripts[target] = scripts[target], scripts[index]
-                self.save_script_groups()
+                if not save_or_rollback(snapshot, prev_name, index):
+                    return
                 refresh_scripts(select_index=target)
 
         def group_jobs(group):
@@ -4640,167 +5247,10 @@ class DatabaseConnectorGUI:
 
         # ---- backup: export / import -----------------------------------------
         def export_groups():
-            groups = state["groups"]
-            if not groups:
-                messagebox.showinfo("Export Groups", "This profile has no groups to export", parent=dialog)
-                return
-            selected = current_group()
-            scope_all = True
-            if selected is not None and len(groups) > 1:
-                answer = messagebox.askyesnocancel(
-                    "Export Groups",
-                    f"Export ALL {len(groups)} groups of profile '{state['profile']}'?\n\n"
-                    f"Yes = all groups\nNo = only '{selected['name']}'",
-                    parent=dialog,
-                )
-                if answer is None:
-                    return
-                scope_all = answer
-            chosen = groups if scope_all else [selected]
-            stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-            label = state["profile"] if scope_all else selected["name"]
-            safe = re.sub(r'[\\/:*?"<>|]', "_", str(label)).strip() or "groups"
-            file_path = filedialog.asksaveasfilename(
-                parent=dialog,
-                title="Export Script Groups",
-                defaultextension=".json",
-                filetypes=[("JSON files", "*.json")],
-                initialfile=f"script_groups_{safe}_{stamp}.json",
-            )
-            if not file_path:
-                return
-            data = {
-                "type": "script_groups",
-                "version": 1,
-                "exported": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "profile": state["profile"],
-                "groups": [
-                    {
-                        "name": g["name"],
-                        "created": g.get("created"),
-                        "scripts": [
-                            {k: v for k, v in sc.items() if not k.startswith("_") and k != "run_index"}
-                            for sc in g.get("scripts", [])
-                        ],
-                    }
-                    for g in chosen
-                ],
-            }
-            try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-            except Exception as e:
-                messagebox.showerror("Export Groups", f"Cannot write file:\n{e}", parent=dialog)
-                return
-            count = sum(len(g["scripts"]) for g in data["groups"])
-            self.results_text.insert(
-                tk.END, f"📤 Exported {len(chosen)} group(s), {count} script(s) → {file_path}\n"
-            )
-            self.results_text.see(tk.END)
-            messagebox.showinfo(
-                "Export Groups",
-                f"Exported {len(chosen)} group(s), {count} script(s)\n\n{file_path}",
-                parent=dialog,
-            )
+            self.export_script_groups(dialog, state["groups"], state["profile"], current_group())
 
         def import_groups():
-            profile = self.profile_combo.get()
-            if not profile:
-                messagebox.showwarning("Import Groups", "Please select a profile first", parent=dialog)
-                return
-            file_path = filedialog.askopenfilename(
-                parent=dialog,
-                title="Import Script Groups",
-                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            )
-            if not file_path:
-                return
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                incoming = data.get("groups") if isinstance(data, dict) else data
-                if not isinstance(incoming, list):
-                    raise ValueError("no 'groups' list in this file")
-                incoming = [
-                    g for g in incoming
-                    if isinstance(g, dict)
-                    and isinstance(g.get("name"), str)
-                    and g["name"].strip()
-                    and isinstance(g.get("scripts", []), list)
-                ]
-                for g in incoming:
-                    for sc in g.get("scripts", []):
-                        if not isinstance(sc, dict) or not sc.get("query"):
-                            raise ValueError(f"group '{g['name']}' has a script without SQL")
-            except Exception as e:
-                messagebox.showerror("Import Groups", f"Not a valid Script Groups file:\n{e}", parent=dialog)
-                return
-            if not incoming:
-                messagebox.showinfo("Import Groups", "No groups found in this file", parent=dialog)
-                return
-
-            profile_groups = [g for g in self.script_groups if g.get("profile") == profile]
-            existing = {g["name"].lower(): g for g in profile_groups}
-            clashes = [g["name"] for g in incoming if g["name"].lower() in existing]
-            summary = "\n".join(
-                f"• {g['name']}  ({len(g.get('scripts', []))} scripts)"
-                + ("  ← already exists" if g["name"] in clashes else "")
-                for g in incoming[:15]
-            )
-            if len(incoming) > 15:
-                summary += f"\n... and {len(incoming) - 15} more"
-            replace = False
-            if clashes:
-                answer = messagebox.askyesnocancel(
-                    "Import Groups",
-                    f"Import {len(incoming)} group(s) into profile '{profile}':\n\n{summary}\n\n"
-                    f"{len(clashes)} group name(s) already exist.\n"
-                    "Yes = replace them\nNo = keep both (imported copy gets a new name)\n"
-                    "Cancel = do not import",
-                    parent=dialog,
-                )
-                if answer is None:
-                    return
-                replace = answer
-            elif not messagebox.askyesno(
-                "Import Groups",
-                f"Import {len(incoming)} group(s) into profile '{profile}'?\n\n{summary}",
-                parent=dialog,
-            ):
-                return
-
-            now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-            taken = {g["name"].lower() for g in profile_groups}
-            last_name = None
-            for g in incoming:
-                name = g["name"]
-                # pop: each existing group is replaced at most once, even when
-                # the file holds the same name twice
-                old = existing.pop(name.lower(), None)
-                if old is not None and replace:
-                    self.script_groups.remove(old)
-                elif name.lower() in taken:
-                    n = 2
-                    while f"{name} ({n})".lower() in taken:
-                        n += 1
-                    name = f"{name} ({n})"
-                taken.add(name.lower())
-                self.script_groups.append(
-                    {
-                        "name": name,
-                        "profile": profile,
-                        "created": g.get("created") or now,
-                        "imported": now,
-                        "scripts": json.loads(json.dumps(g.get("scripts", []), default=str)),
-                    }
-                )
-                last_name = name
-            self.save_script_groups()
-            refresh_groups(select_name=last_name)
-            self.results_text.insert(
-                tk.END, f"📥 Imported {len(incoming)} group(s) from {file_path}\n"
-            )
-            self.results_text.see(tk.END)
+            self.import_script_groups(dialog)
 
         # ---- buttons -------------------------------------------------------
         KIND = {"#27ae60": "success", "#3498db": "secondary", "#e74c3c": "danger", "#95a5a6": "secondary"}
@@ -4849,6 +5299,19 @@ class DatabaseConnectorGUI:
                 refresh_groups()
 
         dialog.bind("<FocusIn>", _on_focus, add="+")
+
+        # Lets an import from outside this window (sidebar) refresh its list
+        def registered(name=None):
+            refresh_groups(select_name=name)
+
+        self._script_groups_refresh = registered
+
+        def _on_destroy(event):
+            # <Destroy> of every child widget also reaches the Toplevel binding
+            if event.widget is dialog and getattr(self, "_script_groups_refresh", None) is registered:
+                self._script_groups_refresh = None
+
+        dialog.bind("<Destroy>", _on_destroy, add="+")
 
         refresh_groups()
 
@@ -4921,13 +5384,30 @@ class DatabaseConnectorGUI:
             )
 
             try:
-                with open(preset_file, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {"jobs": profile_jobs, "created": pd.Timestamp.now().isoformat()},
-                        f,
-                        indent=2,
-                        ensure_ascii=False,
-                    )
+                preset_dir = os.path.dirname(self.jobs_file)
+                requested_name = os.path.basename(preset_file)
+                existing_name = next(
+                    (
+                        name
+                        for name in os.listdir(preset_dir)
+                        if name.casefold() == requested_name.casefold()
+                    ),
+                    None,
+                )
+                if existing_name:
+                    preset_file = os.path.join(preset_dir, existing_name)
+                    if not messagebox.askyesno(
+                        "Overwrite Preset",
+                        f"Preset '{existing_name}' already exists. Overwrite it?",
+                        parent=dialog,
+                    ):
+                        return
+
+                write_json_atomic(
+                    preset_file,
+                    {"jobs": profile_jobs, "created": pd.Timestamp.now().isoformat()},
+                    indent=2,
+                )
 
                 self.results_text.delete("1.0", tk.END)
                 self.results_text.insert(tk.END, f"💾 Preset saved: {preset_name}\n")
@@ -5059,6 +5539,10 @@ class DatabaseConnectorGUI:
 
                 current_profile = self.profile_combo.get()
 
+                saved_jobs_before = self.saved_jobs
+                original_jobs = list(saved_jobs_before)
+                jobs_snapshot = copy.deepcopy(original_jobs)
+
                 # ลบเฉพาะ Job ของ Profile ปัจจุบัน
                 self.saved_jobs = [
                     job for job in self.saved_jobs if job.get("profile") != current_profile
@@ -5071,7 +5555,11 @@ class DatabaseConnectorGUI:
 
                     self.saved_jobs.append(job)
 
-                self.save_jobs()
+                if not self.save_jobs():
+                    self._restore_jobs_snapshot(
+                        saved_jobs_before, original_jobs, jobs_snapshot
+                    )
+                    return
                 self.update_jobs_list()
 
                 self.results_text.delete("1.0", tk.END)
@@ -6275,7 +6763,9 @@ class DatabaseConnectorGUI:
 
         return loading_dialog
 
-    def _execute_query_background(self, sql_query, loading_dialog, engine: Any = None) -> None:
+    def _execute_query_background(
+        self, sql_query, loading_dialog, engine: Any = None, debug_mode=None
+    ) -> None:
         """NEW: Execute query in background with comprehensive error logging.
 
         engine: the run's engine, taken on the main thread (None -> self.engine).
@@ -6283,13 +6773,15 @@ class DatabaseConnectorGUI:
         """
         if engine is None:
             engine = self.engine
+        if debug_mode is None:
+            debug_mode = self.debug_mode.get()
 
         def execute_in_background():
             error_details = None
 
             try:
                 # Debug logging
-                if self.debug_mode.get():
+                if debug_mode:
                     print(f"\n{'='*100}")
                     print(f"🔍 DEBUG: Starting query execution")
                     print(f"Query: {sql_query}")
@@ -6299,25 +6791,25 @@ class DatabaseConnectorGUI:
 
                 # Check if it's a SELECT query or data modification
                 if self.is_select_query(sql_query):
-                    if self.debug_mode.get():
+                    if debug_mode:
                         print("🔍 DEBUG: Detected SELECT query")
 
                     # Execute SELECT query and get results
                     df = self.read_sql_dataframe(sql_query, engine=engine)
 
-                    if self.debug_mode.get():
+                    if debug_mode:
                         print(f"✅ DEBUG: Query successful - {len(df)} rows, {df.shape[1]} columns")
 
                     # Update UI in main thread
                     self.root.after(0, lambda: self.on_query_success(df, sql_query, loading_dialog))
                 else:
-                    if self.debug_mode.get():
+                    if debug_mode:
                         print("🔍 DEBUG: Detected data modification query")
 
                     # Execute UPDATE/INSERT/DELETE statement
                     rows_affected = self._execute_modification(sql_query, engine=engine)
 
-                    if self.debug_mode.get():
+                    if debug_mode:
                         print(f"✅ DEBUG: Modification successful - {rows_affected} rows affected")
 
                     # Update UI in main thread with modification result
@@ -6342,7 +6834,7 @@ class DatabaseConnectorGUI:
                     "query": sql_query,
                 }
 
-                if self.debug_mode.get():
+                if debug_mode:
                     print(f"\n{'='*100}")
                     print(f"❌ DEBUG: Query execution failed")
                     print(f"Error Type: {error_type}")
@@ -7315,14 +7807,30 @@ class DatabaseConnectorGUI:
         job (same order), or None after showing an error. Saved queries and
         the editor text are never changed.
         """
-        tables = None
+        tables, tables_checked = None, False
         prepared, problems = [], []
         for job in jobs:
             name = job.get("name") or "SQL Editor"
             sql = job.get("query", "") or ""
             if find_table_variables(sql):
-                if tables is None:
+                if not tables_checked:
+                    tables_checked = True
                     tables = self._current_table_data_tables()
+                    if tables is not None:
+                        self.results_text.insert(
+                            tk.END,
+                            table_data_source_text(
+                                getattr(self, "loaded_table_data", None),
+                                getattr(self, "last_table_data_mtime", None),
+                            ),
+                        )
+                if tables is None:
+                    file_name = os.path.basename(getattr(self, "table_data_file", "") or "")
+                    problems.append(
+                        f"• {name} — table data file is missing or cannot be read "
+                        f"({file_name}) — try again"
+                    )
+                    continue
                 result = render_table_variables(sql, tables)
                 if not result.ok:
                     detail = []
@@ -7355,10 +7863,21 @@ class DatabaseConnectorGUI:
             return None
         return prepared
 
-    def _current_table_data_tables(self):
-        """Tables of the loaded table-data file (loads the file once if needed)."""
+    def _current_table_data_tables(self) -> Optional[dict]:
+        """Tables of the table-data file, reloaded whenever its mtime changes.
+
+        File missing / unreadable / not a dict -> None (never falls back to
+        old data). The cached data and mtime are only replaced after a
+        successful read, and are shared with Auto-sync.
+        """
+        try:
+            mtime = os.path.getmtime(self.table_data_file)
+        except OSError as error:
+            print(f"Table data file is missing: {error}")
+            return None
         data = self.loaded_table_data
-        if not isinstance(data, dict):
+        if not (isinstance(data, dict)
+                and getattr(self, "last_table_data_mtime", None) == mtime):
             try:
                 with open(self.table_data_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -7366,8 +7885,10 @@ class DatabaseConnectorGUI:
                 print(f"Cannot read table data file: {error}")
                 return None
             if not isinstance(data, dict):
+                print("Cannot read table data file: content is not a JSON object")
                 return None
             self.loaded_table_data = data
+            self.last_table_data_mtime = mtime
         tables = data.get("tables")
         return tables if isinstance(tables, dict) else None
 
@@ -7483,6 +8004,31 @@ class DatabaseConnectorGUI:
         if not self._is_busy():
             return False
         self._log_blocked(action)
+        return True
+
+    def _block_if_profile_mismatch(
+        self, action: str, target: Optional[RunTarget] = None
+    ) -> bool:
+        """Log and block only when the selected and connected Profiles differ."""
+        profile_widget = getattr(self, "profile_combo", None)
+        selected_value = profile_widget.get() if profile_widget is not None else ""
+        selected_profile = selected_value.strip() if isinstance(selected_value, str) else ""
+        target = target if target is not None else self._capture_run_target()
+        connected_value = (
+            target.info.profile
+            if target is not None and target.info is not None
+            else ""
+        )
+        connected_profile = connected_value.strip() if isinstance(connected_value, str) else ""
+        if not selected_profile or not connected_profile or selected_profile == connected_profile:
+            return False
+
+        self.results_text.insert(
+            tk.END,
+            f"⛔ {action} ไม่ได้เริ่มงาน: Profile ที่เลือกคือ '{selected_profile}' "
+            f"แต่ connection ใช้ Profile '{connected_profile}'\n",
+        )
+        self.results_text.see(tk.END)
         return True
 
     def _on_sql_ctrl_enter(self, _event=None) -> None:
@@ -7799,6 +8345,9 @@ class DatabaseConnectorGUI:
         """Execute the SQL query with comprehensive error handling and retry capability"""
         if self._block_if_busy("Run"):
             return
+        target = self._capture_run_target()
+        if DatabaseConnectorGUI._block_if_profile_mismatch(self, "Run", target=target):
+            return
         if not self.engine:
             messagebox.showerror("Error", "Please connect to database first")
             return
@@ -7815,7 +8364,6 @@ class DatabaseConnectorGUI:
         sql_query = prepared[0]  # table variables filled; the editor keeps the template
 
         # The run's engine + destination, taken once here and used to the end
-        target = self._capture_run_target()
         if not self._confirm_data_change([{"name": None, "query": sql_query}], target=target):
             return
         self._start_stoppable_run(target=target)
@@ -7834,7 +8382,10 @@ class DatabaseConnectorGUI:
         loading_dialog = self._create_loading_dialog_with_retry(sql_query)
 
         # Execute query in background thread
-        self._execute_query_background(sql_query, loading_dialog, engine=target.engine)
+        debug_mode = self.debug_mode.get()
+        self._execute_query_background(
+            sql_query, loading_dialog, engine=target.engine, debug_mode=debug_mode
+        )
 
     def on_modification_success(self, rows_affected, sql_query, loading_dialog):
         """Handle successful UPDATE/INSERT/DELETE execution"""
@@ -8539,18 +9090,28 @@ class DatabaseConnectorGUI:
         """List all schemas and tables in the database"""
         if self._block_if_busy("Tables"):
             return
+        target = self._capture_run_target()
+        if DatabaseConnectorGUI._block_if_profile_mismatch(self, "Tables", target=target):
+            return
         if not self.engine:
             messagebox.showerror("Error", "Please connect to database first")
             return
 
         # The engine + database type of this run, taken once on the main thread;
         # the worker below never reads self.engine or the screen db_type
-        target = self._capture_run_target()
         engine = target.engine
         db_type = target.info.db_type if target.info is not None else self.db_type.get()
 
         # Check if user wants to list all databases or just current connection
         current_db_name = self.db_name.get().strip()
+        connection_credentials = (
+            getattr(self, "db_user", None).get() if getattr(self, "db_user", None) else "",
+            getattr(self, "db_password", None).get()
+            if getattr(self, "db_password", None)
+            else "",
+            getattr(self, "db_host", None).get() if getattr(self, "db_host", None) else "",
+            getattr(self, "db_port", None).get() if getattr(self, "db_port", None) else "",
+        )
 
         self.results_text.insert(tk.END, "Fetching database schema information...\n\n")
         self.results_text.see(tk.END)
@@ -8563,7 +9124,7 @@ class DatabaseConnectorGUI:
         loading_dialog = self._create_list_tables_loading_dialog()
 
         # Execute in background thread
-        def fetch_tables_in_background():
+        def fetch_tables_in_background(credentials=connection_credentials):
             try:
                 table_list = []
 
@@ -8647,91 +9208,95 @@ class DatabaseConnectorGUI:
                                 # Create connection for specific database
                                 temp_conn_str = self.get_connection_string(
                                     db_type,
-                                    self.db_user.get(),
-                                    self.db_password.get(),
-                                    self.db_host.get(),
-                                    self.db_port.get(),
+                                    credentials[0],
+                                    credentials[1],
+                                    credentials[2],
+                                    credentials[3],
                                     database,
                                 )
                                 print(f"   🔌 Connecting to {database}...")
                                 temp_engine = create_engine(
                                     temp_conn_str, connect_args=self.get_connect_args(db_type)
                                 )
-                                temp_inspector = inspect(temp_engine)
-                                temp_schemas = temp_inspector.get_schema_names()
-                                print(
-                                    f"   ✅ Connected! Found {len(temp_schemas)} schemas: {temp_schemas}"
-                                )
+                                try:
+                                    temp_inspector = inspect(temp_engine)
+                                    temp_schemas = temp_inspector.get_schema_names()
+                                    print(
+                                        f"   ✅ Connected! Found {len(temp_schemas)} schemas: {temp_schemas}"
+                                    )
 
-                                # Define skip_schemas based on database type
-                                if db_type == "Microsoft SQL Server":
-                                    # Only skip true system schemas, not user schemas
-                                    skip_schemas = ["information_schema", "sys", "guest"]
-                                elif db_type == "PostgreSQL":
-                                    skip_schemas = [
-                                        "information_schema",
-                                        "pg_catalog",
-                                        "pg_toast",
-                                        "pg_toast_temp_1",
-                                    ]
-                                else:  # MySQL
-                                    skip_schemas = [
-                                        "information_schema",
-                                        "mysql",
-                                        "performance_schema",
-                                        "sys",
-                                    ]
+                                    # Define skip_schemas based on database type
+                                    if db_type == "Microsoft SQL Server":
+                                        # Only skip true system schemas, not user schemas
+                                        skip_schemas = ["information_schema", "sys", "guest"]
+                                    elif db_type == "PostgreSQL":
+                                        skip_schemas = [
+                                            "information_schema",
+                                            "pg_catalog",
+                                            "pg_toast",
+                                            "pg_toast_temp_1",
+                                        ]
+                                    else:  # MySQL
+                                        skip_schemas = [
+                                            "information_schema",
+                                            "mysql",
+                                            "performance_schema",
+                                            "sys",
+                                        ]
 
-                                schema_count = 0
-                                for schema in temp_schemas:
-                                    if schema.lower() in skip_schemas:
-                                        print(f"      ⏭️  Skipping system schema: {schema}")
-                                        continue
+                                    schema_count = 0
+                                    for schema in temp_schemas:
+                                        if schema.lower() in skip_schemas:
+                                            print(f"      ⏭️  Skipping system schema: {schema}")
+                                            continue
 
-                                    try:
-                                        # Use raw SQL for SQL Server to avoid HY104 error
-                                        if db_type == "Microsoft SQL Server":
-                                            with temp_engine.connect() as temp_conn:
-                                                query = text(f"""
-                                                    SELECT TABLE_NAME 
-                                                    FROM [{database}].INFORMATION_SCHEMA.TABLES 
-                                                    WHERE TABLE_SCHEMA = '{schema}' 
-                                                    AND TABLE_TYPE = 'BASE TABLE'
-                                                    ORDER BY TABLE_NAME
-                                                """)
-                                                result = temp_conn.execute(query)
-                                                tables = [row[0] for row in result]
-                                        else:
-                                            tables = temp_inspector.get_table_names(schema=schema)
+                                        try:
+                                            # Use raw SQL for SQL Server to avoid HY104 error
+                                            if db_type == "Microsoft SQL Server":
+                                                with temp_engine.connect() as temp_conn:
+                                                    query = text("""
+                                                        SELECT TABLE_NAME
+                                                        FROM INFORMATION_SCHEMA.TABLES
+                                                        WHERE TABLE_SCHEMA = :schema
+                                                        AND TABLE_TYPE = 'BASE TABLE'
+                                                        ORDER BY TABLE_NAME
+                                                    """)
+                                                    result = temp_conn.execute(
+                                                        query, {"schema": schema}
+                                                    )
+                                                    tables = [row[0] for row in result]
+                                            else:
+                                                tables = temp_inspector.get_table_names(schema=schema)
 
-                                        if len(tables) > 0:
-                                            print(
-                                                f"      ✅ Schema '{schema}': {len(tables)} tables"
-                                            )
-                                            schema_count += 1
-                                            for table in tables:
-                                                table_list.append(
-                                                    {
-                                                        "Database": database,
-                                                        "Schema": schema,
-                                                        "Table": table,
-                                                    }
+                                            if len(tables) > 0:
+                                                print(
+                                                    f"      ✅ Schema '{schema}': {len(tables)} tables"
                                                 )
-                                        else:
+                                                schema_count += 1
+                                                for table in tables:
+                                                    table_list.append(
+                                                        {
+                                                            "Database": database,
+                                                            "Schema": schema,
+                                                            "Table": table,
+                                                        }
+                                                    )
+                                            else:
+                                                print(
+                                                    f"      ⚠️  Schema '{schema}': 0 tables (skipping)"
+                                                )
+                                        except Exception as schema_err:
                                             print(
-                                                f"      ⚠️  Schema '{schema}': 0 tables (skipping)"
+                                                f"      ❌ Error reading schema '{schema}': {schema_err}"
                                             )
-                                    except Exception as schema_err:
-                                        print(
-                                            f"      ❌ Error reading schema '{schema}': {schema_err}"
-                                        )
-                                        import traceback
+                                            import traceback
 
-                                        traceback.print_exc()
-                                        # Skip this schema and continue with others
-                                        continue
+                                            traceback.print_exc()
+                                            # Skip this schema and continue with others
+                                            continue
+                                finally:
+                                    temp_engine.dispose()
 
-                                temp_engine.dispose()
                                 total_tables = len(
                                     [t for t in table_list if t["Database"] == database]
                                 )
@@ -8790,7 +9355,11 @@ class DatabaseConnectorGUI:
                 self.root.after(0, lambda err=e: self.on_list_tables_error(err, loading_dialog))
 
         # Start background thread
-        thread = threading.Thread(target=fetch_tables_in_background, daemon=True)
+        thread = threading.Thread(
+            target=fetch_tables_in_background,
+            args=(connection_credentials,),
+            daemon=True,
+        )
         thread.start()
 
     def _create_list_tables_loading_dialog(self) -> "tk.Toplevel":
@@ -8975,7 +9544,7 @@ class DatabaseConnectorGUI:
             pass
         return backup is None
 
-    def save_jobs(self):
+    def save_jobs(self) -> bool:
         """Save jobs to file"""
         if getattr(self, "_jobs_save_blocked", False):
             messagebox.showerror(
@@ -8983,11 +9552,20 @@ class DatabaseConnectorGUI:
                 "saved_jobs.json could not be read when the app started, so it is not "
                 "overwritten. Restart the app to load your jobs again.",
             )
-            return
+            return False
         try:
             write_json_atomic(self.jobs_file, self.saved_jobs)
+            return True
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save jobs:\n{str(e)}")
+            return False
+
+    def _restore_jobs_snapshot(self, jobs, original_jobs, snapshot):
+        for job, saved_values in zip(original_jobs, snapshot):
+            job.clear()
+            job.update(saved_values)
+        jobs[:] = original_jobs
+        self.saved_jobs = jobs
 
     def save_job_dialog(self):
         """Show dialog to save current query as a job - UPDATED: Longer names allowed"""
@@ -9061,8 +9639,13 @@ class DatabaseConnectorGUI:
                 )
             )
 
+            saved_jobs_before = self.saved_jobs
+            original_jobs = list(saved_jobs_before)
+            jobs_snapshot = copy.deepcopy(original_jobs)
             self.saved_jobs.append(job)
-            self.save_jobs()
+            if not self.save_jobs():
+                self._restore_jobs_snapshot(saved_jobs_before, original_jobs, jobs_snapshot)
+                return
             self.update_jobs_list()
 
             self.results_text.delete("1.0", tk.END)
@@ -9122,6 +9705,19 @@ class DatabaseConnectorGUI:
         # A second click (or ▶ of another card) while any run is in progress
         if self._block_if_busy("Run Job"):
             return
+        selected_profile = self.profile_combo.get()
+        job_profile = job.get("profile", selected_profile)
+        if job_profile != selected_profile:
+            self.results_text.insert(
+                tk.END,
+                f"⛔ Run Job ไม่ได้เริ่มงาน: Job Profile คือ '{job_profile}' "
+                f"แต่ Profile ที่เลือกคือ '{selected_profile}'\n",
+            )
+            self.results_text.see(tk.END)
+            return
+        target = self._capture_run_target()
+        if DatabaseConnectorGUI._block_if_profile_mismatch(self, "Run Job", target=target):
+            return
 
         if not self.engine:
             messagebox.showerror("Error", "Please connect to database first")
@@ -9140,7 +9736,6 @@ class DatabaseConnectorGUI:
             return
         sql_query = prepared[0]  # the saved job keeps its original SQL
         # The run's engine + destination, taken once here and used to the end
-        target = self._capture_run_target()
         if not self._confirm_data_change(
             [{"name": job.get("name"), "query": sql_query}], target=target
         ):
@@ -9238,6 +9833,9 @@ class DatabaseConnectorGUI:
         # Extra clicks / Run Group while any run is in progress are refused here
         if self._block_if_busy("Run all"):
             return
+        target = self._capture_run_target()
+        if DatabaseConnectorGUI._block_if_profile_mismatch(self, "Run all", target=target):
+            return
         if jobs_override is not None:
             profile_jobs = list(jobs_override)
             list_numbers = {id(job): number for number, job in enumerate(profile_jobs, start=1)}
@@ -9266,7 +9864,6 @@ class DatabaseConnectorGUI:
         run_sql = {id(job): sql for job, sql in zip(profile_jobs, prepared)}
         # The run's engine + destination, taken once here: every job of this
         # run uses this engine even if self.engine changes meanwhile
-        target = self._capture_run_target()
         run_engine = target.engine
         if not self._confirm_data_change(
             [{"name": job.get("name"), "query": run_sql[id(job)]} for job in profile_jobs],
@@ -9676,6 +10273,9 @@ class DatabaseConnectorGUI:
         """Export ผลลัพธ์ของทุก Job ลง Excel - 1 Job = 1 Sheet (ชื่อ Sheet = ชื่อ Job)"""
         if self._block_if_busy("Export"):
             return
+        target = self._capture_run_target()
+        if DatabaseConnectorGUI._block_if_profile_mismatch(self, "Export", target=target):
+            return
         import re
         import time as time_module
 
@@ -9714,7 +10314,6 @@ class DatabaseConnectorGUI:
             return  # User cancelled
 
         # The run's engine + destination, taken once here and used by the worker
-        target = self._capture_run_target()
         export_engine = target.engine
         jobs = self._reuse_last_run_results(jobs_to_export)
         if jobs is None:
@@ -9744,7 +10343,7 @@ class DatabaseConnectorGUI:
 
             self.root.after(0, _write)
 
-        def on_done(ok, failed, skipped, elapsed, fatal_error):
+        def on_done(ok, failed, skipped, warnings, elapsed, fatal_error):
             self.export_excel_btn.config(state="normal", text="⇩  Export")
             self.results_text.insert(tk.END, f"\n{'='*150}\n")
             if fatal_error:
@@ -9757,6 +10356,7 @@ class DatabaseConnectorGUI:
             self.results_text.insert(tk.END, f"🏁 Export Excel Completed ({elapsed:.2f}s)\n")
             self.results_text.insert(tk.END, f"{'='*150}\n")
             self.results_text.insert(tk.END, f"✅ Success: {ok}\n")
+            self.results_text.insert(tk.END, f"⚠️ Warning: {warnings}\n")
             self.results_text.insert(tk.END, f"❌ Failed: {failed}\n")
             self.results_text.insert(tk.END, f"⏭️ Skipped (not SELECT): {skipped}\n")
             self.results_text.insert(tk.END, f"📁 Saved to: {file_path}\n")
@@ -9766,7 +10366,7 @@ class DatabaseConnectorGUI:
                 "Export Success",
                 f"✅ Export Excel เรียบร้อย\n\n"
                 f"📁 {file_path}\n\n"
-                f"Success: {ok} | Failed: {failed} | Skipped: {skipped}",
+                f"Success: {ok} | Warning: {warnings} | Failed: {failed} | Skipped: {skipped}",
             )
 
         # Table data for {TABLE_...} variables, read here on the main thread
@@ -9775,17 +10375,82 @@ class DatabaseConnectorGUI:
             if any(find_table_variables(j.get("query", "")) for j in jobs)
             else None
         )
+        if export_tables is not None:
+            self.results_text.insert(
+                tk.END,
+                table_data_source_text(self.loaded_table_data, self.last_table_data_mtime),
+            )
 
         def worker():
             import re
 
             illegal_chars = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
-            max_rows = 1048575  # Excel รองรับ 1,048,576 แถว (หัก header 1 แถว)
             used_names = set()
-            ok = failed = skipped = 0
+            ok = failed = skipped = warnings = 0
             fatal_error = None
             start_all = time_module.time()
+
+            def write_literal_cell(ws, row, column, value):
+                cell = ws.cell(row=row, column=column, value=value)
+                cell.data_type = "s"
+
+            def force_literal_strings(ws):
+                for row in ws.iter_rows():
+                    for existing_cell in row:
+                        if isinstance(existing_cell.value, str):
+                            write_literal_cell(
+                                ws,
+                                existing_cell.row,
+                                existing_cell.column,
+                                existing_cell.value,
+                            )
+
+            def sql_line_too_long(job_name: str, line_no: int, line: str) -> bool:
+                """Log and return True when one SQL line cannot fit in a cell."""
+                if not _excel_text_too_long(line):
+                    return False
+                log(
+                    f"⚠️ Warning: Job '{job_name}', SQL line {line_no} is over "
+                    "Excel's 32,767-character limit; the cell was left blank.\n"
+                )
+                return True
+
+            def blank_oversized_cells(job_name: str, values: dict) -> dict:
+                """Copy of a Skipped / Failed row with oversized values set to "" (one log per column)."""
+                checked = {}
+                for column_name, value in values.items():
+                    if _excel_text_too_long(value):
+                        log(
+                            f"⚠️ Warning: Job '{job_name}', column '{column_name}' is over "
+                            "Excel's 32,767-character limit; the cell was left blank.\n"
+                        )
+                        value = ""
+                    checked[column_name] = value
+                return checked
+
+            def append_sql_annotation(ws, sql_text, job_name: str) -> bool:
+                """Write the SQL under the data; True when an oversized line was left blank."""
+                sql_lines = sql_text.splitlines()
+                if not sql_lines:
+                    return False
+
+                start_row = ws.max_row + 2
+                end_row = start_row + len(sql_lines) - 1
+                if end_row > EXCEL_MAX_DATA_ROWS + 1:
+                    log(
+                        "⚠️ SQL annotation not added because the worksheet is full "
+                        "(Excel limit: 1,048,576 rows).\n"
+                    )
+                    return False
+
+                blanked = False
+                for line_no, line in enumerate(sql_lines):
+                    if sql_line_too_long(job_name, line_no + 1, line):
+                        blanked = True
+                        continue
+                    write_literal_cell(ws, row=start_row + line_no, column=1, value=line)
+                return blanked
 
             try:
                 with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
@@ -9836,15 +10501,20 @@ class DatabaseConnectorGUI:
                                 log(
                                     "   Status: ⏭️ Skipped (ไม่ใช่ SELECT - ไม่รันซ้ำเพื่อความปลอดภัย)\n\n"
                                 )
-                                pd.DataFrame(
+                                skipped_row = blank_oversized_cells(
+                                    job_name,
                                     {
-                                        "Status": ["Skipped"],
-                                        "Message": [
+                                        "Status": "Skipped",
+                                        "Message": (
                                             "Not a SELECT query - not executed during export"
-                                        ],
-                                        "Query": [query],
-                                    }
+                                        ),
+                                        "Query": query,
+                                    },
+                                )
+                                pd.DataFrame(
+                                    {k: [v] for k, v in skipped_row.items()}
                                 ).to_excel(writer, sheet_name=sheet, index=False)
+                                force_literal_strings(writer.sheets[sheet])
                                 continue
                             query_start = time_module.time()
                             df = (
@@ -9853,6 +10523,7 @@ class DatabaseConnectorGUI:
                                 else self.read_sql_dataframe(query, engine=export_engine)
                             )
                             query_elapsed = time_module.time() - query_start
+                            _ensure_excel_row_limit(len(df))
 
                             log(f"Query Time : " f"{query_elapsed:.2f}s\n")
                             if df.empty:
@@ -9867,28 +10538,29 @@ class DatabaseConnectorGUI:
 
                                 start_row = 3
 
+                                sql_blanked = False
+
                                 for line_no, line in enumerate(query.splitlines()):
 
-                                    ws.cell(row=start_row + line_no, column=1, value=line)
+                                    if sql_line_too_long(job_name, line_no + 1, line):
+                                        sql_blanked = True
+                                        continue
 
-                                ok += 1
+                                    write_literal_cell(
+                                        ws, row=start_row + line_no, column=1, value=line
+                                    )
+
+                                if sql_blanked:
+                                    warnings += 1
+                                else:
+                                    ok += 1
 
                                 continue
 
                             def clean_value(x):
 
                                 if isinstance(x, bytes):
-
-                                    try:
-                                        x = x.decode("utf-16-le")
-
-                                    except Exception:
-
-                                        try:
-                                            x = x.decode("utf-8")
-
-                                        except Exception:
-                                            x = str(x)
+                                    return format_db_value(x)
 
                                 # Numbers / dates stay real Excel numbers / dates
                                 # (like DBeaver); NULL becomes [NULL]
@@ -9925,15 +10597,6 @@ class DatabaseConnectorGUI:
                                         )
                                     )
 
-                            total_rows = len(df)
-                            if total_rows > max_rows:
-                                df = df.iloc[:max_rows]
-                                log(
-                                    f"   ⚠️ Rows เกินขีดจำกัด Excel: export {max_rows:,} จาก {total_rows:,} แถว\n"
-                                )
-                                log(f"Writing Sheet: {sheet}\n")
-                                log(f"Rows: {len(df)}\n")
-                                log(f"Columns: {len(df.columns)}\n")
                             from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
                             def preserve_illegal_chars(value):
@@ -9953,12 +10616,29 @@ class DatabaseConnectorGUI:
                                 ILLEGAL_CHARACTERS_RE.sub("", str(col)) for col in df.columns
                             ]
 
+                            job_warning = False
+                            if hasattr(df, "iloc"):
+                                for column_index, column_name in enumerate(df.columns):
+                                    column_values = df.iloc[:, column_index]
+                                    oversized = column_values.map(_excel_text_too_long)
+                                    if oversized.any():
+                                        df.iloc[:, column_index] = column_values.mask(
+                                            oversized, ""
+                                        )
+                                        job_warning = True
+                                        log(
+                                            f"⚠️ Warning: Job '{job_name}', column "
+                                            f"'{column_name}' contains string values over "
+                                            "Excel's 32,767-character limit; oversized cells "
+                                            "were left blank.\n"
+                                        )
+
                             log(f"Writing Sheet: {sheet}\n")
                             log(f"Rows: {len(df)}\n")
                             log(f"Columns: {len(df.columns)}\n")
                             df.to_excel(writer, sheet_name=sheet, index=False)
 
-                            log(f"✅ Sheet Exported: {sheet}\n\n")
+                            log(f"📄 Sheet Exported: {sheet}\n\n")
 
                             ws = writer.sheets[sheet]
 
@@ -9980,11 +10660,8 @@ class DatabaseConnectorGUI:
 
                             try:
                                 sql_text = query
-                                start_row = ws.max_row + 2
-
-                                for line_no, line in enumerate(sql_text.splitlines()):
-
-                                    cell = ws.cell(row=start_row + line_no, column=1, value=line)
+                                if append_sql_annotation(ws, sql_text, job_name):
+                                    job_warning = True
 
                             except Exception as e:
 
@@ -10039,8 +10716,12 @@ class DatabaseConnectorGUI:
                                     cell.fill = header_fill
                                     cell.border = all_border
                                     cell.number_format = "@"
-                            ok += 1
-                            log(f"   Status: ✅ Success ({time_module.time() - t0:.2f}s)\n")
+                            if job_warning:
+                                warnings += 1
+                                log(f"   Status: ⚠️ Warning ({time_module.time() - t0:.2f}s)\n")
+                            else:
+                                ok += 1
+                                log(f"   Status: ✅ Success ({time_module.time() - t0:.2f}s)\n")
                             log(f"   Rows: {len(df):,} | Columns: {df.shape[1]}\n\n")
                         except Exception as job_err:
                             failed += 1
@@ -10055,9 +10736,14 @@ class DatabaseConnectorGUI:
                             log("\n=================================\n")
 
                             # ยังสร้าง Sheet ของ Job นี้ไว้ เพื่อให้ 1 Job = 1 Sheet ครบ
+                            failed_row = blank_oversized_cells(
+                                job_name,
+                                {"Status": "Failed", "Error": str(job_err), "Query": query},
+                            )
                             pd.DataFrame(
-                                {"Status": ["Failed"], "Error": [str(job_err)], "Query": [query]}
+                                {k: [v] for k, v in failed_row.items()}
                             ).to_excel(writer, sheet_name=sheet, index=False)
+                            force_literal_strings(writer.sheets[sheet])
 
                     if not writer.sheets:
                         # Stopped before the first job: a workbook needs one sheet
@@ -10069,7 +10755,9 @@ class DatabaseConnectorGUI:
                 fatal_error = f"{type(e).__name__}: {str(e)}"
 
             elapsed = time_module.time() - start_all
-            self.root.after(0, lambda: on_done(ok, failed, skipped, elapsed, fatal_error))
+            self.root.after(
+                0, lambda: on_done(ok, failed, skipped, warnings, elapsed, fatal_error)
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -10173,8 +10861,7 @@ class DatabaseConnectorGUI:
                     if k != "last_used_profile" and isinstance(v, dict)
                 }
                 for profile in profiles.values():
-                    if "db_password" in profile:
-                        profile["db_password"] = unprotect_password(profile["db_password"])
+                    decrypt_profile_password(profile)
                 return profiles
             except Exception as e:
                 print(f"Error loading profiles: {e}")
@@ -10199,10 +10886,7 @@ class DatabaseConnectorGUI:
         """สร้างข้อมูลสำหรับเขียนไฟล์ - password ถูกเข้ารหัส, คง last_used_profile เดิมไว้"""
         data = {}
         for name, profile in self.saved_profiles.items():
-            profile_copy = dict(profile)
-            if profile_copy.get("db_password"):
-                profile_copy["db_password"] = protect_password(profile_copy["db_password"])
-            data[name] = profile_copy
+            data[name] = profile_password_for_disk(profile)
 
         if last_used_profile is None:
             last_used_profile = self.get_last_used_profile()
@@ -10210,10 +10894,10 @@ class DatabaseConnectorGUI:
             data["last_used_profile"] = last_used_profile
         return data
 
-    def save_profiles(self):
+    def save_profiles(self) -> bool:
         """บันทึก profiles ลงไฟล์ - ENHANCED with debugging"""
         if self._profiles_save_refused():
-            return
+            return False
         try:
             # Ensure directory exists
             config_dir = os.path.dirname(self.config_file)
@@ -10222,11 +10906,16 @@ class DatabaseConnectorGUI:
 
             data = self._profiles_for_disk()
             write_json_atomic(self.config_file, data)
+            return True
 
         except Exception as e:
             error_msg = f"❌ Cannot save profile!\n\nError: {str(e)}\n\nPath: {self.config_file}"
-            print(error_msg)
+            try:
+                print(error_msg)
+            except Exception:
+                pass  # console that cannot encode / is closed must not break return False
             messagebox.showerror("Save Error", error_msg)
+            return False
 
     def save_last_used_profile(self, profile_name):
         """บันทึก profile ล่าสุดที่ใช้"""
@@ -10436,12 +11125,9 @@ class DatabaseConnectorGUI:
             port_value = self.db_port.get().strip()
             if ":" in port_value:
                 port_value = port_value.split(":")[0]
-                # Update field with cleaned value
-                self.db_port.delete(0, tk.END)
-                self.db_port.insert(0, port_value)
 
             # บันทึก settings
-            self.saved_profiles[profile_name] = {
+            new_profile = {
                 "db_type": self.db_type.get(),
                 "db_user": self.db_user.get(),
                 "db_password": self.db_password.get(),  # บันทึก password ด้วย
@@ -10450,7 +11136,21 @@ class DatabaseConnectorGUI:
                 "db_name": self.db_name.get(),
                 "sql_query": self.sql_context.get(1.0, tk.END).strip(),
             }
-            self.save_profiles()
+            # Password left empty -> keep a stored password that cannot be
+            # decrypted here instead of wiping it
+            kept = self.saved_profiles.get(profile_name, {}).get(PROFILE_STORED_PASSWORD_KEY)
+            if kept and not new_profile["db_password"]:
+                new_profile[PROFILE_STORED_PASSWORD_KEY] = kept
+            previous_profiles = dict(self.saved_profiles)
+            self.saved_profiles[profile_name] = new_profile
+            if not self.save_profiles():
+                self.saved_profiles.clear()
+                self.saved_profiles.update(previous_profiles)
+                return
+
+            if port_value != self.db_port.get().strip():
+                self.db_port.delete(0, tk.END)
+                self.db_port.insert(0, port_value)
 
             # บันทึก last used profile
             self.save_last_used_profile(profile_name)
@@ -10460,6 +11160,7 @@ class DatabaseConnectorGUI:
             profile_names = list(self.saved_profiles.keys())
             if profile_name in profile_names:
                 self.profile_combo.current(profile_names.index(profile_name))
+            self.update_jobs_list()
             self._active_profile = profile_name
 
             self.results_text.insert(tk.END, f"💾 Saved profile: {profile_name}\n\n")
@@ -10666,7 +11367,7 @@ class DatabaseConnectorGUI:
                     test_btn.config(state="normal")
 
                 try:
-                    dialog.after(0, show)
+                    self.root.after(0, show)
                 except (tk.TclError, RuntimeError):
                     pass
 
@@ -10698,6 +11399,7 @@ class DatabaseConnectorGUI:
             if ":" in port_value:
                 port_value = port_value.split(":")[0]
 
+            previous_profiles = dict(self.saved_profiles)
             self.saved_profiles[profile_name] = {
                 "db_type": type_var.get(),
                 "db_user": user_entry.get().strip(),
@@ -10707,7 +11409,10 @@ class DatabaseConnectorGUI:
                 "db_name": dbname_entry.get().strip(),
                 "sql_query": self.DEFAULT_SQL_QUERY,
             }
-            self.save_profiles()
+            if not self.save_profiles():
+                self.saved_profiles.clear()
+                self.saved_profiles.update(previous_profiles)
+                return
             self.save_last_used_profile(profile_name)
 
             # เลือก Profile ใหม่และโหลดข้อมูลเข้าฟอร์ม
@@ -10759,8 +11464,12 @@ class DatabaseConnectorGUI:
             "Confirm Delete", f"ต้องการลบ Profile '{profile_name}' หรือไม่?"
         )
         if result:
+            previous_profiles = dict(self.saved_profiles)
             del self.saved_profiles[profile_name]
-            self.save_profiles()
+            if not self.save_profiles():
+                self.saved_profiles.clear()
+                self.saved_profiles.update(previous_profiles)
+                return
             self.update_profile_list()
             self.results_text.insert(tk.END, f"🗑️ Deleted profile: {profile_name}\n\n")
             self.results_text.see(tk.END)
@@ -10876,19 +11585,27 @@ class DatabaseConnectorGUI:
 
     @staticmethod
     def _append_where_conditions(sql, conditions):
-        """Add WHERE (or AND when the SQL already has WHERE) conditions."""
+        """Add "<column> IN (...)" conditions to the main statement's WHERE.
+
+        An existing top-level WHERE condition is wrapped in parentheses (so an
+        OR inside it cannot widen the result); new conditions go before
+        GROUP BY / ORDER BY / ... and before a trailing ';' or '/' line.
+        A condition with no values (all reset in an UPDATE / DELETE) becomes
+        1=0, so the statement affects no row instead of more rows.
+        Raises ValueError (from _sql_where_layout) when the place is not certain.
+        """
         if not conditions:
             return sql
-        body = sql.rstrip()
-        semicolon = ""
-        if body.endswith(";"):
-            body, semicolon = body[:-1].rstrip(), ";"
-        keyword = "AND" if re.search(r"\bWHERE\b", body, flags=re.IGNORECASE) else "WHERE"
-        lines = []
-        for column, sql_values in conditions:
-            lines.append(f"{keyword} {column} IN ({sql_values})")
-            keyword = "AND"
-        return body + "\n" + "\n".join(lines) + semicolon
+        layout = _sql_where_layout(sql)
+        added = "\nAND ".join(
+            f"{column} IN ({sql_values})" if str(sql_values).strip() else "1=0"
+            for column, sql_values in conditions
+        )
+        if layout.condition is not None:
+            start, end = layout.condition
+            return sql[:start] + "(" + sql[start:end] + ")" + "\nAND " + added + sql[end:]
+        at = layout.insert_at
+        return sql[:at] + "\nWHERE " + added + sql[at:]
 
     def _render_sql_template(self, parameter_values=None):
         import re
@@ -10909,15 +11626,26 @@ class DatabaseConnectorGUI:
                 )
                 continue
             if parameter_key == "__FIRST_IN_LIST__":
-                rendered_sql, replacements = re.subn(
-                    r"(\bIN\s*\()\s*[^)]*(\))",
-                    lambda match: f"{match.group(1)}{sql_values}{match.group(2)}",
-                    rendered_sql,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-                if not replacements:
-                    raise ValueError("SQL template no longer contains an IN (...) list")
+                tokens = list(_scan_sql(rendered_sql))
+                list_span = None
+                for index, token in enumerate(tokens[:-1]):
+                    if token[:2] != ("word", "IN") or tokens[index + 1][:2] != ("punct", "("):
+                        continue
+                    depth = 0
+                    for closing_token in tokens[index + 1 :]:
+                        if closing_token[:2] == ("punct", "("):
+                            depth += 1
+                        elif closing_token[:2] == ("punct", ")"):
+                            depth -= 1
+                            if depth == 0:
+                                list_span = (tokens[index + 1][4], closing_token[3])
+                                break
+                    if list_span is not None:
+                        break
+                if list_span is None:
+                    raise ValueError("SQL template does not contain an IN (...) list")
+                start, end = list_span
+                rendered_sql = rendered_sql[:start] + sql_values + rendered_sql[end:]
                 continue
 
             if parameter.startswith(":"):
@@ -10938,11 +11666,32 @@ class DatabaseConnectorGUI:
 
         return self._append_where_conditions(rendered_sql, where_conditions)
 
+    @classmethod
+    def _reset_parameter_value(cls, sql_template, parameter, remaining):
+        """Parameter entry after a Reset left `remaining` SQL tokens, or None
+        when the parameter goes back to its placeholder.
+
+        An Auto WHERE column left with no values in an UPDATE / DELETE (or a
+        statement whose type cannot be told) stays as an empty entry, which
+        _append_where_conditions renders as 1=0: dropping it would widen the
+        statement. In a SELECT the condition is dropped as before.
+        """
+        if remaining:
+            return (parameter, ", ".join(remaining))
+        if parameter == cls.AUTO_WHERE_PARAMETER and _where_main_command(sql_template) != "SELECT":
+            return (parameter, "")
+        return None
+
     def reset_single_parameter(self, parameter_key):
         if parameter_key not in self._excel_parameter_values:
             return
 
-        previous_value = self._excel_parameter_values.pop(parameter_key)
+        previous_value = self._excel_parameter_values[parameter_key]
+        emptied = self._reset_parameter_value(self.sql_template, previous_value[0], [])
+        if emptied is None:
+            self._excel_parameter_values.pop(parameter_key)
+        else:  # kept in place, so the order of the conditions does not change
+            self._excel_parameter_values[parameter_key] = emptied
         try:
             rendered_sql = (
                 self._render_sql_template() if self._excel_parameter_values else self.sql_template
@@ -11006,63 +11755,1100 @@ class DatabaseConnectorGUI:
             return token[1:-1].replace("''", "'")
         return token
 
-    # "<column> [NOT] IN (<values>)" — values may contain quoted ')' or ','
-    _IN_LIST_PATTERN = re.compile(
-        r"""(?P<col>(?:"[^"]+"|[A-Za-z_][\w$#]*)(?:\s*\.\s*(?:"[^"]+"|[A-Za-z_][\w$#]*))*)"""
-        r"""\s+(?:NOT\s+)?IN\s*\((?P<vals>(?:'(?:[^']|'')*'|[^'()])*)\)""",
-        re.IGNORECASE,
-    )
+    # SQL keywords never taken as an IN-list column name
+    _IN_LIST_KEYWORDS = frozenset({
+        "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "ON", "CASE", "WHEN",
+        "THEN", "ELSE", "END", "HAVING", "BY", "IS", "NULL", "EXISTS", "BETWEEN",
+        "LIKE", "AS", "DISTINCT", "ALL", "ANY", "SOME", "UNION", "JOIN", "SET",
+        "VALUES", "WITH", "GROUP", "ORDER", "INTERSECT", "EXCEPT", "MINUS",
+        "IF", "ELSIF", "WHILE",
+    })
+    # Tokens allowed right before an IN-list column (besides the SQL start,
+    # "(" and ","): anything else, e.g. `1 - n IN (5)`, makes the column part
+    # of a larger expression, so the list is not detected. IF / ELSIF / WHILE
+    # (PL/SQL conditions) are detected so the dialog can say why they are refused.
+    _IN_LIST_LEAD_WORDS = frozenset({
+        "NOT", "AND", "OR", "WHERE", "WHEN", "ON", "HAVING", "IF", "ELSIF", "WHILE",
+    })
+
+    @classmethod
+    def _is_name_token(cls, token: tuple) -> bool:
+        """A column-name part: a non-keyword word or a quoted identifier."""
+        if token[0] == "word":
+            return token[1] not in cls._IN_LIST_KEYWORDS
+        return token[0] == "ident"
+
+    @classmethod
+    def _is_in_list_lead(cls, token: Optional[tuple]) -> bool:
+        """True when token (None = SQL start) may come right before a column."""
+        if token is None:
+            return True
+        if token[0] == "punct":
+            return token[1] in ("(", ",")
+        return token[0] == "word" and token[1] in cls._IN_LIST_LEAD_WORDS
+
+    @classmethod
+    def _in_list_column_start(cls, tokens: list, in_index: int) -> Optional[int]:
+        """Index of the first token of the (dotted) column before
+        `[NOT] IN` at in_index, or None when there is no plain column or the
+        column is part of a larger expression (`1 - n IN (`)."""
+        index = in_index - 1
+        if index >= 0 and cls._is_not_word(tokens[index]):
+            index -= 1
+        if index < 0 or not cls._is_name_token(tokens[index]):
+            return None
+        while (index >= 2 and tokens[index - 1][:2] == ("punct", ".")
+               and cls._is_name_token(tokens[index - 2])):
+            index -= 2
+        if not cls._is_in_list_lead(tokens[index - 1] if index > 0 else None):
+            return None
+        return index
+
+    @staticmethod
+    def _in_list_value_tokens(sql: str, tokens: list, open_index: int,
+                              close_index: int) -> Optional[list]:
+        """Value texts of the list between tokens[open_index] '(' and
+        tokens[close_index] ')', split on ',' tokens of _scan_sql, so commas
+        in comments and strings never split a value. Comments between values
+        are dropped. None (skip the list) when it is empty, a subquery
+        (SELECT / WITH), has an empty value or a comment inside a value."""
+        inner = tokens[open_index + 1:close_index]
+        if not inner or (inner[0][0] == "word" and inner[0][1] in ("SELECT", "WITH")):
+            return None
+        groups, current = [], []
+        for token in inner:
+            if token[:2] == ("punct", ","):
+                groups.append(current)
+                current = []
+            else:
+                current.append(token)
+        groups.append(current)
+        values = []
+        for group in groups:
+            if not group:
+                return None
+            if any(sql[a[4]:b[3]].strip() for a, b in zip(group, group[1:])):
+                return None  # a comment inside one value
+            values.append(sql[group[0][3]:group[-1][4]])
+        return values
+
+    @staticmethod
+    def _in_list_close(tokens: list, open_index: int) -> Optional[int]:
+        """Index of the ')' closing tokens[open_index], or None when the list
+        has nested parentheses or is not closed."""
+        depth = tokens[open_index][2]
+        for index in range(open_index + 1, len(tokens)):
+            kind, value = tokens[index][0], tokens[index][1]
+            if kind == "punct" and value == "(":
+                return None
+            if kind == "punct" and value == ")" and tokens[index][2] == depth:
+                return index
+        return None
 
     @classmethod
     def _detect_sql_in_lists(cls, sql):
-        """Find literal IN (...) lists in SQL that has no tracked Excel parameters."""
+        """Find literal `<column> [NOT] IN (<values>)` lists in SQL that has
+        no tracked Excel parameters.
+
+        Uses _scan_sql tokens, so text inside comments and string literals is
+        never detected, and a comment between the column and IN is skipped.
+        """
+        sql = sql or ""
+        tokens = list(_scan_sql(sql))
         found = []
-        for match in cls._IN_LIST_PATTERN.finditer(sql or ""):
-            values = match.group("vals")
-            if re.match(r"\s*SELECT\b", values, flags=re.IGNORECASE):
+        for index, token in enumerate(tokens):
+            if token[:2] != ("punct", "(") or index == 0 or tokens[index - 1][:2] != ("word", "IN"):
                 continue
-            tokens = list(dict.fromkeys(cls._split_sql_values(values)))
-            if not tokens:
+            column_index = cls._in_list_column_start(tokens, index - 1)
+            close_index = cls._in_list_close(tokens, index)
+            if column_index is None or close_index is None:
                 continue
+            vals_span = (token[4], tokens[close_index][3])
+            values = cls._in_list_value_tokens(sql, tokens, index, close_index)
+            if not values:
+                continue
+            values_tokens = list(dict.fromkeys(values))
+            column_end = index - 1
+            if cls._is_not_word(tokens[column_end - 1]):
+                column_end -= 1
             found.append({
-                "column": re.sub(r"\s+", "", match.group("col")),
-                "span": match.span(),
-                "vals_span": match.span("vals"),
-                "tokens": tokens,
+                "column": "".join(sql[t[3]:t[4]] for t in tokens[column_index:column_end]),
+                "span": (tokens[column_index][3], tokens[close_index][4]),
+                "vals_span": vals_span,
+                "tokens": values_tokens,
             })
         return found
 
     @staticmethod
-    def _remove_sql_condition(sql, start, end):
-        """Remove the condition sql[start:end] plus its AND/OR (or WHERE if it is the only one)."""
-        before, after = sql[:start], sql[end:]
-        connective_before = re.search(r"\s*\b(?:AND|OR)\s*$", before, flags=re.IGNORECASE)
-        if connective_before:
-            return before[: connective_before.start()] + after
-        connective_after = re.match(r"\s*\b(?:AND|OR)\b\s*", after, flags=re.IGNORECASE)
-        if re.search(r"\bWHERE\s*$", before, flags=re.IGNORECASE):
-            if connective_after:
-                return before + after[connective_after.end():]
-            where = re.search(r"\s*\bWHERE\s*$", before, flags=re.IGNORECASE)
-            return before[: where.start()] + after
-        if connective_after:
-            return before + after[connective_after.end():]
-        return before + "1=1" + after
+    def _is_not_word(token: Optional[tuple]) -> bool:
+        return token is not None and token[0] == "word" and token[1] == "NOT"
+
+    # Reset (detected mode) of an IN list nested in parentheses is allowed only
+    # when every enclosing level provably keeps "fewer values -> fewer rows".
+    # Leads (besides the SQL start, "(" and ",") of a positive group / predicate
+    _RESET_POSITIVE_LEADS = frozenset({"AND", "OR", "WHERE", "WHEN", "ON", "HAVING"})
+    # Leads of a nested list's own predicate inside its subquery / group
+    _RESET_OWN_LEADS = frozenset({"AND", "OR", "WHERE", "ON"})
+    # Words that may follow a positive group: it is not compared or computed with
+    _RESET_FOLLOW_WORDS = frozenset({
+        "AND", "OR", "GROUP", "ORDER", "HAVING", "UNION", "INTERSECT", "MINUS",
+        "EXCEPT", "FETCH", "LIMIT", "OFFSET", "RETURNING", "FOR", "WINDOW",
+        "CONNECT", "START", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS",
+        "NATURAL",
+    })
+    # Clause words: the nearest one before a token tells which clause it is in
+    _RESET_CLAUSE_WORDS = frozenset({
+        "SELECT", "FROM", "WHERE", "ON", "HAVING", "SET", "GROUP", "ORDER", "USING",
+        "VALUES", "INTO", "CONNECT", "START", "RETURNING", "UPDATE", "DELETE", "MERGE",
+        "INSERT", "WITH", "UNION", "INTERSECT", "MINUS", "EXCEPT", "FETCH", "LIMIT",
+        "OFFSET", "WINDOW",
+    })
+    # Words in a subquery that make its rows depend on other rows (not monotone)
+    _RESET_UNSAFE_SUBQUERY_WORDS = frozenset({
+        "GROUP", "HAVING", "ROWNUM", "LIMIT", "FETCH", "OFFSET", "TOP", "CONNECT", "START",
+    })
+    _RESET_AGGREGATE_WORDS = frozenset({
+        "COUNT", "SUM", "MIN", "MAX", "AVG", "LISTAGG", "MEDIAN", "STDDEV", "VARIANCE",
+        "GROUP_CONCAT", "STRING_AGG", "ARRAY_AGG", "ROW_NUMBER", "RANK", "DENSE_RANK",
+        "FIRST_VALUE", "LAST_VALUE", "LAG", "LEAD", "NTILE", "OVER", "KEEP",
+    })
+
+    @staticmethod
+    def _token_before(tokens: list, index: int) -> Optional[tuple]:
+        return tokens[index - 1] if index > 0 else None
+
+    @staticmethod
+    def _is_word(token: Optional[tuple], words) -> bool:
+        return token is not None and token[0] == "word" and token[1] in words
+
+    @staticmethod
+    def _matching_close(tokens: list, open_index: int) -> Optional[int]:
+        """Index of the ")" closing tokens[open_index], or None."""
+        depth = tokens[open_index][2]
+        for index in range(open_index + 1, len(tokens)):
+            if tokens[index][:2] == ("punct", ")") and tokens[index][2] == depth:
+                return index
+        return None
+
+    @staticmethod
+    def _enclosing_parens(tokens: list, index: int) -> list:
+        """Indexes of the unclosed "(" before tokens[index], innermost first."""
+        found, balance = [], 0
+        for at in range(index - 1, -1, -1):
+            if tokens[at][:2] == ("punct", ")"):
+                balance += 1
+            elif tokens[at][:2] == ("punct", "("):
+                if balance:
+                    balance -= 1
+                else:
+                    found.append(at)
+        return found
 
     @classmethod
-    def _reset_sql_in_lists(cls, sql, in_lists, selected):
-        """Drop selected[i] tokens from in_lists[i] directly in the SQL text."""
+    def _clause_before(cls, tokens: list, index: int) -> Optional[int]:
+        """Index of the clause word (WHERE, ON, SELECT, ...) tokens[index] is in.
+        Enclosing parentheses that are not a subquery are looked through."""
+        balance = 0
+        for at in range(index - 1, -1, -1):
+            kind, value = tokens[at][0], tokens[at][1]
+            if (kind, value) == ("punct", ")"):
+                balance += 1
+            elif (kind, value) == ("punct", "("):
+                balance = max(0, balance - 1)
+            elif not balance and kind == "word" and value in cls._RESET_CLAUSE_WORDS:
+                return at
+        return None
+
+    @classmethod
+    def _is_outer_join_on(cls, tokens: list, on_index: int) -> bool:
+        """True unless the ON at on_index provably belongs to a plain / INNER JOIN."""
+        balance = 0
+        for at in range(on_index - 1, -1, -1):
+            kind, value = tokens[at][0], tokens[at][1]
+            if (kind, value) == ("punct", ")"):
+                balance += 1
+            elif (kind, value) == ("punct", "("):
+                if not balance:
+                    return True
+                balance -= 1
+            elif not balance and kind == "word" and value == "JOIN":
+                if cls._is_word(cls._token_before(tokens, at), cls._RESET_OUTER_JOIN_WORDS):
+                    return True
+                # an inner join, but a later RIGHT / FULL JOIN (or an earlier
+                # outer join) of the same FROM can turn it into an anti-join
+                return cls._from_has_outer_join(tokens, on_index)
+            elif not balance and kind == "word" and value in cls._RESET_CLAUSE_WORDS:
+                return True  # ON of MERGE or an unknown shape
+        return True
+
+    _RESET_OUTER_JOIN_WORDS = ("LEFT", "RIGHT", "FULL", "OUTER")
+
+    @classmethod
+    def _from_has_outer_join(cls, tokens: list, on_index: int) -> bool:
+        """True when the FROM that the ON at on_index belongs to (same
+        parentheses level) has any LEFT / RIGHT / FULL / OUTER JOIN."""
+        depth = tokens[on_index][2]
+        start = on_index
+        while start > 0 and not (tokens[start - 1][2] < depth
+                                 or cls._is_word(tokens[start - 1], ("FROM",))
+                                 and tokens[start - 1][2] == depth):
+            start -= 1
+        for at in range(start, len(tokens)):
+            kind, value, level = tokens[at][:3]
+            if level < depth or kind in ("semi", "sep"):
+                break  # the ")" closing this level / the end of the statement
+            if level != depth or kind != "word":
+                continue
+            if value in cls._RESET_CLAUSE_WORDS and value not in ("ON", "USING"):
+                break  # WHERE / GROUP / UNION ...: the end of this FROM
+            if value == "JOIN" and cls._is_word(cls._token_before(tokens, at),
+                                                cls._RESET_OUTER_JOIN_WORDS):
+                return True
+        return False
+
+    @classmethod
+    def _inside_case(cls, tokens: list, index: int) -> bool:
+        """True when tokens[index] lies in a CASE expression that is still
+        open at its own parentheses level (looking back to the clause word or
+        the enclosing "(")."""
+        balance = ends = 0
+        for at in range(index - 1, -1, -1):
+            kind, value = tokens[at][0], tokens[at][1]
+            if (kind, value) == ("punct", ")"):
+                balance += 1
+            elif (kind, value) == ("punct", "("):
+                if not balance:
+                    return False
+                balance -= 1
+            elif balance or kind != "word":
+                continue
+            elif value == "END":
+                ends += 1
+            elif value == "CASE":
+                if not ends:
+                    return True
+                ends -= 1
+            elif value in cls._RESET_CLAUSE_WORDS:
+                return False
+        return False
+
+    @classmethod
+    def _is_positive_lead(cls, token: Optional[tuple]) -> bool:
+        if token is None:
+            return True
+        if token[0] == "punct":
+            return token[1] in ("(", ",")
+        return cls._is_word(token, cls._RESET_POSITIVE_LEADS)
+
+    @classmethod
+    def _is_positive_follow(cls, token: Optional[tuple]) -> bool:
+        if token is None or token[0] in ("semi", "sep"):
+            return True
+        if token[0] == "punct":
+            return token[1] == ")"
+        return cls._is_word(token, cls._RESET_FOLLOW_WORDS)
+
+    _MERGE_ON_REASON = ("in the MERGE ON condition (removing values can change which rows "
+                        "are matched / inserted)")
+    _OUTER_ON_REASON = "in the ON condition of an outer (LEFT / RIGHT / FULL) JOIN"
+
+    @classmethod
+    def _is_merge_on(cls, tokens: list, on_index: int) -> bool:
+        """True when the ON at on_index is the ON of MERGE ... USING src ON."""
+        balance = 0
+        for at in range(on_index - 1, -1, -1):
+            kind, value = tokens[at][0], tokens[at][1]
+            if (kind, value) == ("punct", ")"):
+                balance += 1
+            elif (kind, value) == ("punct", "("):
+                if not balance:
+                    return False
+                balance -= 1
+            elif not balance and kind == "word" and value == "JOIN":
+                return False
+            elif not balance and kind == "word" and value in cls._RESET_CLAUSE_WORDS:
+                return value == "USING" and any(
+                    cls._is_word(t, ("MERGE",)) for t in tokens[:at])
+        return False
+
+    @classmethod
+    def _on_refusal(cls, tokens: list, on_index: int) -> Optional[str]:
+        """Why a list in the ON at on_index may not be reset, or None."""
+        if cls._is_merge_on(tokens, on_index):
+            return cls._MERGE_ON_REASON
+        if cls._is_outer_join_on(tokens, on_index):
+            return cls._OUTER_ON_REASON
+        return None
+
+    @classmethod
+    def _positive_clause_refusal(cls, tokens: list, index: int) -> Optional[str]:
+        """Why tokens[index] is not in a WHERE / inner-JOIN ON condition, or None."""
+        clause = cls._clause_before(tokens, index)
+        word = tokens[clause][1] if clause is not None else None
+        if word == "ON":
+            reason = cls._on_refusal(tokens, clause)
+            if reason:
+                return reason
+        if word not in ("WHERE", "ON"):
+            return f"in a {word or 'non-WHERE'} clause, not a WHERE / JOIN ON condition"
+        return None
+
+    @classmethod
+    def _subquery_body_refusal(cls, tokens: list, open_index: int, close_index: int,
+                               list_index: int) -> Optional[str]:
+        """Why removing rows inside this subquery could add rows outside, or None."""
+        depth = tokens[open_index][2] + 1
+        for at in range(open_index + 1, close_index):
+            kind, value, level = tokens[at][:3]
+            if kind != "word":
+                continue
+            if level == depth and value in ("MINUS", "EXCEPT", "INTERSECT") and at < list_index:
+                return f"inside a subquery with {value} before it"
+            if level == depth and value in cls._RESET_UNSAFE_SUBQUERY_WORDS:
+                return f"inside a subquery that uses {value}"
+            if value in cls._RESET_AGGREGATE_WORDS and (
+                    value == "OVER" or tokens[at + 1][:2] == ("punct", "(")):
+                return f"inside a subquery that uses {value}"
+        return None
+
+    @classmethod
+    def _enclosing_paren_refusal(cls, tokens: list, open_index: int, list_index: int,
+                                 scope: Optional[Tuple[int, int]] = None) -> Optional[str]:
+        """Why the "(" at open_index is not a provably positive level, or None.
+
+        Positive: `col IN (subquery)`, `EXISTS (subquery)` or a grouping "("
+        after a lead (start, "(", ",", AND, OR, WHERE, WHEN, ON, HAVING), none
+        of them after NOT or inside an open CASE, not followed by a
+        comparison / operator, in a WHERE / inner-JOIN ON condition (no outer
+        join anywhere in that FROM), and a subquery without MINUS /
+        EXCEPT / INTERSECT before the list, grouping, aggregates or row limits.
+
+        `scope` (start, end) of the statement is given only for UPDATE /
+        DELETE / INSERT / MERGE: then an inline view / parenthesised join in
+        an inner-joined FROM (_from_item_refusal) and a WITH (CTE) body used
+        only in positive places (_cte_refusal) are positive too.
+        """
+        close_index = cls._matching_close(tokens, open_index)
+        if close_index is None:
+            return "inside unbalanced parentheses"
+        if cls._inside_case(tokens, open_index):
+            return "inside a CASE expression"
+        prev = cls._token_before(tokens, open_index)
+        is_query = cls._is_word(tokens[open_index + 1], ("SELECT", "WITH"))
+        if cls._is_word(prev, ("ON",)) and cls._is_merge_on(tokens, open_index - 1):
+            return cls._MERGE_ON_REASON
+        if cls._is_from_item(tokens, open_index):
+            if scope is not None:
+                return cls._from_item_refusal(tokens, open_index, close_index, list_index,
+                                              is_query)
+            what = "an inline view" if is_query else "a parenthesised join"
+            return (f"inside {what} after {prev[1]} (only UPDATE / DELETE / INSERT / MERGE "
+                    "can reset one)")
+        if cls._is_word(prev, ("AS",)):
+            info = cls._cte_info(tokens, open_index)
+            if info is not None:
+                if scope is None:
+                    return (f"inside the WITH (CTE) body of {info['cte']['name']} "
+                            "(only UPDATE / DELETE / INSERT / MERGE can reset one)")
+                return cls._cte_refusal(tokens, info, list_index, scope)
+        if cls._is_word(prev, ("IN",)):
+            if cls._is_not_word(cls._token_before(tokens, open_index - 1)):
+                return "inside NOT IN (subquery)"
+            column = cls._in_list_column_start(tokens, open_index - 1)
+            if column is None or not is_query:
+                return "inside an IN (...) that is not `column IN (subquery)`"
+            lead = cls._token_before(tokens, column)
+            if cls._is_not_word(lead):
+                return "inside NOT column IN (subquery)"
+        elif cls._is_word(prev, ("EXISTS",)):
+            lead = cls._token_before(tokens, open_index - 1)
+            if cls._is_not_word(lead):
+                return "inside NOT EXISTS (subquery)"
+            if not is_query:
+                return "inside EXISTS without a subquery"
+        else:
+            lead = prev
+            if cls._is_not_word(lead):
+                return "inside NOT (...)"
+            if cls._is_word(lead, ("ALL", "ANY", "SOME")):
+                return f"inside a quantified comparison ({lead[1]} (subquery))"
+            if is_query and cls._is_positive_lead(lead):
+                return "inside a compared scalar subquery (its result is compared or computed with)"
+            if is_query and lead[0] != "word":
+                return f"inside a compared scalar subquery (after {lead[1]})"
+            if is_query:
+                return f"inside a subquery after {lead[1]} (not in a WHERE condition)"
+        if not cls._is_positive_lead(lead):
+            return "inside parentheses used in a comparison, function or expression"
+        follow = tokens[close_index + 1] if close_index + 1 < len(tokens) else None
+        if not cls._is_positive_follow(follow):
+            return "inside parentheses whose result is compared or used in an expression"
+        reason = cls._positive_clause_refusal(tokens, open_index)
+        if reason or not is_query:
+            return reason
+        return cls._subquery_body_refusal(tokens, open_index, close_index, list_index)
+
+    @classmethod
+    def _nested_own_refusal(cls, tokens: list, column: int, open_index: int) -> Optional[str]:
+        """Why a nested list's own predicate is not a plain condition, or None."""
+        if cls._inside_case(tokens, column):
+            return "inside a CASE expression"
+        lead = cls._token_before(tokens, column)
+        if cls._is_not_word(lead):
+            lead = cls._token_before(tokens, column - 1)
+        if not (lead is not None and (lead[:2] == ("punct", "(")
+                                      or cls._is_word(lead, cls._RESET_OWN_LEADS))):
+            return "part of a CASE, function or expression"
+        reason = cls._positive_clause_refusal(tokens, column)
+        if reason:
+            return reason
+        close_index = cls._matching_close(tokens, open_index)
+        if close_index is None:
+            return "inside unbalanced parentheses"
+        follow = tokens[close_index + 1] if close_index + 1 < len(tokens) else None
+        if not cls._is_positive_follow(follow):
+            return "compared or used in an expression"
+        return None
+
+    @classmethod
+    def _is_pure_select(cls, sql: str, tokens: list) -> bool:
+        """True for one plain SELECT (optionally WITH ... SELECT) that writes
+        nothing: not INSERT ... SELECT, MERGE, CREATE TABLE AS, SELECT INTO,
+        several statements, or a statement whose type cannot be told."""
+        body = list(tokens)
+        while body and body[-1][0] in ("semi", "sep"):
+            body.pop()
+        if any(t[0] in ("semi", "sep") for t in body):
+            return False
+        if _where_main_command(sql) != "SELECT":
+            return False
+        return not any(cls._is_word(t, cls._RESET_WRITE_WORDS) for t in body)
+
+    # Words that make a statement more than a read (any depth, fail safe)
+    _RESET_WRITE_WORDS = frozenset({
+        "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "INTO", "TRUNCATE", "DROP",
+        "ALTER",
+    })
+
+    @classmethod
+    def _statement_level_refusal(cls, tokens: list, top_index: int, start: int = 0,
+                                 end: Optional[int] = None) -> Optional[str]:
+        """Why a list at depth-0 position top_index (the list itself or its
+        outermost "(") could add rows through the statement's own query, or
+        None: its SELECT branch comes after MINUS / EXCEPT, or that branch has
+        a HAVING after it (rows removed before GROUP BY change the groups).
+        Only tokens of the statement [start, end) are looked at."""
+        end = len(tokens) if end is None else end
+        for at in range(top_index - 1, start - 1, -1):
+            if tokens[at][2] == 0 and cls._is_word(tokens[at], ("MINUS", "EXCEPT")):
+                return f"in a query after {tokens[at][1]} (rows it no longer removes come back)"
+        for at in range(top_index + 1, end):
+            if tokens[at][2] != 0:
+                continue
+            if cls._is_word(tokens[at], _WHERE_SET_OPERATORS):
+                break
+            if cls._is_word(tokens[at], ("HAVING",)):
+                return ("in a query with GROUP BY ... HAVING "
+                        "(fewer rows can change which groups match)")
+        return None
+
+    @classmethod
+    def _whitelist_refusal(cls, tokens: list, column: int, open_index: int, enclosing: list,
+                           scope: Optional[Tuple[int, int]] = None) -> Optional[str]:
+        """Nested: the list's own predicate and every enclosing level must be
+        provably positive. Top level: not inside a CASE, not in the ON of an
+        outer JOIN (or of an inner JOIN in a FROM with any outer join) or of
+        MERGE. `scope`: see _enclosing_paren_refusal."""
+        if enclosing:
+            reason = cls._nested_own_refusal(tokens, column, open_index)
+            for paren in enclosing:
+                if reason:
+                    break
+                reason = cls._enclosing_paren_refusal(tokens, paren, column, scope)
+            return reason
+        if cls._inside_case(tokens, column):
+            return "inside a CASE expression"
+        clause = cls._clause_before(tokens, column)
+        if clause is not None and tokens[clause][1] == "ON":
+            return cls._on_refusal(tokens, clause)
+        return None
+
+    # ---- FROM items: inline views and parenthesised joins (R2-T-fix2) ------
+    # Words at a FROM level that make its rows depend on other rows
+    _RESET_FROM_LEVEL_WORDS = frozenset({
+        "APPLY", "LATERAL", "PIVOT", "UNPIVOT", "MATCH_RECOGNIZE",
+    })
+    # Words after a FROM item that are not an alias
+    _RESET_FROM_NOT_ALIAS = frozenset({
+        "PIVOT", "UNPIVOT", "MATCH_RECOGNIZE", "SAMPLE", "TABLESAMPLE", "PARTITION",
+        "MODEL", "OUTER",
+    })
+
+    @classmethod
+    def _is_from_item(cls, tokens: list, index: int) -> bool:
+        """True when tokens[index] (a "(" or a name) starts an item of a FROM
+        list: right after FROM (not IS DISTINCT FROM), after JOIN, or after
+        a "," of a FROM clause."""
+        prev = cls._token_before(tokens, index)
+        if cls._is_word(prev, ("JOIN",)):
+            return True
+        if cls._is_word(prev, ("FROM",)):
+            return not cls._is_word(cls._token_before(tokens, index - 1), ("DISTINCT",))
+        if prev is not None and prev[:2] == ("punct", ","):
+            clause = cls._clause_before(tokens, index)
+            return clause is not None and tokens[clause][1] == "FROM"
+        return False
+
+    @staticmethod
+    def _level_range(tokens: list, index: int) -> Tuple[int, int]:
+        """(start, end) of the tokens at tokens[index]'s parentheses level
+        (deeper tokens included), stopping at ";" / "/"."""
+        depth = tokens[index][2]
+        start = index
+        while start > 0 and tokens[start - 1][2] >= depth and tokens[start - 1][0] not in (
+                "semi", "sep"):
+            start -= 1
+        end = index
+        while end < len(tokens) and tokens[end][2] >= depth and tokens[end][0] not in (
+                "semi", "sep"):
+            end += 1
+        return start, end
+
+    @classmethod
+    def _from_level_refusal(cls, tokens: list, index: int) -> Optional[str]:
+        """Why the FROM level holding tokens[index] may lose rows of an outer
+        side when this item loses rows (outer join, Oracle (+), APPLY,
+        LATERAL, PIVOT ...), or None."""
+        if cls._from_has_outer_join(tokens, index):
+            return "in a FROM that has an outer (LEFT / RIGHT / FULL) JOIN"
+        depth = tokens[index][2]
+        start, end = cls._level_range(tokens, index)
+        for at in range(start, end):
+            token = tokens[at]
+            if token[2] != depth:
+                continue
+            if cls._is_word(token, cls._RESET_FROM_LEVEL_WORDS):
+                return f"in a FROM that uses {token[1]}"
+            if (token[:2] == ("punct", "(") and at + 2 < end
+                    and tokens[at + 1][:2] == ("punct", "+")
+                    and tokens[at + 2][:2] == ("punct", ")")):
+                return "in a query with an Oracle (+) outer join"
+        return None
+
+    @classmethod
+    def _from_item_follow_ok(cls, tokens: list, last: int) -> bool:
+        """True when the FROM item ending at tokens[last] is followed only by
+        an optional [AS] alias and then the end, ")", ",", a JOIN / WHERE /
+        ON / USING or another clause (no PIVOT, column list, sampling ...)."""
+        def plain_follow(token: Optional[tuple]) -> bool:
+            return cls._is_positive_follow(token) or cls._is_word(
+                token, ("ON", "USING", "WHERE")) or (token is not None
+                                                    and token[:2] == ("punct", ","))
+
+        at = last + 1
+        token = tokens[at] if at < len(tokens) else None
+        if cls._is_word(token, ("AS",)):
+            at += 1
+            token = tokens[at] if at < len(tokens) else None
+            if token is None or not cls._is_name_token(token):
+                return False
+        if (token is not None and not plain_follow(token) and cls._is_name_token(token)
+                and not cls._is_word(token, cls._RESET_FROM_NOT_ALIAS)):
+            at += 1
+            token = tokens[at] if at < len(tokens) else None
+        return plain_follow(token)
+
+    @classmethod
+    def _from_position_refusal(cls, tokens: list, first: int, last: int) -> Optional[str]:
+        """Why the FROM item tokens[first..last] is not a provably positive
+        FROM item (inner / plain JOIN or comma list, FROM without outer
+        joins, nothing unchecked after it), or None."""
+        prev = cls._token_before(tokens, first)
+        if cls._is_word(prev, ("JOIN",)):
+            kind = cls._token_before(tokens, first - 1)
+            if cls._is_word(kind, cls._RESET_OUTER_JOIN_WORDS):
+                return f"in a FROM item of a {kind[1]} JOIN (outer join)"
+        reason = cls._from_level_refusal(tokens, first)
+        if reason:
+            return reason
+        if not cls._from_item_follow_ok(tokens, last):
+            return "in a FROM item followed by PIVOT, sampling or another unchecked clause"
+        return None
+
+    @classmethod
+    def _from_item_refusal(cls, tokens: list, open_index: int, close_index: int,
+                           list_index: int, is_query: bool) -> Optional[str]:
+        """Inline view `(SELECT ...)` or parenthesised join `(b JOIN c ON ...)`
+        in a FROM: positive when its JOIN is inner / plain (or a comma list),
+        that FROM has no outer join at all, and a view body has no set
+        operator before the list, grouping, aggregates, window functions or
+        row limits (_subquery_body_refusal)."""
+        reason = cls._from_position_refusal(tokens, open_index, close_index)
+        if reason:
+            return reason
+        if not is_query:
+            return None  # parenthesised join: its own ON / items are checked level by level
+        if any(cls._is_word(t, cls._RESET_WRITE_COMMANDS)
+               for t in tokens[open_index + 1:close_index]):
+            return "inside an inline view that is not a plain SELECT"
+        return cls._subquery_body_refusal(tokens, open_index, close_index, list_index)
+
+    # ---- WITH (CTE) bodies (R2-T-fix2) --------------------------------------
+    @staticmethod
+    def _name_key(token: tuple) -> str:
+        """Upper-cased name of a word / quoted identifier token."""
+        return token[1].strip('"`[]').upper()
+
+    @classmethod
+    def _parse_ctes(cls, tokens: list, with_index: int) -> Optional[dict]:
+        """The CTE list after the WITH at with_index: {"ctes": [{name,
+        name_index, open, close}], "main": index after the list, "recursive"},
+        or None when it is not a plain `WITH name [(cols)] AS (...) [, ...]`."""
+        count = len(tokens)
+        at = with_index + 1
+        recursive = at < count and cls._is_word(tokens[at], ("RECURSIVE",))
+        if recursive:
+            at += 1
+        ctes = []
+        while True:
+            if at >= count or not cls._is_name_token(tokens[at]):
+                return None
+            name_index = at
+            at += 1
+            if at < count and tokens[at][:2] == ("punct", "("):
+                close = cls._matching_close(tokens, at)
+                if close is None:
+                    return None
+                at = close + 1
+            if at + 1 >= count or not cls._is_word(tokens[at], ("AS",)) \
+                    or tokens[at + 1][:2] != ("punct", "("):
+                return None
+            close = cls._matching_close(tokens, at + 1)
+            if close is None:
+                return None
+            ctes.append({"name": cls._name_key(tokens[name_index]), "name_index": name_index,
+                         "open": at + 1, "close": close})
+            at = close + 1
+            if at < count and tokens[at][:2] == ("punct", ","):
+                at += 1
+                continue
+            return {"ctes": ctes, "main": at, "recursive": recursive}
+
+    @classmethod
+    def _cte_info(cls, tokens: list, open_index: int) -> Optional[dict]:
+        """The CTE whose body opens at open_index (with its WITH list), or None."""
+        depth = tokens[open_index][2]
+        for at in range(open_index - 1, -1, -1):
+            if tokens[at][2] < depth:
+                return None
+            if tokens[at][2] == depth and cls._is_word(tokens[at], ("WITH",)):
+                parsed = cls._parse_ctes(tokens, at)
+                if parsed is None:
+                    return None
+                cte = next((c for c in parsed["ctes"] if c["open"] == open_index), None)
+                if cte is None:
+                    return None
+                return dict(parsed, cte=cte, with_index=at)
+        return None
+
+    @classmethod
+    def _is_name_reference(cls, tokens: list, index: int, name: str) -> bool:
+        """tokens[index] is the bare name `name` (not `name.col` / `x.name`)."""
+        token = tokens[index]
+        if token[0] not in ("word", "ident") or cls._name_key(token) != name:
+            return False
+        dot = ("punct", ".")
+        before = cls._token_before(tokens, index)
+        after = tokens[index + 1] if index + 1 < len(tokens) else None
+        return not ((before is not None and before[:2] == dot)
+                    or (after is not None and after[:2] == dot))
+
+    @classmethod
+    def _cte_refusal(cls, tokens: list, info: dict, list_index: int,
+                     scope: Tuple[int, int]) -> Optional[str]:
+        """A list in a CTE body is positive when the CTE is not recursive,
+        its body is a plain SELECT passing _subquery_body_refusal, no other
+        CTE uses it, and every use of its name in the statement is a
+        positive FROM item (_cte_reference_refusal)."""
+        cte = info["cte"]
+        name, open_index, close_index = cte["name"], cte["open"], cte["close"]
+        if info["recursive"]:
+            return f"inside a recursive WITH (CTE {name})"
+        if not cls._is_word(tokens[open_index + 1], ("SELECT", "WITH")) or any(
+                cls._is_word(t, cls._RESET_WRITE_COMMANDS)
+                for t in tokens[open_index + 1:close_index]):
+            return f"inside CTE {name}, which is not a plain SELECT"
+        reason = cls._subquery_body_refusal(tokens, open_index, close_index, list_index)
+        if reason:
+            return f"{reason} (CTE {name})"
+        depth = tokens[info["with_index"]][2]
+        scope_end = scope[1] if depth == 0 else cls._level_range(tokens, info["with_index"])[1]
+        for ref in range(info["with_index"] + 1, scope_end):
+            if ref == cte["name_index"] or not cls._is_name_reference(tokens, ref, name):
+                continue
+            if open_index < ref < close_index:
+                return f"inside a recursive WITH (CTE {name} uses itself)"
+            other = next((c for c in info["ctes"] if c["open"] < ref < c["close"]), None)
+            if other is not None:
+                return f"inside CTE {name}, which another CTE ({other['name']}) uses"
+            if ref < info["main"]:
+                continue  # the WITH list itself (another CTE's name)
+            reason = cls._cte_reference_refusal(tokens, ref, info, scope)
+            if reason:
+                return f"inside CTE {name}, which is used {reason}"
+        return None
+
+    @classmethod
+    def _cte_reference_refusal(cls, tokens: list, ref: int, info: dict,
+                               scope: Tuple[int, int]) -> Optional[str]:
+        """Why the use of a CTE name at ref is not a positive FROM item: not
+        a FROM / inner-JOIN item, a FROM with an outer join, inside NOT
+        EXISTS / NOT IN / ALL / ANY / a compared scalar / CASE, or after
+        MINUS / EXCEPT / before HAVING. None when positive."""
+        if not cls._is_from_item(tokens, ref):
+            prev = cls._token_before(tokens, ref)
+            where = prev[1] if prev is not None else "the start"
+            return f"after {where} (not as a FROM / inner JOIN item)"
+        reason = cls._from_position_refusal(tokens, ref, ref)
+        if reason:
+            return reason
+        with_index = info["with_index"]
+        enclosing = [p for p in cls._enclosing_parens(tokens, ref) if p > with_index]
+        for paren in enclosing:
+            reason = cls._enclosing_paren_refusal(tokens, paren, ref, scope)
+            if reason:
+                return reason
+        top = enclosing[-1] if enclosing else ref
+        if tokens[with_index][2] == 0:
+            return cls._statement_level_refusal(tokens, top, scope[0], scope[1])
+        container = cls._enclosing_parens(tokens, with_index)[0]
+        close_index = cls._matching_close(tokens, container)
+        if close_index is None:
+            return "inside unbalanced parentheses"
+        return cls._subquery_body_refusal(tokens, container, close_index, top)
+
+    # ---- the statement a list belongs to; PL/SQL blocks (R2-T-fix2) ---------
+    _RESET_WRITE_COMMANDS = frozenset({"DELETE", "UPDATE", "INSERT", "MERGE"})
+    _RESET_DDL_OBJECT_WORDS = frozenset({
+        "TABLE", "VIEW", "INDEX", "SCHEMA", "SEQUENCE", "DATABASE", "PROCEDURE",
+        "FUNCTION", "TRIGGER", "TYPE", "USER", "ROLE", "EXTENSION", "PACKAGE", "SYNONYM",
+    })
+    # Words that may start a PL/SQL piece before its statement
+    _PLSQL_PREFIX_WORDS = frozenset({"BEGIN", "DECLARE", "ELSE", "LOOP", "EXCEPTION", "THEN"})
+    # Control-flow header word -> word that ends its condition (None: the ";")
+    _PLSQL_HEADERS = {
+        "IF": "THEN", "ELSIF": "THEN", "CASE": "THEN", "WHEN": "THEN", "WHILE": "LOOP",
+        "FOR": "LOOP", "EXIT": None, "CONTINUE": None,
+    }
+    _PLSQL_HEADER_REASONS = {
+        "IF": "in a PL/SQL IF / ELSIF condition (removing values can switch which branch runs)",
+        "CASE": "in a PL/SQL CASE / WHEN condition (removing values can switch which "
+                "branch runs)",
+        "WHILE": "in a PL/SQL WHILE condition (removing values can change how the loop runs)",
+        "FOR": "in a PL/SQL FOR loop / cursor (removing values changes the rows the "
+               "loop works on)",
+        "EXIT": "in a PL/SQL EXIT / CONTINUE WHEN condition (removing values can change "
+                "how the loop runs)",
+    }
+    _PLSQL_HEADER_REASONS.update({
+        "ELSIF": _PLSQL_HEADER_REASONS["IF"], "WHEN": _PLSQL_HEADER_REASONS["CASE"],
+        "CONTINUE": _PLSQL_HEADER_REASONS["EXIT"],
+    })
+    _ROW_COUNT_WORDS = frozenset({"ROWCOUNT", "FOUND", "NOTFOUND", "BULK_ROWCOUNT"})
+
+    @staticmethod
+    def _statement_bounds(tokens: list, index: int) -> Tuple[int, int]:
+        """(start, end) of the ";"-separated piece holding tokens[index]."""
+        start, end = 0, len(tokens)
+        for at in range(index - 1, -1, -1):
+            if tokens[at][0] in ("semi", "sep") and tokens[at][2] == 0:
+                start = at + 1
+                break
+        for at in range(index, len(tokens)):
+            if tokens[at][0] in ("semi", "sep") and tokens[at][2] == 0:
+                end = at
+                break
+        return start, end
+
+    @staticmethod
+    def _statement_count(tokens: list) -> int:
+        """Number of non-empty ";"-separated pieces."""
+        count, has_content = 0, False
+        for token in tokens:
+            if token[0] in ("semi", "sep") and token[2] == 0:
+                count += has_content
+                has_content = False
+            else:
+                has_content = True
+        return count + has_content
+
+    @classmethod
+    def _is_procedural(cls, tokens: list) -> bool:
+        """True for PL/SQL / T-SQL code: DECLARE, a BEGIN block (not BEGIN
+        TRANSACTION), IF / ELSIF / WHILE / LOOP at the top level (not DROP
+        TABLE IF EXISTS), @@ROWCOUNT, or CREATE PROCEDURE / FUNCTION ..."""
+        for at, token in enumerate(tokens):
+            if token[0] != "word" or token[2] != 0:
+                continue
+            value = token[1]
+            after = tokens[at + 1] if at + 1 < len(tokens) else None
+            if value == "BEGIN":
+                if not (after is None or after[0] in ("semi", "sep")
+                        or cls._is_word(after, ("TRAN", "TRANSACTION", "WORK"))):
+                    return True
+            elif value in ("DECLARE", "ELSIF", "WHILE", "LOOP") or value == "@@ROWCOUNT":
+                return True
+            elif value == "IF" and not cls._is_word(cls._token_before(tokens, at),
+                                                    cls._RESET_DDL_OBJECT_WORDS):
+                return True
+        return _is_plsql_block([t[1] for t in tokens if t[0] == "word"][:8])
+
+    @classmethod
+    def _statement_command(cls, tokens: list, start: int, end: int) -> Optional[str]:
+        """First command word of the statement [start, end) (the one after
+        the CTE list for WITH), or None when it cannot be told."""
+        if start >= end or tokens[start][0] != "word":
+            return None
+        command = tokens[start][1]
+        if command != "WITH":
+            return command
+        return next((tokens[at][1] for at in range(start + 1, end)
+                     if tokens[at][2] == tokens[start][2]
+                     and cls._is_word(tokens[at], cls._RESET_WRITE_COMMANDS | {"SELECT"})),
+                    None)
+
+    @classmethod
+    def _plsql_statement(cls, tokens: list, target: int, start: int,
+                         end: int) -> Tuple[Optional[str], int]:
+        """(refusal or None, index where the SQL statement holding
+        tokens[target] starts) for the PL/SQL piece [start, end): BEGIN /
+        DECLARE / ELSE / LOOP / THEN are skipped, IF / ELSIF / CASE / WHEN
+        ... THEN, WHILE / FOR ... LOOP and EXIT WHEN conditions are skipped
+        (refused when the list is in one), then the statement must be SQL."""
+        at = start
+        while at < end:
+            token = tokens[at]
+            word = token[1] if token[0] == "word" and token[2] == 0 else None
+            if word in cls._PLSQL_PREFIX_WORDS:
+                at += 1
+                continue
+            if word in cls._PLSQL_HEADERS:
+                stop = cls._PLSQL_HEADERS[word]
+                close = end if stop is None else next(
+                    (i for i in range(at + 1, end)
+                     if tokens[i][2] == 0 and cls._is_word(tokens[i], (stop,))), end)
+                if target < close:
+                    return cls._PLSQL_HEADER_REASONS[word], at
+                at = close + 1
+                continue
+            if word in cls._RESET_WRITE_COMMANDS or word in ("SELECT", "WITH"):
+                return None, at
+            if word == "CURSOR":
+                return "in a PL/SQL cursor definition (its rows can steer the block)", at
+            return ("in a PL/SQL statement that is not UPDATE / DELETE / INSERT / MERGE "
+                    "(its effect on the block cannot be told)"), at
+        return "in a PL/SQL block where its statement cannot be told", start
+
+    @classmethod
+    def _plsql_command_refusal(cls, tokens: list, start: int, end: int) -> Optional[str]:
+        """Why the SQL statement [start, end) inside a PL/SQL block can steer
+        the block: a SELECT (INTO), RETURNING ... INTO, or a block that
+        reads SQL%ROWCOUNT / %FOUND / %NOTFOUND / @@ROWCOUNT."""
+        command = cls._statement_command(tokens, start, end)
+        top = [t for t in tokens[start:end] if t[2] == 0]
+        if command not in cls._RESET_WRITE_COMMANDS:
+            if any(cls._is_word(t, ("INTO",)) for t in top):
+                return ("in a SELECT ... INTO inside a PL/SQL block (fewer rows can change "
+                        "the variables and which branch runs)")
+            return "in a query inside a PL/SQL block (its rows can steer the block)"
+        if any(cls._is_word(t, ("RETURNING",)) for t in top):
+            return ("in a statement with RETURNING ... INTO inside a PL/SQL block (the "
+                    "returned values can steer the block)")
+        for at, token in enumerate(tokens):
+            if token[0] == "word" and token[1] == "@@ROWCOUNT" or (
+                    token[:2] == ("punct", "%") and at + 1 < len(tokens)
+                    and cls._is_word(tokens[at + 1], cls._ROW_COUNT_WORDS)):
+                return ("in a block that reads SQL%ROWCOUNT / %FOUND / %NOTFOUND / "
+                        "@@ROWCOUNT (fewer rows changed can switch which branch runs)")
+        return None
+
+    @classmethod
+    def _write_target(cls, tokens: list, start: int, end: int) -> Optional[str]:
+        """Upper-cased (last part of the) name of the table the statement
+        [start, end) writes: INSERT / MERGE / SELECT INTO t, UPDATE t,
+        DELETE [FROM] t, CREATE ... TABLE t; None when it cannot be told."""
+        top = [at for at in range(start, end) if tokens[at][2] == 0]
+        found = next((at for at in top if cls._is_word(
+            tokens[at], ("INTO", "UPDATE", "DELETE", "TABLE"))), None)
+        if found is None:
+            return None
+        before = cls._token_before(tokens, found)
+        if cls._is_word(before, ("ALL", "FIRST")):
+            return None  # multi-table INSERT ALL / FIRST
+        at = found + 1
+        if tokens[found][1] == "DELETE" and at < end and cls._is_word(tokens[at], ("FROM",)):
+            at += 1
+        if at < end and cls._is_word(tokens[at], ("ALL", "FIRST", "ONLY", "TOP")):
+            return None
+        name = None
+        while at < end and cls._is_name_token(tokens[at]):
+            name = cls._name_key(tokens[at])
+            if at + 2 < end and tokens[at + 1][:2] == ("punct", "."):
+                at += 2
+                continue
+            break
+        return name
+
+    @classmethod
+    def _other_statement_refusal(cls, tokens: list, start: int, end: int) -> Optional[str]:
+        """With several statements (or a PL/SQL block): a statement that
+        writes a table another statement also names could feed it fewer
+        rows (e.g. INSERT INTO tmp ...; DELETE ... WHERE k NOT IN (SELECT k
+        FROM tmp)), so it is refused; None when no other statement uses it."""
+        command = cls._statement_command(tokens, start, end)
+        top = [t for t in tokens[start:end] if t[2] == 0]
+        if command == "SELECT" and not any(cls._is_word(t, ("INTO",)) for t in top):
+            return None  # writes nothing
+        target = cls._write_target(tokens, start, end)
+        if target is None:
+            return ("in a statement whose target table cannot be told, next to other "
+                    "statements that could read it")
+        for at, token in enumerate(tokens):
+            if start <= at < end:
+                continue
+            if token[0] in ("word", "ident") and cls._name_key(token) == target:
+                return (f"in a statement that writes {target}, which another statement in "
+                        "the SQL also uses (fewer rows written there can make it affect "
+                        "more rows)")
+        return None
+
+    @classmethod
+    def _statement_scope_refusal(cls, tokens: list, column: int, start: int,
+                                 end: int) -> Tuple[Optional[str], int]:
+        """(refusal or None, statement start) of the list at tokens[column]
+        whose ";"-separated piece is [start, end). PL/SQL / T-SQL blocks:
+        only a list of an UPDATE / DELETE / INSERT / MERGE statement may be
+        reset (not SELECT ... INTO, cursor / FOR loops, IF / ELSIF / WHILE /
+        EXIT WHEN / CASE conditions, RETURNING INTO, %ROWCOUNT readers).
+        Several statements: one that writes a table another one names is
+        refused (_other_statement_refusal)."""
+        several = cls._statement_count(tokens) > 1
+        if cls._is_procedural(tokens):
+            reason, start = cls._plsql_statement(tokens, column, start, end)
+            if not reason:
+                reason = cls._plsql_command_refusal(tokens, start, end)
+            if reason:
+                return reason, start
+            several = True
+        if several:
+            return cls._other_statement_refusal(tokens, start, end), start
+        return None, start
+
+    @classmethod
+    def _enclosing_negation(cls, tokens: list, enclosing: list) -> Optional[str]:
+        """NOT (...), NOT EXISTS (...), NOT IN (...) or NOT col IN (...) that
+        encloses the list, or None (the emptied-list rule of pure SELECT)."""
+        for paren in enclosing:
+            prev = cls._token_before(tokens, paren)
+            if cls._is_not_word(prev):
+                return "NOT (...)"
+            before = cls._token_before(tokens, paren - 1)
+            if cls._is_word(prev, ("EXISTS",)) and cls._is_not_word(before):
+                return "NOT EXISTS (subquery)"
+            if cls._is_word(prev, ("IN",)):
+                if cls._is_not_word(before):
+                    return "NOT IN (subquery)"
+                column = cls._in_list_column_start(tokens, paren - 1)
+                if column is not None and cls._is_not_word(cls._token_before(tokens, column)):
+                    return "NOT column IN (subquery)"
+        return None
+
+    @classmethod
+    def _in_list_reset_refusal(cls, sql: str, item: dict, emptied: bool) -> Optional[str]:
+        """Error text when resetting the detected IN list `item` of sql could
+        make the statement match more rows, or None when the reset is safe.
+
+        Every statement: the statement-level rules (_statement_level_refusal:
+        after MINUS / EXCEPT, before a HAVING). UPDATE / DELETE / INSERT ...
+        SELECT / MERGE / unknown statements also get the whitelist
+        (_whitelist_refusal): any reset (partial or empty) that is not
+        provably positive is refused. A pure SELECT only reads, so (user
+        decision) it skips the whitelist. Then, for every statement, an
+        emptied `col NOT IN (` / `NOT col IN (` or a list emptied under NOT
+        (...) / NOT EXISTS / NOT IN is refused. `_scan_sql` skips strings and
+        comments.
+
+        R2-T-fix2: the rules look at the statement holding the list
+        (_statement_scope_refusal: PL/SQL control flow, several statements).
+        Only in UPDATE / DELETE / INSERT / MERGE may the list sit in an
+        inner-joined inline view / parenthesised join or a positively used
+        WITH (CTE) body.
+        """
+        tokens = list(_scan_sql(sql))
+        column = next(i for i, t in enumerate(tokens) if t[3] >= item["span"][0])
+        open_index = next(i for i, t in enumerate(tokens) if t[4] >= item["vals_span"][0])
+        name = item["column"]
+        enclosing = cls._enclosing_parens(tokens, column)
+        start, end = cls._statement_bounds(tokens, column)
+        reason = None
+        if not cls._is_pure_select(sql, tokens):
+            procedural = cls._is_procedural(tokens)
+            scope_reason, start = cls._statement_scope_refusal(tokens, column, start, end)
+            writes = cls._statement_command(tokens, start, end) in cls._RESET_WRITE_COMMANDS
+            scope = (start, end) if writes and not scope_reason else None
+            reason = cls._whitelist_refusal(tokens, column, open_index, enclosing, scope)
+            if procedural and not reason and not enclosing:
+                reason = cls._positive_clause_refusal(tokens, column)
+            if scope_reason:
+                reason = f"{scope_reason}; also {reason}" if reason else scope_reason
+        if not reason:
+            reason = cls._statement_level_refusal(
+                tokens, enclosing[-1] if enclosing else column, start, end)
+        if reason:
+            return (f"Cannot reset {name} IN (...): it is {reason}, so removing values "
+                    "could make the statement affect more rows (up to every row) — "
+                    "edit the SQL by hand")
+        if not emptied:
+            return None
+        if cls._is_not_word(tokens[open_index - 2]):
+            negated = f"{name} NOT IN (...)"
+        elif cls._is_not_word(cls._token_before(tokens, column)):
+            negated = f"NOT {name} IN (...)"
+        else:
+            outer = cls._enclosing_negation(tokens, enclosing)
+            if outer is None:
+                return None
+            return (f"Cannot reset {name} IN (...): it is inside {outer}; with no values "
+                    "left it would match every row — keep at least one value or edit "
+                    "the SQL by hand")
+        return (f"{negated} would have no values left, which matches every row — "
+                "keep at least one value or edit the SQL by hand")
+
+    @classmethod
+    def _reset_sql_in_lists(cls, sql: str, in_lists: list, selected: dict) -> str:
+        """Drop selected[i] tokens from in_lists[i] directly in the SQL text.
+
+        A list left empty becomes 1=0 (IN: matches no row, in place, so the
+        WHERE / AND / OR around it stay valid). A reset that could make the
+        statement match more rows (see _in_list_reset_refusal: an emptied
+        negated list, a list nested in a level that is not provably positive,
+        an outer-JOIN ON) raises ValueError instead; then no SQL is returned.
+        """
         for index in sorted(range(len(in_lists)), key=lambda i: -in_lists[i]["span"][0]):
             chosen = selected.get(index)
             if not chosen:
                 continue
             item = in_lists[index]
             remaining = [token for token in item["tokens"] if token not in chosen]
+            error = cls._in_list_reset_refusal(sql, item, emptied=not remaining)
+            if error:
+                raise ValueError(error)
             if remaining:
                 start, end = item["vals_span"]
                 sql = sql[:start] + ", ".join(remaining) + sql[end:]
-            else:
-                sql = cls._remove_sql_condition(sql, *item["span"])
+                continue
+            span_start, span_end = item["span"]
+            sql = sql[:span_start] + "1=0" + sql[span_end:]
         return sql
 
     def show_reset_parameter_dialog(self, close_after_selected=False, wait=False):
@@ -11098,7 +12884,10 @@ class DatabaseConnectorGUI:
         tk.Label(
             _head,
             text="เลือกคอลัมน์ แล้วติ๊กค่าที่ต้องการเอาออกจาก SQL "
-                 "(ถ้าเอาออกครบทุกค่า คอลัมน์นั้นจะกลับเป็น placeholder เดิม)",
+                 "(ถ้าเอาออกครบทุกค่า: parameter กลับเป็นค่าเดิมใน template; "
+                 "Auto WHERE / IN-list ที่เอาออกครบจะกลายเป็น 1=0; "
+                 "ถ้า Reset แล้วอาจกระทบแถวมากขึ้นใน UPDATE/DELETE/INSERT/MERGE "
+                 "จะ Reset ไม่ได้)",
             bg=CARD, fg=UI["muted"], font=UI_FONT_SM,
         ).pack(anchor="w")
 
@@ -11282,9 +13071,11 @@ class DatabaseConnectorGUI:
                     result[key] = (parameter, sql_values)
                     continue
                 remaining = [t for t in column_tokens.get(key, []) if t not in chosen]
-                if remaining:
-                    result[key] = (parameter, ", ".join(remaining))
-                # all values removed -> parameter goes back to its placeholder
+                # all values removed -> placeholder again, or 1=0 for an
+                # Auto WHERE column of an UPDATE / DELETE
+                value = self._reset_parameter_value(self.sql_template, parameter, remaining)
+                if value is not None:
+                    result[key] = value
             return result
 
         def render_sql(values):
@@ -11296,7 +13087,10 @@ class DatabaseConnectorGUI:
 
         def refresh_sql_preview():
             if detected_mode:
-                preview_sql = build_detected_sql()
+                try:
+                    preview_sql = build_detected_sql()
+                except ValueError as error:
+                    preview_sql = f"{source_sql}\n\n-- {error}"
             else:
                 try:
                     preview_sql = render_sql(build_reset_values())
@@ -11415,8 +13209,13 @@ class DatabaseConnectorGUI:
                 return
             if detected_mode:
                 # Values were typed into the SQL: edit the SQL text directly
+                try:
+                    new_sql = build_detected_sql()
+                except ValueError as error:  # e.g. NOT IN (...) left empty
+                    messagebox.showerror("Reset Error", str(error), parent=dialog)
+                    return
                 self.sql_context.delete("1.0", tk.END)
-                self.sql_context.insert("1.0", build_detected_sql())
+                self.sql_context.insert("1.0", new_sql)
                 dialog.destroy()
                 return
             new_values = build_reset_values()
@@ -11431,7 +13230,11 @@ class DatabaseConnectorGUI:
             if self.debug_mode.get():
                 print(f"[Excel Parameter Debug] Reset values; remaining="
                       f"{list(self._excel_parameter_values)}")
-            if close_after_selected or not self._excel_parameter_values:
+            values_left = any(
+                self._split_sql_values(sql_values)
+                for _parameter, sql_values in self._excel_parameter_values.values()
+            )
+            if close_after_selected or not values_left:
                 dialog.destroy()
                 return
             column_selected.clear()
@@ -11452,7 +13255,10 @@ class DatabaseConnectorGUI:
 
         if detected_mode:
             # Nothing tracked to restore — values come from IN (...) lists in the SQL
-            tk.Label(_footer_bar, text="ค่าจาก IN (...) ใน SQL · ถ้าเอาออกครบทุกค่า เงื่อนไขนั้นจะถูกลบ",
+            tk.Label(_footer_bar,
+                     text="ค่าจาก IN (...) ใน SQL · IN-list ที่เอาออกครบจะกลายเป็น 1=0 · "
+                          "ถ้า Reset แล้วอาจกระทบแถวมากขึ้นใน UPDATE/DELETE/INSERT/MERGE "
+                          "จะ Reset ไม่ได้",
                      bg=UI["surface"], fg=UI["muted"], font=UI_FONT_SM).pack(side="left")
         else:
             _o, _ = ui_button(_footer_bar, "Reset All Parameters", reset_all, kind="danger",
@@ -11580,8 +13386,7 @@ class DatabaseConnectorGUI:
 
         import re
 
-        placeholder_pattern = r"\{\{?\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}?|:[A-Za-z_][A-Za-z0-9_]*"
-        placeholders = list(dict.fromkeys(re.findall(placeholder_pattern, sql_template)))
+        placeholders = _detect_sql_placeholders(sql_template)
         auto_where_choice = "Auto WHERE (Excel column)"
         # One choice per "<column> IN (...)" list, so values go into the right column
         in_list_choices = {}  # combobox text -> SQL column
@@ -12289,6 +14094,12 @@ class DatabaseConnectorGUI:
 
     def on_closing(self):
         """Handle window close event - save current profile as last used"""
+        if self._is_busy() and not messagebox.askyesno(
+            "Confirm Exit",
+            "A task is still running. Are you sure you want to close the application?",
+            parent=self.root,
+        ):
+            return
         current_profile = self.profile_combo.get()
         if current_profile and current_profile in self.saved_profiles:
             self.save_last_used_profile(current_profile)
