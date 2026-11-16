@@ -11,6 +11,10 @@ script_groups.json
 script_groups_backup.json
 app_settings.json
 logs/
+
+# Real bank data: presets and copies of unreadable data files
+preset_*.json
+*_unreadable_*.json
 robot_tests/results/
 
 # Robot Framework output when run from the project root
@@ -19,3 +23,8 @@ robot_tests/results/
 /output.xml
 /interactive_console_output.xml
 /screenshots/
+
+# PyInstaller build output
+/build/
+/dist/
+*.spec
