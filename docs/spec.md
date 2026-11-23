@@ -1171,7 +1171,7 @@ stdout ที่ encode "❌" ไม่ได้ หมายถึง `io.TextI
 | AC | Given / When / Then |
 |---|---|
 | R10-AC-14 | **Given** ไฟล์เดิมที่ถูกล็อกแบบ Excel ตั้งแต่ก่อนเริ่ม **When** export **Then** fail ก่อนรัน query (R10-Q-3): `read_sql_dataframe` **ไม่ถูกเรียก**, `showerror` 1 ครั้ง title `"Export Error"` ข้อความมี `file_path` และสาเหตุ (`PermissionError` / ข้อความว่าไฟล์ถูกเปิดอยู่), ไฟล์เดิมไม่เปลี่ยน, ไม่มี temp ค้าง — คงพฤติกรรม fail เร็วของโค้ดเดิม |
-| R10-AC-15 | **Given** ไฟล์เดิมไม่ถูกล็อกตอนเริ่ม แต่ถูกล็อกแบบ Excel ใน `read_sql_dataframe` ของ Job สุดท้าย (จำลองผู้ใช้เปิดไฟล์ระหว่าง export) และ test แบบไม่ขึ้นกับ OS ที่ patch `os.replace` ให้ raise `PermissionError` **When** export จบ **Then** (ตาม R10-Q-3) ไฟล์เดิมไม่เปลี่ยน, ไฟล์ temp ที่ save ครบ **ถูกเก็บไว้** และ `openpyxl` เปิดได้ครบทุก sheet ของ export, `showerror` 1 ครั้งข้อความมี `file_path`, temp path และสาเหตุ, Execution Logs มีข้อมูลเดียวกัน, ไม่มี `showinfo` และไม่มีไฟล์ temp อื่นค้าง |
+| R10-AC-15 | **Given** ไฟล์เดิมไม่ถูกล็อกตอนเริ่ม แต่ถูกล็อกแบบ Excel ใน `read_sql_dataframe` ของ Job สุดท้าย (จำลองผู้ใช้เปิดไฟล์ระหว่าง export) และ test แบบไม่ขึ้นกับ OS ที่ patch `os.replace` ให้ raise `PermissionError` **When** export จบ **Then** (ตาม R10-Q-3) ไฟล์เดิมไม่เปลี่ยน, ไฟล์ temp ที่ save ครบ **ถูกเก็บไว้** และ `openpyxl` เปิดได้ครบทุก sheet ของ export, `showerror` 1 ครั้งข้อความมี `file_path`, temp path และสาเหตุ, Execution Logs มีข้อมูลเดียวกัน, ไม่มี `showinfo` และไม่มีไฟล์ temp อื่นค้าง — **หมายเหตุ (2026-11-23, R13-AC-11): ส่วน "replace ล้มครั้งเดียวแล้วเก็บ temp" ถูกแทนที่โดย R12-5 ที่ผู้ใช้สั่ง — `os.replace` ที่ล้มด้วย `PermissionError` ถูก retry ตาม `EXPORT_REPLACE_RETRY_DELAYS` (0.2 / 0.5 / 1.0 วินาที รวม 1 + 3 ครั้ง) ก่อน แล้วจึงเก็บ temp + แจ้ง path ตาม AC นี้; `OSError` อื่นไม่ retry (ดู `docs/tasks.md` R12-5) ห้าม Round ถัดไปแก้กลับเป็น replace ครั้งเดียว** |
 
 #### Stop (พฤติกรรมไฟล์เท่านั้น — ข้อความเป็นเรื่องของ B12)
 
@@ -1220,7 +1220,7 @@ stdout ที่ encode "❌" ไม่ได้ หมายถึง `io.TextI
 |---|---|---|
 | R10-Q-1 | ชื่อ / ที่อยู่ไฟล์ temp: (ก) ชื่อตายตัว `<stem>.tmp.xlsx` ตามที่ bug-hunter เสนอ, (ข) ชื่อไม่ซ้ำแบบสร้าง exclusive ในโฟลเดอร์เดียวกัน เช่น `<stem>.<สุ่ม>.tmp.xlsx` (`tempfile.mkstemp(dir=<โฟลเดอร์ปลายทาง>, prefix=f"{stem}.", suffix=".tmp.xlsx")`) | (ข) — ชื่อตายตัวอาจเขียนทับ / ลบไฟล์ของผู้ใช้ที่บังเอิญชื่อตรงกัน หรือชนกันเมื่อ export สองครั้งไปปลายทางเดียวกัน (R10-AC-3); ลงท้าย `.xlsx` ให้เปิดดูได้ถ้าค้าง; ไม่ใช้ prefix `~$` (ชนกับไฟล์ lock ของ Excel) และไม่ใช้ `%TEMP%` (R10-AC-2) |
 | R10-Q-2 | กด Stop แล้วจะ (ก) แทนที่ไฟล์ปลายทางด้วย workbook บางส่วนเหมือนเดิม (ผ่าน temp + replace), (ข) ถือเป็นยกเลิก — ลบ temp และคงไฟล์เดิม, (ค) ถามผู้ใช้ตอน Stop | (ก) — คงพฤติกรรมเดิมของ Stop ให้มากที่สุดเพราะ B12 (ข้อความ / ความหมายของ Stop) อยู่นอกขอบเขต; การเปลี่ยนความหมาย Stop ควรตัดสินพร้อม B12 (R10-AC-16, R10-AC-17) ถ้าผู้ใช้เลือก (ข) ให้แก้ R10-AC-16/17 เป็น "ไฟล์เดิมไม่เปลี่ยน + ไม่มี temp" |
-| R10-Q-3 | ไฟล์ปลายทางถูกล็อก (Excel เปิดอยู่): ตอนเริ่ม และตอน `os.replace` ล้มหลังรันเสร็จ จะทำอย่างไร | ตอนเริ่ม: ตรวจก่อนรัน query แล้ว fail เร็วพร้อม `showerror` (คงพฤติกรรมเดิมที่ `ExcelWriter` fail ทันที — R10-AC-14); ตอน replace ล้ม: **เก็บ temp ที่สมบูรณ์ไว้** แล้วแจ้ง path ปลายทาง, path temp และสาเหตุ ให้ผู้ใช้ปิด Excel แล้วเปลี่ยนชื่อเอง ไม่ทิ้งผลที่รันมาหลายชั่วโมง (R10-AC-15); ไม่ retry อัตโนมัติ ไม่มี dialog ถามซ้ำ |
+| R10-Q-3 | ไฟล์ปลายทางถูกล็อก (Excel เปิดอยู่): ตอนเริ่ม และตอน `os.replace` ล้มหลังรันเสร็จ จะทำอย่างไร | ตอนเริ่ม: ตรวจก่อนรัน query แล้ว fail เร็วพร้อม `showerror` (คงพฤติกรรมเดิมที่ `ExcelWriter` fail ทันที — R10-AC-14); ตอน replace ล้ม: **เก็บ temp ที่สมบูรณ์ไว้** แล้วแจ้ง path ปลายทาง, path temp และสาเหตุ ให้ผู้ใช้ปิด Excel แล้วเปลี่ยนชื่อเอง ไม่ทิ้งผลที่รันมาหลายชั่วโมง (R10-AC-15); ไม่ retry อัตโนมัติ ไม่มี dialog ถามซ้ำ — **หมายเหตุ (2026-11-23, R13-AC-11): "ไม่ retry อัตโนมัติ" ถูกแทนที่โดย R12-5 ที่ผู้ใช้สั่ง — ตอน replace ล้มด้วย `PermissionError` ให้ retry อัตโนมัติตาม `EXPORT_REPLACE_RETRY_DELAYS` (0.2 / 0.5 / 1.0 วินาที) ก่อน ถ้ายังล้มจึงเก็บ temp ตามเดิม; ส่วน "ตอนเริ่ม fail เร็ว" และ "ไม่มี dialog ถามซ้ำ" ยังคงเดิม** |
 | R10-Q-4 | fatal error หลังเขียนไปแล้วบาง sheet: (ก) คงไฟล์เดิม ลบ temp (เปลี่ยนจากเดิมที่เขียน workbook บางส่วนทับ), (ข) แทนที่ด้วย workbook บางส่วนเหมือนเดิม | (ก) — คือหัวใจของ B3 "ไฟล์เดิมไม่เปลี่ยนจนกว่า export สำเร็จ"; workbook บางส่วนจาก fatal ไม่มีสัญญาณบอกว่าไม่ครบ (R10-AC-9) |
 | R10-Q-5 | `tests/test_r4_excel_row_limit.py` mock `pd.ExcelWriter` ด้วย writer ปลอมที่ไม่สร้างไฟล์ และใช้ path สัมพัทธ์ `"export.xlsx"` — หลังแก้ `os.replace` จะหา temp ไม่เจอ / อาจสร้างไฟล์ใน repo: อนุญาตให้ปรับ harness หรือบังคับให้ design เข้ากันได้โดยไม่แก้ test | อนุญาตให้ปรับ **เฉพาะ harness** (path ใน `TemporaryDirectory`, stub การแทนที่ไฟล์) ไม่แตะ assertion ตามหลัก R7-AC-27 และรายงานไฟล์ที่ปรับ (R10-AC-20); ถ้า design ทำให้ผ่านได้โดยไม่แก้ก็ไม่ต้องปรับ |
 | R10-Q-6 | temp ที่ค้างจากการปิดแอป / kill process ระหว่าง export ควรถูกล้างอัตโนมัติ (เช่นตอนเปิดแอปครั้งถัดไป) หรือไม่ | ไม่ — นอกขอบเขต (ต้องสแกนโฟลเดอร์ที่ผู้ใช้เลือกซึ่งแอปไม่ได้จดไว้); ชื่อ temp ตาม R10-Q-1 บอกชัดว่าเป็นไฟล์ชั่วคราว ผู้ใช้ลบเองได้ ไฟล์เดิมปลอดภัยแล้ว (R10-AC-4) |
@@ -1364,3 +1364,125 @@ stdout ที่ encode "❌" ไม่ได้ หมายถึง `io.TextI
 | R11-Q-8 | จุดอื่นที่อ่านช่องกรอกขณะ Connect — Save Job บันทึก `"database": self.db_name.get()` (`:9726`) และ `"db_type": self.db_type.get()` ซึ่งอาจไม่ตรงกับ connection ที่ใช้รัน — รวมใน Round นี้หรือไม่ | ไม่รวม — เป็น metadata ของ Job ไม่ได้เปลี่ยนปลายทางที่รัน และไม่อยู่ในรายงาน B4; ถ้าผู้ใช้ต้องการให้เปิด Round แยก |
 | R11-Q-9 | R11-AC-22 (full suite สองแบบ encoding) จะรันใน Round นี้หรือเลื่อนแบบ Round 8-10 | ให้ผู้ใช้ตัดสิน — ถ้าเลื่อน ให้รัน focused ตามที่ระบุใน R11-AC-22 แทน |
 | R11-Q-10 | Blocker R11-R1 (ดู Round 11 ใน `docs/design.md` / `docs/tasks.md`): `test_info_db_type_wins_over_screen_at_start` ใน `tests/test_run_engine_batch.py` ตั้ง `info` แต่ไม่มี password ที่เก็บไว้ จึงชนกับ R11-Q-6 (block) และขัดกับ R11-AC-21 (ห้ามแก้ test) | **ผู้ใช้ตัดสินแล้ว: ตัวเลือก (a)** — อนุญาตให้ปรับ harness เฉพาะ test นี้ โดยเพิ่ม setup 1 บรรทัด `stub._connected_password = (engine_a, "pw")` ก่อน `self._start(stub)`; ห้ามแก้ assertion ใด ตามแนวทางเดียวกับ R10-Q-5; R11-AC-21 ปรับให้ระบุข้อยกเว้นนี้แล้ว |
+
+---
+
+# Round 13 — Follow-up: ข้อเสนอแนะ 🟢 ทั้ง 9 ข้อจาก Code Review Round 12 (ก่อนเปิด PR เข้า main)
+
+> ใช้เลข `R13-AC-x` และ `R13-Q-x` แยกจาก Round ก่อนหน้า ไม่ลบเนื้อหา Round ก่อนหน้า (ยกเว้นหมายเหตุที่เพิ่มใน R10-AC-15 / R10-Q-3 ตาม R13-AC-11)
+> ที่มา: `docs/review.md` หัวข้อ `# Code Review — Round 12` ส่วน 🟢 Suggestion ข้อ 1-9 (🟡 ข้อ 1 แก้แล้วใน commit `d2c4dd5`) — ผู้ใช้สั่ง "แก้ก่อน" ทั้ง 9 ข้อ
+> ไฟล์ที่เกี่ยวข้อง (เลขบรรทัด ณ 2026-11-23 อาจคลาดเล็กน้อย): `database_connect_gui.py` — `_SECRET_PATTERNS` / `redact_secrets` (`:94-121`), `load_preset_dialog` filter (`:5692-5694`), `connect_database` (`:7725-7807`, except `:7764-7779`), `_show_connection_error` (`:7911-7944`, `ui_dialog(..., message=str(error))` `:7939`), `results_text.insert` ถูกห่อให้เขียน run log ด้วย (`:3300-3308`), `list_tables` worker (`:9438`, `:9441`, `:9547`, `:9551`, `:9564`, `:9567`, ส่ง error `:9612`), `on_list_tables_error` (`:9724-9740`), `new_profile_dialog` → closure `test_connection` (`:11632-11674`, ข้อความ error `:11656-11658`); tests: `tests/test_r8_load_jobs_writeback.py:305`, `tests/test_r10_export_atomic_write.py:175-178`, `tests/test_r11_connection_target_snapshot.py:982-1012`, `tests/test_database_connect_gui_core.py`
+
+### R13-1. เป้าหมาย
+
+ปิดข้อเสนอแนะ 🟢 ที่ค้างจาก review Round 12 ก่อนเปิด PR เข้า main โดยหลักคือ **ไม่ให้ password หลุดผ่านข้อความ error ของการ Connect** (🟢3): ตอนนี้ `connect_database` แสดง `❌ Connection Error: {error}` ดิบใน Execution Logs (ซึ่งถูกเขียนลง `logs/run_YYYY-MM-DD.log` ด้วย) และ dialog Connection Error; ปุ่ม "ทดสอบการเชื่อมต่อ" ใน New Profile ก็แสดง error ดิบ — ถ้า driver / SQLAlchemy ใส่ connection string ไว้ใน error (SQL Server `odbc_connect=...PWD=...`) รหัสจะปรากฏบนจอและในไฟล์ log; ที่เหลือเป็นการปรับ pattern ของ `redact_secrets`, test ที่ขาด, ความสม่ำเสมอของโค้ด และเอกสาร
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่ Connect ล้ม (รหัสไม่ไปอยู่ในจอ / log ที่ส่งต่อคนอื่น), ผู้ดูแลความปลอดภัย, ผู้พัฒนา Round ถัดไป
+
+### R13-2. ขอบเขต
+
+#### In scope
+
+- **🟢3 เส้นทาง error ของการ Connect** (ค้นแล้วมี 2 จุดที่สร้าง connection และแสดง error):
+  1. `connect_database` except — (ก) `results_text.insert("❌ Connection Error: ...")` (→ Execution Logs + run log), (ข) `_show_connection_error`: Label ในกล่องแดง (`msg`) และ `ui_dialog(message=...)`
+  2. `new_profile_dialog` → `test_connection` → `work()` except — ข้อความ `✕  เชื่อมต่อไม่สำเร็จ: ...` ใน `result_label`
+  - ทุกจุดต้องผ่าน `redact_secrets(str(error), <password ที่ใช้สร้าง connection นั้น>)` **ก่อน** ตัดบรรทัด / ตัดความยาว; ข้อความส่วนอื่นคงเดิม
+  - Tables (`list_tables` / `on_list_tables_error`) ทำแล้วใน R12-7 — Round นี้แก้เฉพาะ 🟢1 / 🟢4
+- **🟢1** `on_list_tables_error` ใช้ password เดียวกับที่ worker ใช้ (`credentials[1]`) ส่งไปพร้อม error
+- **🟢2** ปรับ `_SECRET_PATTERNS` ตาม R13-Q-1 (ค่าเริ่มต้น: แก้ (ข) (ค) (ง), ยอมรับ (ก) (จ) เป็น known limit)
+- **🟢4** แยกบรรทัด `redact_secrets(...)` ที่ยาวใน `list_tables` worker; `quote_plus` import ระดับ module
+- **🟢5** หมายเหตุใน R10-AC-15 / R10-Q-3 ว่าถูก R12-5 แทน — **PM ใส่แล้วใน Round นี้** (ข้อความเดิมคงอยู่)
+- **🟢6** test pin ค่า `EXPORT_REPLACE_RETRY_DELAYS`
+- **🟢7** unit test ตรงของ `write_json_atomic` 3 ทาง (`json.dump` ล้ม, `fsync` ล้ม, `BaseException`)
+- **🟢8** แก้ comment `tests/test_r8_load_jobs_writeback.py:305` ให้ตรงความจริง (ข้อยกเว้นของกฎห้ามแก้ test เดิม — comment เท่านั้น)
+- **🟢9** filter ใน `load_preset_dialog` (`:5692-5694`) ทน element ที่ไม่ใช่ dict ตาม R13-Q-3
+
+#### Out of scope
+
+- error ของการ **รัน** query / Run Job / Run All / Export (`on_query_error_enhanced`, `on_query_error`, Error & Debug tab, debug print `:6997-7001`, `show_batch_error`, `show_critical_error`) — R13-Q-2
+- เปลี่ยนข้อความ / layout ของ dialog Connection Error, tips, ปุ่ม Retry / Edit
+- เปลี่ยนเกณฑ์ความยาวขั้นต่ำ 4 ตัวของ known secret, เปลี่ยนวิธีสร้าง connection string / URL
+- กรณีขอบ (ก) / (จ) ของ 🟢2 (ถ้า R13-Q-1 ยืนยัน known limit)
+- แก้ `docs/design.md` (หน้าที่ architect — ถ้าต้องการหมายเหตุ R12-5 ที่นั่นด้วย)
+- refactor อื่น, commit
+
+### R13-3. User stories
+
+- **R13-US-1**: ในฐานะผู้ใช้ที่ Connect SQL Server ไม่ผ่าน ฉันต้องการเห็นสาเหตุจากฐานข้อมูลโดยไม่มีรหัสผ่านของฉันบนจอ ใน Execution Logs หรือในไฟล์ `logs/run_*.log` เพื่อส่ง log ให้ทีมอื่นได้อย่างปลอดภัย
+- **R13-US-2**: ในฐานะผู้ใช้ที่กด "ทดสอบการเชื่อมต่อ" ตอนสร้าง Profile ฉันต้องการข้อความ error ที่ไม่มีรหัสผ่านเช่นกัน
+- **R13-US-3**: ในฐานะผู้พัฒนา Round ถัดไป ฉันต้องการ test ที่ล็อกพฤติกรรม (retry delay, `write_json_atomic`) และ spec ที่ไม่ขัดกับของจริง เพื่อไม่แก้กลับโดยไม่รู้ตัว
+
+### R13-4. Acceptance criteria
+
+วิธีทดสอบ: `unittest` แบบ stub (`DatabaseConnectorGUI.__new__`, `_FakeEntry`, patch `create_engine` / `messagebox` / `ui_dialog` / `tk.Label` / `print` / `threading.Thread`) ไม่ต่อ DB จริง ไม่เปิด Tk จริง; ไฟล์ test ใหม่ทั้งหมดอยู่ใน `tests/test_r13_*.py`
+
+นิยาม:
+- `PW = "S3cr;t}PW-13"` (มี `;` และ `}` → ODBC เขียนเป็น `{S3cr;t}}PW-13}`)
+- "error ที่มีรหัส" (แยก subTest): (1) ODBC ดิบ `... DRIVER={D};SERVER=h,1;UID={u};PWD={S3cr;t}}PW-13};Encrypt=yes ... Login failed for user 'u'.`; (2) `mssql+pyodbc:///?odbc_connect=` + `quote_plus(<ODBC ข้อ 1>)` + ` Login failed for user 'u'.`; (3) ข้อความอิสระที่มี `PW` ตรงตัว `bad password S3cr;t}PW-13 for u`
+- "ไม่รั่ว" = ข้อความไม่มี `PW`, `quote_plus(PW)`, `S3cr`, `PW-13`, `}}PW-13`, `%7D%7DPW-13`
+- "ไม่ mask เกิน" = ข้อความยังมี `Login failed for user 'u'` (หรือ `bad password` / `for u` ใน (3))
+
+#### Connect (🟢3)
+
+| AC | Given / When / Then |
+|---|---|
+| R13-AC-1 | **Given** ช่อง Password = `PW` และ `engine.connect()` raise "error ที่มีรหัส" แต่ละแบบ **When** `connect_database` **Then** ทุกข้อความที่ `results_text.insert` ได้รับ (Execution Logs และ run log ที่ป้อนจาก insert เดียวกัน `:3300-3308`) "ไม่รั่ว" และ "ไม่ mask เกิน"; ยังมีบรรทัดขึ้นต้น `❌ Connection Error: ` ตามเดิม; `print` ที่ถูกจับ (ถ้ามี) ไม่รั่ว |
+| R13-AC-2 | **Given** เหมือน R13-AC-1 **When** dialog Connection Error ถูกสร้าง (patch `ui_dialog` ให้เรียก `build_body` กับ frame ปลอม และจับ `text` ของ `tk.Label`) **Then** argument `message`, `subtitle` และ `text` ของ Label ทุกตัว "ไม่รั่ว"; Label กล่องแดงยัง "ไม่ mask เกิน"; การตัด 400 ตัวอักษรทำ **หลัง** redact (ข้อความยาว > 400 ที่มี `PWD={...}` ช่วงท้าย ไม่เหลือส่วนของรหัส) |
+| R13-AC-3 | **Given** `create_engine` / `get_connection_string` raise (ไม่ใช่ `engine.connect()`) ด้วย "error ที่มีรหัส" แบบ (1) **When** `connect_database` **Then** ผลเหมือน R13-AC-1 / R13-AC-2 และพฤติกรรมเดิมคงอยู่: `_replace_engine(None)`, `status_label` = `❌ Connection Failed`, `execute_btn` / `inspect_btn` disabled |
+| R13-AC-4 | **Given** ช่อง Password ยาว < 4 ตัว (`"pw1"`) และ error แบบ (1) ที่ใช้รหัสนี้ **When** `connect_database` **Then** ไม่รั่ว (ผ่าน pattern) และคำทั่วไปที่มี `pw1` นอก `PWD=` ไม่ถูกแตะ — ยืนยันเกณฑ์ 4 ตัวเดิม |
+| R13-AC-5 | **Given** การกด "ทดสอบการเชื่อมต่อ" ใน New Profile ด้วย Password = `PW` และ `create_engine` / `connect` raise "error ที่มีรหัส" แต่ละแบบ **When** สร้างข้อความผลลัพธ์ (logic ใน `work()` แยกเป็น helper ที่ทดสอบได้โดยไม่เปิด dialog — ชื่อกำหนดใน design) **Then** ข้อความ `✕  เชื่อมต่อไม่สำเร็จ: ...` "ไม่รั่ว"; redact ทำก่อนเลือกบรรทัดแรกและก่อนตัด 300 ตัวอักษร; กรณีสำเร็จข้อความ `✓  ทดสอบเชื่อมต่อสำเร็จ · ...` เหมือนเดิม |
+| R13-AC-6 | **Given** error ปกติที่ไม่มีรหัส (`could not translate host name "x" to address`, `Login timeout expired`, ลิงก์ `https://sqlalche.me/e/20/e3q8`) **When** ผ่าน R13-AC-1 / R13-AC-5 **Then** ข้อความเท่ากับเดิมทุกตัวอักษร |
+
+#### Tables (🟢1, 🟢4)
+
+| AC | Given / When / Then |
+|---|---|
+| R13-AC-7 | **Given** `_run_target = RunTarget(engine, None)` (ทาง R11-AC-17 อ่านรหัสจากช่องกรอก) ช่อง Password = `PW`, ไม่มี `_connected_password` และ worker raise error แบบ (3) (รหัสตรงตัว ไม่มี `PWD=`) **When** `list_tables` จนถึง `on_list_tables_error` **Then** `results_text` และ `showerror` "ไม่รั่ว" — เพราะใช้ password ที่ worker ใช้ (`credentials[1]`) ไม่ใช่ `_connected_password` |
+| R13-AC-8 | **Given** snapshot มี `info` + `_connected_password = (engine, PW)` แล้วก่อน `on_list_tables_error` ถูกเรียก `_connected_password` ถูกเปลี่ยนเป็นรหัสอื่น **When** error แบบ (3) ถึง `on_list_tables_error` **Then** ยัง "ไม่รั่ว" (ใช้รหัสของ worker); test เดิม `test_on_list_tables_error_is_redacted` ผ่านโดยไม่แก้ (ถ้า signature เปลี่ยน ต้องรองรับการเรียกแบบเดิมด้วย default) |
+| R13-AC-9 | **Given** source ของ `database_connect_gui.py` **When** test อ่านทุกบรรทัดที่มี `redact_secrets(` **Then** ทุกบรรทัดยาว ≤ 95 ตัวอักษร (แนวที่ใช้ทั้งไฟล์); และ `inspect.getsource(app.redact_secrets)` ไม่มี `import`, `app.quote_plus` มีอยู่ระดับ module |
+
+#### `redact_secrets` patterns (🟢2 — ตามค่าเริ่มต้น R13-Q-1)
+
+| AC | Given / When / Then |
+|---|---|
+| R13-AC-10 | **When** `redact_secrets(text)` (ไม่ส่ง known secret) **Then** ผลตรงทุกตัวอักษร (subTest): (ข) `password = 'x y'` → `password = '***'`, `PWD="a;b"` → `PWD="***"`, quote ไม่ปิด `password='abc` → `password='***` ; (ค) `DB_PASSWORD=abc next` → `DB_PASSWORD=*** next`, `MY_PWD=abc;` → `MY_PWD=***;`; (ง) `http://host:8080/a@b` และ `see http://h:80/x?y=a@b` **ไม่เปลี่ยน**; ขณะที่ `postgresql://u:p%40ss@h/db` → `postgresql://u:***@h/db` ตามเดิม; และ test เดิม `RedactSecretsTests` ทั้งคลาสผ่านโดยไม่แก้ |
+| R13-AC-12 | **Given** known limit (ก) / (จ) ตาม R13-Q-1 **When** `redact_secrets("postgresql://u:p@ss@h/db")` และ `redact_secrets("testing table test_x", "test")` **Then** ได้ `"postgresql://u:***@ss@h/db"` และ `"***ing table ***_x"` ตามลำดับ (พฤติกรรมปัจจุบัน) — pin ไว้เป็น known limit ให้เห็นถ้ามีคนเปลี่ยน; และ `redact_secrets("postgresql://u:p@ss@h/db", "p@ss")` ไม่มี `p@ss` (known secret ปิดให้) — ถ้าผู้ใช้เลือกแก้ (ก) / (จ) ใน R13-Q-1 ให้ปรับ AC นี้เป็นผลใหม่ |
+
+#### Export / persistence / เอกสาร (🟢5, 🟢6, 🟢7, 🟢8, 🟢9)
+
+| AC | Given / When / Then |
+|---|---|
+| R13-AC-11 | **Given** `docs/spec.md` **When** อ่านแถว R10-AC-15 และ R10-Q-3 **Then** ข้อความเดิมยังอยู่ครบ และมีหมายเหตุ "ถูกแทนที่โดย R12-5 (2026-11-23)" — **ทำแล้วโดย PM ใน Round นี้**; ตรวจด้วย review (ไม่ต้องมี unittest) |
+| R13-AC-13 | **Given** โมดูล `app` (ไม่ patch) **When** test อ่าน `app.EXPORT_REPLACE_RETRY_DELAYS` **Then** `== (0.2, 0.5, 1.0)` และ `sum(...) <= 2.0` |
+| R13-AC-14 | **Given** ไฟล์ JSON เดิมที่มีเนื้อหา X ใน temp dir **When** `write_json_atomic` ล้มแต่ละแบบ (subTest): (ก) `json.dump` raise `TypeError` (ข้อมูล serialize ไม่ได้), (ข) patch `os.fsync` raise `OSError`, (ค) patch `os.fsync` (หรือ `json.dump`) raise `KeyboardInterrupt` **Then** exception ชนิดเดิมหลุดออกมา (instance เดียวกัน), bytes ของไฟล์เดิม = X, ไม่มี `<path>.tmp` ค้าง และ `os.replace` ไม่ถูกเรียก |
+| R13-AC-15 | **Given** `tests/test_r8_load_jobs_writeback.py:305` **When** แก้ **เฉพาะ comment** ให้ตรงความจริง (เช่น `print() returns silently when sys.stdout is None`) **Then** ไม่มีการแก้บรรทัดอื่นในไฟล์นั้น (ตรวจด้วย `git diff` ใน review) และ test ผ่าน |
+| R13-AC-16 | **Given** `saved_jobs = [job_P1_a, None, "junk", job_P2_b]` (profile ปัจจุบัน = P1) และ preset ที่ valid 1 job **When** Load Preset แล้วกด Yes (`save_jobs` สำเร็จ) **Then** ไม่มี exception / rollback / `showerror`; `askyesno` นับ 1 job; ผล `saved_jobs` = ตาม R13-Q-3 (ค่าเริ่มต้น: `[None, "junk", job_P2_b, <job จาก preset>]` — element เสียถูก**เก็บไว้**ตามลำดับเดิม, `job_P1_a` ถูกแทน) |
+
+#### Regression
+
+| AC | Given / When / Then |
+|---|---|
+| R13-AC-17 | **Given** แก้ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบ ((ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง บน `cp874` + redirect stdout/stderr ไปไฟล์) **Then** ทั้งสองแบบ `OK` จำนวน test เท่ากัน และ ≥ 1147 + จำนวน test ใหม่ของ `tests/test_r13_*.py`; test เดิมทุกไฟล์ไม่ถูกแก้ ยกเว้น comment ตาม R13-AC-15 |
+| R13-AC-18 | **Given** test ใหม่ทั้งหมด **When** รัน **Then** ไม่มี password จริง / รหัสทดสอบปรากฏใน stdout / stderr ของการรัน test, ใน `logs/` หรือไฟล์ใดนอก temp dir ของ test; `ConnectionInfo` / `RunTarget` ยังไม่มี field password (`tests/test_run_target.py` ผ่าน) |
+
+**สรุปจำนวน AC Round 13**: 18 ข้อ (Connect 6, Tables 3, patterns 2, export / persistence / เอกสาร 5 — R13-AC-11 ตรวจด้วย review, regression 2)
+
+### R13-5. ข้อจำกัด / สมมติฐาน
+
+- ยังไม่มีหลักฐานว่า driver ใส่ `PWD=` ใน error ของการ Connect จริง — เป็นการปิดความเสี่ยงล่วงหน้าแบบเดียวกับ R12-7; ทดสอบด้วยข้อความจำลองเท่านั้น
+- Known secret ของ Connect / Test connection = ค่าที่อ่านจากช่อง Password ตอนกด (ค่าที่ใช้สร้าง connection นั้น); รหัส < 4 ตัวพึ่ง pattern อย่างเดียว (เกณฑ์เดิม)
+- run log ได้ข้อความจาก `results_text.insert` ที่ถูกห่อ — redact ก่อน insert จึงครอบ run log ด้วย; dialog / `print` ต้อง redact แยก
+- Minimal diff: แก้ `_SECRET_PATTERNS` / `redact_secrets`, except ของ `connect_database`, `_show_connection_error` (หรือผู้เรียกส่งข้อความที่ redact แล้ว), `test_connection` (แยก helper), `list_tables` (บรรทัด print + ส่ง password ให้ error handler), `on_list_tables_error`, filter `load_preset_dialog`; PEP 8 + type hints สำหรับ helper ใหม่
+- ห้าม commit
+
+### R13-6. คำถามที่ยังไม่มีคำตอบ
+
+AC ใช้คำตอบที่แนะนำเป็นค่าเริ่มต้น ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R13-Q-1 | กรณีขอบ 🟢2 แก้ข้อไหน: (ก) URL ไม่ encode ที่รหัสมีช่องว่าง / `'` / `"` / `@`, (ข) `password = 'x'` → `***'x'`, (ค) `DB_PASSWORD=` ไม่ถูก mask, (ง) URL ที่ไม่ใช่ userinfo ถูก mask เกิน (`http://host:8080/a@b`), (จ) known secret ที่เป็นคำทั่วไป (`test`) mask คำอื่นด้วย | **แก้ (ข) (ค) (ง)** — เปลี่ยน regex เล็กน้อย ไม่ลดการป้องกันข้อความที่แอปสร้าง (แอป `quote_plus` รหัสใน URL → ไม่มี `/` ดิบ จึงตัด `/` ออกจาก userinfo ได้). **known limit (ก) (จ)** — (ก) แอปไม่สร้าง URL แบบนี้และ known secret ≥ 4 ตัวปิดให้; (จ) mask เกินคือฝั่งปลอดภัย การจำกัดเป็น whole-word จะพลาด `PWD%3Dtest%3B` (`D` ติดหน้า) — R13-AC-12 pin พฤติกรรมไว้ |
+| R13-Q-2 | ขยายการ redact ไปยัง error ของการ**รัน** (Run / Run Job / Run All / Export / Error & Debug tab / debug print) ด้วยหรือไม่ — connection ที่หลุดแล้ว reconnect (`pool_pre_ping`) อาจได้ error แบบเดียวกัน | **ไม่รวมใน Round นี้** — review 🟢3 ระบุเฉพาะ Connect, ผู้ใช้ต้องการด่วนก่อน PR; ถ้าต้องการให้เปิด Round แยก |
+| R13-Q-3 | 🟢9 element ที่ไม่ใช่ dict ใน `saved_jobs` ตอน Load Preset (กด Yes): เก็บไว้ หรือทิ้ง | **เก็บไว้** — ไม่ใช่ Job ของ Profile ปัจจุบัน (สอดคล้องกับตัวนับที่ไม่นับมัน), ไม่ทำลายข้อมูลที่ไม่เข้าใจ; ในทางปฏิบัติไม่เกิดเพราะ `load_jobs` reject ตั้งแต่โหลด (R13-AC-16) |
+
+คำตอบผู้ใช้ (2026-11-23): **R13-Q-1** แก้ (ข) (ค) (ง); ยอมรับ (ก) URL ไม่ encode ที่มี `@` และ (จ) known secret ที่เป็นคำทั่วไป เป็น known limit (R13-AC-12 คงตามเดิม) · **R13-Q-2** ไม่ redact error ตอนรัน (Run / Run Job / Run All / Export / Error & Debug / reconnect) ใน Round นี้ · **R13-Q-3** element ที่ไม่ใช่ dict ใน `saved_jobs` ตอน Load Preset → เก็บไว้ในลำดับเดิม (R13-AC-16 คงตามเดิม)
