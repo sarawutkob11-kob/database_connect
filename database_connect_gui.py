@@ -6940,15 +6940,20 @@ class DatabaseConnectorGUI:
         return loading_dialog
 
     def _execute_query_background(
-        self, sql_query, loading_dialog, engine: Any = None, debug_mode=None
+        self, sql_query, loading_dialog, engine: Any = None, debug_mode=None,
+        password: Optional[str] = None,
     ) -> None:
         """NEW: Execute query in background with comprehensive error logging.
 
         engine: the run's engine, taken on the main thread (None -> self.engine).
-        The worker never reads self.engine.
+        password: the run's Connect password, used only to mask errors
+        (None -> read here on the main thread for `engine`).
+        The worker never reads self.engine or the stored password.
         """
         if engine is None:
             engine = self.engine
+        if password is None:
+            password = self._connected_password_for(engine)
         if debug_mode is None:
             debug_mode = self.debug_mode.get()
 
@@ -6999,8 +7004,8 @@ class DatabaseConnectorGUI:
             except Exception as e:
                 # Comprehensive error logging
                 error_type = type(e).__name__
-                error_message = str(e)
-                error_traceback = traceback.format_exc()
+                error_message = redact_secrets(str(e), password)
+                error_traceback = redact_secrets(traceback.format_exc(), password)
 
                 # Store error details for retry
                 error_details = {
@@ -8383,6 +8388,8 @@ class DatabaseConnectorGUI:
         self._stop_event.set()
         with self._active_db_lock:
             connections = list(self._active_db_connections.values())
+        # Only to mask cancel errors; Stop may come before any Connect (no engine yet)
+        password = self._connected_password_for(getattr(self, "engine", None))
         cancelled = 0
         for dbapi_connection in connections:
             cancel = getattr(dbapi_connection, "cancel", None)  # Oracle (python-oracledb)
@@ -8392,7 +8399,7 @@ class DatabaseConnectorGUI:
                 cancel()
                 cancelled += 1
             except Exception as e:
-                print(f"Stop: cancel failed: {e}")
+                print(f"Stop: cancel failed: {redact_secrets(str(e), password)}")
         if cancelled:
             msg = f"\n⏹ Stop requested — cancelled {cancelled} running query(ies); remaining jobs are skipped.\n"
         else:
@@ -8636,8 +8643,10 @@ class DatabaseConnectorGUI:
 
         # Execute query in background thread
         debug_mode = self.debug_mode.get()
+        run_password = self._connected_password_for(target.engine)
         self._execute_query_background(
-            sql_query, loading_dialog, engine=target.engine, debug_mode=debug_mode
+            sql_query, loading_dialog, engine=target.engine, debug_mode=debug_mode,
+            password=run_password,
         )
 
     def on_modification_success(self, rows_affected, sql_query, loading_dialog):
@@ -8713,6 +8722,8 @@ class DatabaseConnectorGUI:
 
     def on_query_error(self, error, loading_dialog):
         """Handle query execution error"""
+        # Safety net: callers may pass a raw exception that holds the password
+        error_text = redact_secrets(str(error), self._connected_password_for(self.engine))
         try:
             # Close loading dialog
             loading_dialog.destroy()
@@ -8723,13 +8734,13 @@ class DatabaseConnectorGUI:
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert(tk.END, "❌ QUERY ERROR\n")
         self.results_text.insert(tk.END, "=" * 150 + "\n\n")
-        self.results_text.insert(tk.END, f"Error: {str(error)}\n\n")
+        self.results_text.insert(tk.END, f"Error: {error_text}\n\n")
         self.results_text.see(tk.END)
 
         # Re-enable execute button
         self.execute_btn.config(state="normal", text="▶  Run")
 
-        messagebox.showerror("Query Error", f"Failed to execute query:\n\n{str(error)}")
+        messagebox.showerror("Query Error", f"Failed to execute query:\n\n{error_text}")
 
     # ------------------------------------------------------------------
     # Results Drawer UI (presentation only — reuses export_to_csv,
@@ -10034,6 +10045,8 @@ class DatabaseConnectorGUI:
         self._ui_progress = {"total": 0, "index": 0, "name": job.get("name", ""), "kind": "job"}
         self._start_stoppable_run(target=target)
         engine = target.engine
+        # Read once on the main thread; the worker only masks errors with it
+        run_password = self._connected_password_for(engine)
 
         # หาเลขลำดับของ Job ตาม Saved Jobs
         current_profile = self.profile_combo.get()
@@ -10110,7 +10123,10 @@ class DatabaseConnectorGUI:
 
             except Exception as e:
                 elapsed = time.perf_counter() - start_time
-                self.root.after(0, lambda err=e: finish("error", error=err, query_time=elapsed))
+                err_text = redact_secrets(str(e), run_password)
+                self.root.after(
+                    0, lambda err=err_text: finish("error", error=err, query_time=elapsed)
+                )
 
         threading.Thread(target=run_in_background, daemon=True).start()
 
@@ -10154,6 +10170,8 @@ class DatabaseConnectorGUI:
         # The run's engine + destination, taken once here: every job of this
         # run uses this engine even if self.engine changes meanwhile
         run_engine = target.engine
+        # Read once on the main thread; the worker only masks errors with it
+        run_password = self._connected_password_for(run_engine)
         if not self._confirm_data_change(
             [{"name": job.get("name"), "query": run_sql[id(job)]} for job in profile_jobs],
             target=target,
@@ -10296,9 +10314,10 @@ class DatabaseConnectorGUI:
                             }
                         )
 
+                        err_text = redact_secrets(str(e), run_password)
                         self.root.after(
                             0,
-                            lambda i=idx, j=job, err=e, qt=elapsed_time: self.update_job_status(
+                            lambda i=idx, j=job, err=err_text, qt=elapsed_time: self.update_job_status(
                                 i, j, "error", error=err, query_time=qt, show_popup=False
                             ),
                         )
@@ -10319,7 +10338,8 @@ class DatabaseConnectorGUI:
                 )
 
             except Exception as e:
-                self.root.after(0, lambda err=e: self.show_batch_error(err))
+                batch_err = redact_secrets(str(e), run_password)
+                self.root.after(0, lambda err=batch_err: self.show_batch_error(err))
 
         # Start background thread
         thread = threading.Thread(target=run_all_jobs, daemon=True)
@@ -10604,6 +10624,8 @@ class DatabaseConnectorGUI:
 
         # The run's engine + destination, taken once here and used by the worker
         export_engine = target.engine
+        # Read once on the main thread; the worker only masks errors with it
+        export_password = self._connected_password_for(export_engine)
         jobs = self._reuse_last_run_results(jobs_to_export)
         if jobs is None:
             return  # User cancelled
@@ -11021,18 +11043,20 @@ class DatabaseConnectorGUI:
                             failed += 1
                             import traceback
 
+                            # Masked once; the log and the Excel cell use the same text
+                            error_text = redact_secrets(str(job_err), export_password)
                             log("\n=================================\n")
                             log(f"Job Failed : {job_name}\n")
                             log(f"Sheet : {sheet}\n")
                             log(f"Error Type : {type(job_err).__name__}\n")
-                            log(f"Error : {str(job_err)}\n")
-                            log(traceback.format_exc())
+                            log(f"Error : {error_text}\n")
+                            log(redact_secrets(traceback.format_exc(), export_password))
                             log("\n=================================\n")
 
                             # ยังสร้าง Sheet ของ Job นี้ไว้ เพื่อให้ 1 Job = 1 Sheet ครบ
                             failed_row = blank_oversized_cells(
                                 job_name,
-                                {"Status": "Failed", "Error": str(job_err), "Query": query},
+                                {"Status": "Failed", "Error": error_text, "Query": query},
                             )
                             pd.DataFrame(
                                 {k: [v] for k, v in failed_row.items()}
@@ -11061,7 +11085,7 @@ class DatabaseConnectorGUI:
                     temp_path = None  # nothing left to delete
 
             except Exception as e:
-                fatal_error = f"{type(e).__name__}: {str(e)}"
+                fatal_error = f"{type(e).__name__}: {redact_secrets(str(e), export_password)}"
             finally:
                 if temp_handle is not None and not temp_handle.closed:
                     try:

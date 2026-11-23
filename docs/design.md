@@ -2397,3 +2397,127 @@ R13-AC-15 / R13-AC-11 ตรวจด้วย `git diff` / review; R13-AC-17 / 
 | R13-AC-10 | R13-T1, R13-T4 | R13-AC-11 | R13-T4 (review) | R13-AC-12 | R13-T1, R13-T4 |
 | R13-AC-13 | R13-T4 | R13-AC-14 | R13-T4 | R13-AC-15 | R13-T4 |
 | R13-AC-16 | R13-T3, R13-T4 | R13-AC-17 | R13-T | R13-AC-18 | R13-T4, R13-T |
+
+---
+
+# Round 14 — ซ่อนรหัสผ่านใน error ตอนรัน (P1-P12)
+
+> spec: `docs/spec.md` Round 14 (R14-AC-1..18); คำตอบผู้ใช้ R14-Q-1..3 (2026-11-23) ตามค่าแนะนำ; เลขบรรทัด ณ commit `00ef40b` (คลาดได้เล็กน้อย); ห้าม commit; test เดิมห้ามแก้
+
+## R14-D1. แนวทาง
+
+- ใช้ `redact_secrets(text, password)` เดิม (`:125`) — **ไม่แก้** ฟังก์ชัน / `_SECRET_PATTERNS`
+- **redact ที่ต้นทางครั้งเดียว** ใน worker (หรือจุดแรกที่ข้อความเกิด) แล้วส่งข้อความที่ redact แล้วต่อไปตามทางเดิม — ปลายทาง (results_text → run log, messagebox, popup, dialog, clipboard, แท็บ Error & Debug, print, cell Excel) ไม่ต้องแก้ ยกเว้น `on_query_error` (P6) ที่ redact ซ้ำเป็นตาข่ายกันผู้เรียกที่ส่ง exception ดิบ
+- **รหัสอ่านครั้งเดียวบน main thread** ด้วย `self._connected_password_for(<engine ของการรัน>)` ทันทีหลังบรรทัดที่หยิบ engine จาก `target` (snapshot เดียวกัน) แล้วให้ worker ใช้ผ่าน closure / argument — worker ไม่อ่าน `_connected_password`, `self.engine` หรือช่อง Password (R14-AC-13); `None` → `redact_secrets` ใช้ pattern อย่างเดียว (R14-Q-3, R14-AC-14)
+- ข้อความ SQL ของผู้ใช้ (`error_details["query"]`, cell `Query`, `SQL:` ใน log, `print("Query: ...")`) **ไม่แตะ** (R14-Q-1); traceback redact ทั้งก้อนแต่คงครบ (R14-Q-2)
+- รหัสไม่ถูกเก็บใน `error_details` / `job_results` / `RunTarget` / ไฟล์ใด (เป็น local ของ closure เท่านั้น)
+
+## R14-D2. การส่งรหัสให้ worker (ไม่เปลี่ยนพฤติกรรมอื่น)
+
+| ทาง | จุดอ่าน (main thread) | ส่งให้ worker |
+|---|---|---|
+| Run | `execute_query` ก่อนเรียก `_execute_query_background` (`:8638-8641`): `run_password = self._connected_password_for(target.engine)` | argument ใหม่ `password=run_password` |
+| Run (ผู้เรียกเดิม) | `_execute_query_background` หลัง `if engine is None: engine = self.engine` (`:6950-6953`, ยังเป็น main thread): `if password is None: password = self._connected_password_for(engine)` | closure `execute_in_background` |
+| Run Job | `run_job` หลัง `engine = target.engine` (`:10036`): `run_password = self._connected_password_for(engine)` | closure `run_in_background` |
+| Run all | `run_selected_job` หลัง `run_engine = target.engine` (`:10156`): `run_password = self._connected_password_for(run_engine)` | closure `run_all_jobs` |
+| Export | `export_jobs_to_excel` หลัง `export_engine = target.engine` (`:10606`): `export_password = self._connected_password_for(export_engine)` | closure `worker` |
+| Stop | `stop_running_queries` ก่อน loop (`:8386`): `password = self._connected_password_for(self.engine)` | — (main thread) |
+
+Signature ที่เปลี่ยน (keyword ท้ายสุด, ค่า default คงพฤติกรรมผู้เรียกเดิม `tests/test_run_engine.py:289-332`):
+
+```python
+def _execute_query_background(
+    self, sql_query, loading_dialog, engine: Any = None, debug_mode=None,
+    password: Optional[str] = None,
+) -> None:
+```
+
+ไม่มี method / class / field ใหม่อื่น; `update_job_status`, `show_batch_error`, `on_query_error`, `_show_error_details_dialog`, `_poll_last_error`, `on_query_error_enhanced` signature เดิม
+
+## R14-D3. จุด redact ราย P
+
+| P | ฟังก์ชัน / บรรทัด | แก้เป็น |
+|---|---|---|
+| P1 | `execute_in_background` except `:7002-7003` | `error_message = redact_secrets(str(e), password)`; `error_traceback = redact_secrets(traceback.format_exc(), password)`; `error_type` / `"query"` เดิม |
+| P2 | `:7013-7019` | ไม่แก้ — ใช้ตัวแปร P1 ที่ redact แล้ว |
+| P3 | `on_query_error_enhanced` `:7113`, `:7118` | ไม่แก้ — อ่าน `error_details` ที่ redact แล้ว |
+| P4 | `_show_error_details_dialog` `:7172`, `:7219`, `copy_error` | ไม่แก้ — 〃 |
+| P5 | `_poll_last_error` `:9052-9060` | ไม่แก้ — อ่าน `self.last_error_details` ที่ redact แล้ว |
+| P6 | `on_query_error` `:8726`, `:8732` | ต้นฟังก์ชัน: `error_text = redact_secrets(str(error), self._connected_password_for(self.engine))` แล้วใช้ `error_text` แทน `str(error)` ทั้งสองจุด (ผู้เรียก `:7041` ส่ง message ที่ redact แล้ว → redact ซ้ำไม่เปลี่ยนผล) |
+| P7 | `run_in_background` except `:10111-10113` | `err_text = redact_secrets(str(e), run_password)` แล้ว `lambda err=err_text: finish("error", error=err, ...)` — `update_job_status` ได้ `str` แทน exception: `f"Error       : {error}"` และ `str(error)` (`:10386`, `:10393`) ให้ผลเท่าเดิมทุกตัวอักษร (`format(e) == str(e)`) |
+| P8 | `run_all_jobs` except `:10299-10303` | `lambda ..., err=redact_secrets(str(e), run_password), ...` (default arg ประเมินใน worker); `job_results["_error"]` = `e` เดิม (ใช้แค่ `is None`); `error_msg` `:10281` ไม่แตะ |
+| P9 | except นอก `:10322` | `lambda err=redact_secrets(str(e), run_password): self.show_batch_error(err)` — `show_batch_error` ไม่แก้ |
+| P10 | export `worker` except `job_err` `:11027-11036` | ครั้งเดียวต้น except: `error_text = redact_secrets(str(job_err), export_password)`; `log(f"Error : {error_text}\n")`; `log(redact_secrets(traceback.format_exc(), export_password))`; `"Error": error_text` ใน dict ที่ส่ง `blank_oversized_cells`; `Error Type` / `Query` เดิม |
+| P11 | export `worker` except นอก `:11064` | `fatal_error = f"{type(e).__name__}: {redact_secrets(str(e), export_password)}"`; `on_done` ไม่แก้; ข้อความ `OSError` ของ replace `:11053-11059` ไม่แตะ (ไม่ใช่ error DB) |
+| P12 | `stop_running_queries` `:8395` | `print(f"Stop: cancel failed: {redact_secrets(str(e), password)}")` (ตัวแปร `password` จาก R14-D2) |
+
+ทุกบรรทัดที่มี `redact_secrets(` ต้อง ≤ 95 ตัวอักษร (R13-AC-9) — ถ้าเกินให้แยกเป็นตัวแปรก่อน
+
+## R14-D4. Export: redact ก่อนตรวจ 32,767 (R14-AC-11)
+
+ลำดับใน except `job_err` ต้องเป็น: `error_text = redact_secrets(...)` → `log(...)` → `blank_oversized_cells(job_name, {"Status": "Failed", "Error": error_text, "Query": query})` → `to_excel`. `blank_oversized_cells` ตรวจ `_excel_text_too_long` บนข้อความที่ redact แล้ว จึง (ก) ดิบยาวเกิน-หลัง redact สั้นลง → เขียน cell ได้, ไม่มี Warning; (ข) ดิบไม่เกิน-หลัง redact ยาวเกิน (`PWD=` → `PWD=***`) → cell ว่าง + Warning ตามเดิม. ห้ามเรียก `str(job_err)` ซ้ำที่อื่นใน block นี้
+
+## R14-D5. ข้อความเดิมทุกตัวอักษรเมื่อไม่มีรหัส (R14-AC-16)
+
+- `redact_secrets` คืน `str(text)` เดิมเมื่อไม่มี secret ≥ 4 ตัวที่ปรากฏ และไม่มี pattern ตรง → ใช้กับ `str(e)` / `format_exc()` ได้ผลเท่าเดิม
+- ไม่เปลี่ยน format string, prefix (`Error Message: `, `Error       : `, `Error : `, `Error: `, `Stop: cancel failed: `, `<Class>: `), ลำดับ insert, ตัวนับ, การ break ของ Job modify, ปุ่ม
+- P7/P8/P9 เปลี่ยนชนิดที่ส่งจาก exception → `str` เท่านั้น; ผู้รับใช้แค่ `str()` / f-string จึงเท่ากัน
+- known limit คงตาม R13: known secret ที่เป็นคำทั่วไป / pattern `password=` ใน `[SQL: ...]` ของข้อความ error ถูก mask (ฝั่งปลอดภัย, spec R14-6)
+
+## R14-D6. Data model
+
+ไม่เปลี่ยน — ไม่มี field password ใน `error_details`, `job_results`, `RunTarget`, `ConnectionInfo`; ไม่มีไฟล์ / key JSON ใหม่
+
+## R14-D7. แผน test (`tests/test_r14_*.py`)
+
+ค่าคงที่ร่วม: `PW = "S3cr;t}PW-14"`, `LEAKS = (PW, quote_plus(PW), "S3cr", "PW-14", "}}PW-14", "%7D%7DPW-14")`, error (1)(2)(3) ตามนิยาม spec ((1) สร้างแบบ R13-D9); stub `GUI.__new__` ตาม `tests/test_run_engine.py::make_stub` (+ `_connected_password = (E, PW)`, `password_entry`-แบบ `_FakeEntry("field-pw-x")` ที่นับการเรียก `get`); `threading.Thread` จับ target แล้วรันเอง; `root.after` เก็บ callback แล้วเรียก; patch `builtins.print` ทุก test (เก็บข้อความไว้ตรวจ); `read_sql_dataframe` / `_execute_modification` = Mock raise `RuntimeError(err)` ภายในฟังก์ชันจริง (ให้มี traceback จริง); engine `E` = sqlite ใน temp dir หรือ `object()`; ไม่มี Tk จริง (patch `app.tk.Toplevel` / `tk.Label` / `tk.Text` / `tk.Frame` / `tk.LabelFrame` / `tk.Scrollbar` / `tk.Button`, `app.messagebox`)
+
+Oracle ของ "พฤติกรรมเดิม" (R14-AC-16): รันเส้นทางเดียวกันสองรอบ — รอบจริง และรอบ `mock.patch.object(app, "redact_secrets", lambda t, *s: str(t))` — แล้ว `assertEqual` ทุกปลายทาง (traceback ต่างกันได้แค่ถ้าบรรทัด frame ต่าง → เทียบหลังตัด traceback หรือใช้ error ที่ไม่มี pattern ทั้งสองรอบ)
+
+| ไฟล์ | AC | วิธี |
+|---|---|---|
+| `test_r14_run_redaction.py` | R14-AC-1 | `execute_query` จริง (stub `_capture_run_target` คืน `RunTarget(E, None)`, `_create_loading_dialog_with_retry` Mock) subTest (1)(2)(3): `last_error_details` message/traceback ไม่รั่ว, message มี `Login failed for user 'u'` (หรือ `bad password`/`for u`), `type == "RuntimeError"`, `query` = SQL เดิม |
+| 〃 | R14-AC-2 | AC-1 + `debug_mode=_Var(True)`: ทุก `print` args ไม่รั่ว; มีบรรทัด `Error Message:` / `Full Traceback:` |
+| 〃 | R14-AC-3 | `on_query_error_enhanced` จริง, dialog Mock (`winfo_exists` True), debug True/False: ทุก `results_text.insert` ไม่รั่ว, มี `Error Message: `; `_write_run_log` (Mock) ไม่รั่ว |
+| 〃 | R14-AC-4 | `_show_error_details_dialog` จริง: จับ kwargs `text` ของ `tk.Label`, `insert` ของ `tk.Text` Mock, ดึง `command` ของปุ่ม `Copy Error Details` แล้วเรียก → `root.clipboard_append` ไม่รั่ว |
+| 〃 | R14-AC-5 | `_build_error_debug_tab` ต้องใช้ Tk → เรียก `_poll_last_error` ผ่านการจับ closure: patch `tk.Text` คืน fake `debug_text` (`winfo_exists` True, `after` จับ fn) แล้วเรียก fn; ถ้า harness หนักเกินให้ตรวจผ่าน `last_error_details` (AC-1) + assert source ของ `_poll_last_error` อ่านแค่ `self.last_error_details` (บันทึกเหตุผลใน tasks) |
+| 〃 | R14-AC-6 | (ก) `on_query_error_enhanced` กับ dialog `winfo_exists` False; (ข) `GUI.on_query_error(stub, RuntimeError(err), dlg)` ตรง ๆ, `stub.engine = E`: `results_text` + `messagebox.showerror` ไม่รั่ว |
+| 〃 | R14-AC-13 (Run) | หลัง `execute_query` คืนและก่อนรัน thread: `stub._connected_password = (E2, "Other-PW-99")`, `stub.engine = E2`; error (3) → ไม่รั่ว; `_FakeEntry.get` count = 0 หลังเริ่ม |
+| 〃 | R14-AC-14 (Run) | `_connected_password = None`: (1)(2) ไม่รั่ว, (3) message = ข้อความดิบ |
+| 〃 | R14-AC-15 | `_is_busy` True, `_active_db_connections = {1: conn}` ที่ `cancel.side_effect = RuntimeError(err)`; print ขึ้นต้น `Stop: cancel failed: ` และไม่รั่ว |
+| `test_r14_jobs_redaction.py` | R14-AC-7 | `run_job` จริง (harness `test_run_engine`), `show_table_popup` Mock: `inserted` บรรทัด `Error       : ` ไม่รั่ว/ไม่ mask เกิน, `Status      : Fail`, popup DataFrame `Error` ไม่รั่ว, `_finish_job_result_report.assert_called_with(1, 0, 1)` |
+| 〃 | R14-AC-8 | `run_selected_job(jobs_override=[A, B, C])` B raise; `show_batch_summary` จริงหรือจับ args → (3 jobs, 2, 1); log ไม่รั่ว; case B เป็น UPDATE ล้ม → C ไม่ถูกรัน |
+| 〃 | R14-AC-9 | `update_job_status` raise ตอน schedule (ให้ `root.after` raise ครั้งแรกด้วย err) → `show_batch_error` จริง: insert ไม่รั่ว, ปุ่ม normal, `_batch_running False` |
+| 〃 | R14-AC-13/14 (Run Job, Run all) | เปลี่ยน `_connected_password` / `engine` หลังเริ่มก่อนรัน thread → ไม่รั่ว; `None` → (3) ไม่ถูกแก้ |
+| `test_r14_export_redaction.py` | R14-AC-10 | ตาม harness `tests/test_r7_excel_cell_limit.py` / `test_r10_export_atomic_write.py` (`filedialog.asksaveasfilename` → temp path, `_reuse_last_run_results` คืน jobs): A คืน DataFrame, B raise; อ่านไฟล์ด้วย `openpyxl`: sheet B `Status = Failed`, `Error` ไม่รั่ว/ไม่ mask เกิน, `Query` = SQL เดิม; log ไม่รั่ว; summary `Success: 1`, `Failed: 1`, `Warning: 0` |
+| 〃 | R14-AC-11 | (ก) `"x " + (PW + " ") * N` ให้ดิบ > 32,767 หลัง redact ≤ 32,767 → cell = ข้อความ redact, ไม่มี Warning column `'Error'`; (ข) `"PWD=;" * M` ดิบ ≤ 32,767 หลัง redact > 32,767 → cell ว่าง + Warning |
+| 〃 | R14-AC-12 | patch `app._ensure_export_target_writable` raise err → `Error: RuntimeError: ...` ใน insert + `showerror` ไม่รั่ว |
+| 〃 | R14-AC-13/14 (Export) | เหมือนข้างบน |
+| ทุกไฟล์ (subTest ใน `test_r14_run_redaction.py`) | R14-AC-16 | error 3 แบบใน spec ผ่าน P1-P12 → ทุกปลายทางเท่ากับรอบ oracle; ตัวนับเท่ากัน |
+| 〃 | R14-AC-17 (ส่วน static) | ทุก `redact_secrets(` ใน source ≤ 95; `error_details` keys = `{"type","message","traceback","query"}` |
+
+R14-AC-17 (stdout / logs) และ R14-AC-18 = R14-T regression
+
+## R14-D8. ความเสี่ยงและผลกระทบ
+
+| # | ความเสี่ยง | การควบคุม |
+|---|---|---|
+| R14-R1 | อ่าน `_connected_password` / `self.engine` ใน worker (ผิด snapshot, R14-AC-13) | อ่านเฉพาะจุดใน R14-D2 บน main thread; ใน worker ใช้แค่ตัวแปร closure |
+| R14-R2 | Python ลบตัวแปร `e` เมื่อจบ `except` → lambda ที่อ้าง `e` ตรง ๆ พัง / redact ใน main thread | คำนวณ `redact_secrets(str(e), ...)` ใน worker เป็น default arg ของ lambda (`err=...`) |
+| R14-R3 | Export: เรียก `str(job_err)` ใหม่ใน dict แทน `error_text` → cell รั่ว หรือตรวจ 32,767 บนข้อความดิบ | ใช้ `error_text` ตัวเดียว (R14-D4); AC-10 / AC-11 |
+| R14-R4 | เปลี่ยน prefix / ช่องว่าง / ชนิดข้อมูลโดยไม่ตั้งใจ → R14-AC-16 และ test เดิมล้ม | แก้เฉพาะ expression ภายใน f-string; oracle test |
+| R14-R5 | บรรทัด `redact_secrets(` > 95 (เช่น P11, P6) → R13-AC-9 ล้ม | แยกตัวแปรก่อน |
+| R14-R6 | stub เดิมที่ไม่มี `_connected_password` | `_connected_password_for` ใช้ `getattr(..., None)` อยู่แล้ว → `None`; รัน full suite ยืนยัน |
+| R14-R7 | traceback ที่ redact มีบรรทัด source ของ library ที่ตรง pattern ถูก mask บางส่วน | ยอมรับตาม R14-Q-2 |
+| R14-R8 | test พิมพ์รหัสออก stdout / เขียน `logs/` (R14-AC-17) | patch `print` ทุก test; `_write_run_log` Mock หรือ log dir ใน temp |
+
+## R14-D9. AC → Task
+
+| AC | Task | AC | Task | AC | Task |
+|---|---|---|---|---|---|
+| R14-AC-1 | R14-T1, R14-T3 | R14-AC-2 | R14-T1, R14-T3 | R14-AC-3 | R14-T1, R14-T3 |
+| R14-AC-4 | R14-T1, R14-T3 | R14-AC-5 | R14-T1, R14-T3 | R14-AC-6 | R14-T1, R14-T3 |
+| R14-AC-7 | R14-T2, R14-T3 | R14-AC-8 | R14-T2, R14-T3 | R14-AC-9 | R14-T2, R14-T3 |
+| R14-AC-10 | R14-T2, R14-T3 | R14-AC-11 | R14-T2, R14-T3 | R14-AC-12 | R14-T2, R14-T3 |
+| R14-AC-13 | R14-T1, R14-T2, R14-T3 | R14-AC-14 | R14-T1, R14-T2, R14-T3 | R14-AC-15 | R14-T1, R14-T3 |
+| R14-AC-16 | R14-T1, R14-T2, R14-T3 | R14-AC-17 | R14-T3, R14-T | R14-AC-18 | R14-T3, R14-T |

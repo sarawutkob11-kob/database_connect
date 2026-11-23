@@ -800,3 +800,54 @@ Test ไม่ได้ผ่านแบบไม่ได้ตรวจอะ
 2. [database_connect_gui.py:114] userinfo pattern ไม่ mask รหัสที่มี `/` ดิบอีกต่อไป (`mysql://u:pa/ss@h` คงเดิม ขณะที่ R12 mask ได้) — เป็นการแลกตาม R13-Q-1 (ง) ที่ผู้ใช้ยอมรับ และแอป `quote_plus` รหัสเสมอ + known secret ≥ 4 ตัวปิดให้; เสนอ pin กรณีนี้ใน `test_ac12_known_limits_pinned` ให้เห็นเป็น known limit เหมือน (ก) / (จ)
 3. [database_connect_gui.py:99-100] pattern quote หยุดที่ quote ตัวแรก: `PWD='ab'cd;` → `PWD='***'cd;`, `PASSWORD='it''s'` → `'***''s'` (ส่วนหลังรหัสยังเห็น) — เกิดเฉพาะเมื่อไม่มี known secret (รหัส < 4 ตัว หรือมาจากที่อื่น) และ `build_sqlserver_odbc_connect` ครอบทุกค่าด้วย `{}` อยู่แล้ว จึงไม่ใช่ข้อความที่แอปสร้าง — บันทึกเป็น known limit ได้
 4. [database_connect_gui.py:9628-9631, :11504] สไตล์: lambda ที่ตัดบรรทัดกลาง call (`on_list_tables_error(\n err, loading_dialog, pw)`) อ่านยาก — แยกเป็น `def _report(err=e, pw=credentials[1]): ...` ได้; `import time as _time` ใน `_run_connection_test` ยกมาจากโค้ดเดิม ย้ายไประดับ module ได้ถ้าจะ refactor ต่อ (ไม่บังคับ)
+
+---
+
+# Code Review — Round 14 (ซ่อนรหัสผ่านใน error ตอนรัน P1-P12) — 2026-11-23
+
+## สรุป
+**ผ่าน** — 🔴 0, 🟡 0, 🟢 3
+
+ตรวจ `git diff` เทียบ `00ef40b` (`database_connect_gui.py` +54/-15) + test ใหม่ 3 ไฟล์ (38 test); test เดิมไม่ถูกแก้ (`git status` มีแต่ไฟล์ใหม่ `?? tests/test_r14_*.py`)
+รันซ้ำ: `tests.test_r14_*` → `Ran 38 ... OK`; ทั้งชุด `python -X utf8 -m unittest discover -s tests -p "test_*.py"` → `Ran 1220 ... OK`; output ไม่มี `S3cr` / `PW-14`; `logs/` ไม่มีชิ้นส่วนรหัส
+
+ประเด็นที่ตรวจเป็นพิเศษ:
+1. **แหล่งรหัส / race** — รหัสอ่านบน main thread ครั้งเดียวต่อการรันจาก engine ของ snapshot เดียวกัน: Run `:8646` (+ fallback `:6955` ยังอยู่บน main thread เพราะ `_execute_query_background` ถูกเรียกจาก main thread ก่อนสร้าง thread), Run Job `:10049`, Run all `:10174`, Export `:10628`; worker ใช้แค่ตัวแปร closure — ไม่อ่าน `_connected_password` / `self.engine` / ช่อง Password. reconnect ระหว่างรันไม่กระทบ (AC-13 มี test ทั้ง 4 เส้นทาง + นับ `get_calls`). `on_query_error` `:8726` และ `stop_running_queries` อ่าน `self.engine` บน main thread (Stop ใช้ `getattr` เพราะอาจกดก่อน Connect — ยอมรับได้, `__init__` `:2518` ตั้ง `self.engine = None` อยู่แล้ว)
+2. **ครอบคลุม P1-P12** — redact ที่ต้นทางครบ: P1 `:7007-7008` (ครอบ P2-P5 เพราะทุกปลายทางอ่าน `error_details`), P6 `:8726`, P7 `:10126`, P8 `:10317`, P9 `:10341`, P10 `:11047` + traceback `:11053` (log และ cell ใช้ข้อความเดียวกัน), P11 `:11088`, P12 `:8402`. ค้นเพิ่ม (`str(e)`, `{e}`, `format_exc`, `print_exc`, ผู้เรียก `read_sql_dataframe` / `_execute_modification` / `engine.connect`) ไม่พบเส้นทางรันอื่นที่ error ของ DB ออกไปดิบ — ที่เหลือเป็น Connect / Test / Tables (R12-R13 redact แล้ว) หรือ error ที่ไม่ใช่ DB. Retry (`retry_query` → `execute_query`) อ่านรหัสใหม่ตามปกติ. `Failed to append SQL` `:10984` **ไม่เสี่ยง** — ดู 🟢-2
+3. **ไม่มีรหัส = เหมือนเดิม** — P7/P8/P9 ส่ง `str` แทน exception; ปลายทาง (`update_job_status` `Error       : {error}`, `pd.DataFrame({"Error": [str(error)]})`, `show_batch_error` `str(error)`) ให้ผลเท่ากันทุกตัวอักษร ไม่มีจุดใดใช้ `type(error)` / `isinstance`. ตัวนับ / `_finish_job_result_report` / การหยุด loop เมื่อ modify ล้มไม่เปลี่ยน. Export redact ก่อน `blank_oversized_cells` (AC-11 ก/ข มี test ทั้งสองทิศ)
+4. **SQL ของผู้ใช้ไม่ถูกแตะ** — `error_details["query"]`, `print("Query: ...")`, cell `Query`, `SQL:` ใน log ไม่ผ่าน `redact_secrets` (R14-Q-1); AC-10 / AC-11b ตรวจ cell `Query` = SQL เดิม
+5. **Test** — assert ผลจริง: ตรวจ "ไม่รั่ว" ทุกชิ้น + "ไม่ mask เกิน"; AC-16 เทียบกับ oracle (patch `redact_secrets` = identity) **และ** assert ข้อความคาดหวังตรงตัว; AC-14 pin known limit แบบ (3) ตาม R14-Q-3 (ถูกตาม spec ไม่ใช่ pin พฤติกรรมผิด); worker ใช้ `read_sql_dataframe` raise ในฟังก์ชันจริงจึงมี traceback จริง
+
+## Verdict ราย R14-AC
+
+| AC | ผล | หลักฐาน |
+|---|---|---|
+| R14-AC-1 | ✅ | `:7007-7008`; `test_ac1_last_error_details_masked` |
+| R14-AC-2 | ✅ | debug print ใช้ตัวแปรที่ redact แล้ว `:7022-7023`; `test_ac2_debug_prints_masked` |
+| R14-AC-3 | ✅ | `on_query_error_enhanced` อ่าน `error_details` (ไม่แก้ตาม D3); `test_ac3_*` |
+| R14-AC-4 | ✅ | `test_ac4_dialog_and_clipboard_masked` |
+| R14-AC-5 | ✅ | `test_ac5_error_debug_tab_masked`, `test_ac5_later_poll_*` |
+| R14-AC-6 | ✅ | `:8726`; `test_ac6_dialog_closed_before_error`, `test_ac6_raw_exception_passed_directly` |
+| R14-AC-7 | ✅ | `:10126`; `test_ac7_run_job_error_masked` |
+| R14-AC-8 | ✅ | `:10317`; `test_ac8_failed_select_job_masked_and_counted`, `test_ac8_failed_modify_job_still_stops_the_run` |
+| R14-AC-9 | ✅ | `:10341`; `test_ac9_batch_error_masked_buttons_back` |
+| R14-AC-10 | ✅ | `:11047-11059`; `test_ac10_failed_sheet_and_logs_masked` (อ่าน xlsx จริง) |
+| R14-AC-11 | ✅ | redact ก่อน `blank_oversized_cells`; `test_ac11a_*`, `test_ac11b_*` |
+| R14-AC-12 | ✅ | `:11088` คง `<class>: `; `test_ac12_fatal_error_masked` |
+| R14-AC-13 | ✅ | snapshot บน main thread; `test_ac13_*` ทั้ง Run / Run Job / Run all / Export + `gets_after_start == 0` |
+| R14-AC-14 | ✅ | `test_ac14_*` ทั้ง 3 ไฟล์ |
+| R14-AC-15 | ✅ | `:8391-8402`; `test_ac15_*` (รวมกรณีไม่มี engine / engine ไม่มีรหัส) |
+| R14-AC-16 | ✅ | `test_ac16_*` (oracle + ข้อความตรงตัว); QA ยืนยันผ่านกับโค้ดเก่าด้วย |
+| R14-AC-17 | ✅ | `test_redact_lines_at_most_95`, `test_no_password_field_in_run_records`; ไม่มีรหัสใน output / `logs/` (รันซ้ำแล้ว) |
+| R14-AC-18 | ✅ | `Ran 1220 ... OK` (utf-8 รันซ้ำแล้ว; cp874 + redirect ตามผล QA) = 1182 + 38; test เดิมไม่ถูกแก้ |
+
+## 🔴 Critical (ต้องแก้ก่อน merge)
+- ไม่มี
+
+## 🟡 Warning (ควรแก้)
+- ไม่มี
+
+## 🟢 Suggestion (ทางเลือก)
+1. [database_connect_gui.py:10320] บรรทัด `lambda i=idx, j=job, err=err_text, qt=elapsed_time: self.update_job_status(` ยาว 103 ตัวอักษร (เดิม 96 ก็เกิน PEP 8 อยู่แล้ว) — ไม่กระทบผล; ถ้าจะแก้ให้ขึ้นบรรทัดใหม่หลัง `lambda ...:` หรือเปลี่ยนชื่อ `err_text` → `err` ไม่จำเป็นใน Round นี้ (minimal diff)
+2. [database_connect_gui.py:10982-10984] `log(f"Failed to append SQL: {str(e)}")` ไม่ redact — **ตัดสิน: ไม่เสี่ยง** ไม่ต้องแก้: `append_sql_annotation` ทำงานกับ worksheet ของ openpyxl + ข้อความ SQL ของผู้ใช้เท่านั้น ไม่แตะ engine / connection จึงไม่มีทางได้ connection string; ถ้า error ของ openpyxl สะท้อนเนื้อ SQL ก็อยู่ในขอบเขต R14-Q-1 (SQL ของผู้ใช้ไม่ redact) ตรงกับที่ spec R14-2 จัดเป็น "ไม่ใช่เส้นทาง"
+3. [database_connect_gui.py:6955] `password=None` มีสองความหมาย ("ไม่ได้ส่ง" กับ "engine ไม่มีรหัส") ทำให้อ่าน `_connected_password_for(engine)` ซ้ำเมื่อผู้เรียกส่ง `None` มาจริง — ผลเหมือนกัน (ยังบน main thread, ได้ `None` เท่าเดิม) ไม่มีผลกระทบ; ถ้าอยากชัดใช้ sentinel ได้ในอนาคต

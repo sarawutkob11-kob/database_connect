@@ -926,3 +926,45 @@
 | R13-AC-10 | R13-T1, R13-T4 | R13-AC-11 | R13-T4 (review) | R13-AC-12 | R13-T1, R13-T4 |
 | R13-AC-13 | R13-T4 | R13-AC-14 | R13-T4 | R13-AC-15 | R13-T4 |
 | R13-AC-16 | R13-T3, R13-T4 | R13-AC-17 | R13-T | R13-AC-18 | R13-T4, R13-T |
+
+---
+
+# Round 14 — ซ่อนรหัสผ่านใน error ตอนรัน (P1-P12)
+
+> design: `docs/design.md` หัวข้อ Round 14 (R14-D1..D9); คำตอบผู้ใช้ R14-Q-1..3 (2026-11-23) ตามค่าแนะนำ; ห้าม commit; test เดิมห้ามแก้; ทุกบรรทัด `redact_secrets(` ≤ 95
+
+- [x] R14-T1: Run (P1-P6) + Stop (P12)
+  - ไฟล์: `database_connect_gui.py` — `_execute_query_background` (`:6942-7027`), `execute_query` (`:8638-8641`), `on_query_error` (`:8714-8732`), `stop_running_queries` (`:8384-8395`)
+  - ทำอะไร: ตาม R14-D2 / R14-D3 — เพิ่ม keyword `password: Optional[str] = None` (None → `self._connected_password_for(engine)` บน main thread ก่อน start thread); `execute_query` ส่ง `password=self._connected_password_for(target.engine)`; P1 redact `str(e)` + `format_exc()` (P2-P5 ได้ผลอัตโนมัติ ไม่แก้); P6 redact ซ้ำด้วยรหัสของ `self.engine`; P12 อ่านรหัสก่อน loop แล้ว redact ใน print; รัน `python -m unittest tests.test_run_engine tests.test_r13_connect_redaction` ต้องผ่าน
+  - AC ที่ครอบคลุม: R14-AC-1..6, R14-AC-13 (Run), R14-AC-14 (Run), R14-AC-15, R14-AC-16 (P1-P6, P12)
+  - ขึ้นกับ: -
+  - บันทึก dev (2026-11-23): ทำตาม R14-D2/D3; ต่างจาก design จุดเดียว — P12 อ่านรหัสด้วย `getattr(self, "engine", None)` เพราะ stub ของ `tests/test_running_banner.py::StopRunningQueriesTests` ไม่มี `engine` (Stop ก่อน Connect ก็เป็นกรณีจริง) ผลเท่ากับ `self.engine` เมื่อมี; full suite 1182 OK
+- [x] R14-T2: Run Job / Run all / Export (P7-P11)
+  - ไฟล์: `database_connect_gui.py` — `run_job` (`:10036`, `:10111-10113`), `run_selected_job` (`:10156`, `:10299-10303`, `:10322`), `export_jobs_to_excel` (`:10606`, `:11020-11036`, `:11063-11064`)
+  - ทำอะไร: ตาม R14-D2 / R14-D3 / R14-D4 — อ่าน `run_password` / `export_password` ครั้งเดียวหลังบรรทัดหยิบ engine; redact ใน worker เป็น default arg ของ lambda (ส่ง `str` ให้ `finish` / `update_job_status` / `show_batch_error`); Export ใช้ `error_text` ตัวเดียวทั้ง log และ cell `Error` **ก่อน** `blank_oversized_cells`; traceback redact; fatal คง prefix `<Class>: `; ไม่แตะ `update_job_status`, `show_batch_error`, `on_done`, `job_results["_error"]`, ข้อความ replace `OSError`; รัน `python -m unittest tests.test_run_engine_batch tests.test_r7_excel_cell_limit tests.test_r10_export_atomic_write tests.test_run_entry_block` ต้องผ่าน
+  - AC ที่ครอบคลุม: R14-AC-7..12, R14-AC-13 / AC-14 (Run Job, Run all, Export), R14-AC-16 (P7-P11)
+  - ขึ้นกับ: - (ทำขนานกับ R14-T1 ได้ ไฟล์เดียวกันคนละช่วง)
+  - บันทึก dev (2026-11-23): P8 / P9 คำนวณ `redact_secrets(...)` ใน worker เป็นตัวแปร (`err_text` / `batch_err`) ก่อนส่งเป็น default arg ของ lambda (บรรทัดเดียวจะเกิน 95); `log(f"Failed to append SQL: {str(e)}")` ใน export ไม่อยู่ใน P1-P12 จึงไม่แตะ; full suite 1182 OK
+- [x] R14-T3 (qa): เขียน `tests/test_r14_*.py`
+  - ไฟล์: `tests/test_r14_run_redaction.py`, `tests/test_r14_jobs_redaction.py`, `tests/test_r14_export_redaction.py`
+  - ทำอะไร: ตามแผน R14-D7 — stub `GUI.__new__` ไม่มี Tk จริง ไม่มี DB จริง (sqlite / Mock raise ได้), patch `print` ทุก test, Export เขียนเฉพาะ temp dir แล้วอ่านด้วย `openpyxl`; oracle R14-AC-16 (patch `app.redact_secrets` เป็น identity แล้วเทียบ); ยืนยันว่า test ใหม่ล้มกับโค้ด HEAD (สำเนาใน scratchpad) ในจุดที่เกี่ยวกับการรั่ว; ตรวจ `git diff tests/` ว่าไม่แก้ test เดิม
+  - AC ที่ครอบคลุม: R14-AC-1..16 (ทดสอบ), R14-AC-17 (ส่วน static), R14-AC-18 (ส่วน test ใหม่)
+  - ขึ้นกับ: R14-T1, R14-T2
+  - บันทึก QA (2026-11-23): test ใหม่ 38 (run 21, jobs 10, export 7; subTest ครอบ error (1)(2)(3) และ error ไม่มีรหัส 3 แบบ); AC-5 ตรวจ**ทางตรง** — เรียก `_build_error_debug_tab` จริงโดย patch `tk.Frame` / `tk.Checkbutton` / `ui_button` / `ui_round_check` / `scrolledtext.ScrolledText` แล้วอ่านสิ่งที่ `_poll_last_error` insert (รวม poll รอบถัดไปผ่าน `after`) ไม่ต้องใช้การตรวจทางอ้อม; AC-11 (ก) ดิบ 33,802 → redact 10,406 เขียน cell ได้ ไม่มี Warning, (ข) `"PWD=;" * 6000` ดิบ 30,000 → 48,000 cell ว่าง + Warning 1 ครั้ง; AC-13 ครบ Run (`execute_query`, ผู้เรียก `_execute_query_background` เดิมแบบไม่ส่ง `password` ทั้งไม่ส่ง engine / ส่ง engine) / Run Job / Run all (รวม P9 สองแบบ: `root.after` raise และ `update_job_status("running")` raise) / Export (job ล้มและ fatal), `db_password.get` = 0; P12 มี / ไม่มี `engine`; AC-16 oracle = รันซ้ำโดย patch `redact_secrets` เป็น identity + ตรวจข้อความเดิมตรงตัว (`Error       : `, popup `Error` = `str(exception)`, `Error: `, `Error : `, `Error: RuntimeError: `, `Stop: cancel failed: `) และตัวนับ; กับโค้ด HEAD (สำเนาใน scratchpad): test ด้าน redact ล้มทั้งหมด (86 failure ใน subTest) ส่วน test AC-16 ผ่าน (ยืนยันว่าพฤติกรรมเดิมไม่เปลี่ยน) และ output ตอนล้มไม่มีชิ้นส่วนรหัส; `git diff tests/` ไม่มี test เดิมถูกแก้
+- [x] R14-T: Regression ทั้งชุด สอง mode encoding
+  - ไฟล์: - (รันเท่านั้น)
+  - ทำอะไร: `python -m unittest discover -s tests -p "test_*.py"` (ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง (cp874) + redirect stdout/stderr ไปไฟล์ → `OK` ทั้งคู่ จำนวนเท่ากัน ≥ 1182 + test ใหม่; ค้น `S3cr` / `PW-14` ใน output ทั้งสองไฟล์และ `logs/` ต้องไม่พบ, `logs/` ไม่เปลี่ยน; `tests/test_run_target.py` ผ่าน
+  - AC ที่ครอบคลุม: R14-AC-17, R14-AC-18
+  - ขึ้นกับ: R14-T3
+  - บันทึก QA (2026-11-23): (ก) `PYTHONIOENCODING=utf-8` → `Ran 1220 tests` `OK`; (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` (cp874) + redirect stdout/stderr ลงไฟล์ → `Ran 1220 tests` `OK` (= 1182 + 38); ค้น `S3cr` / `PW-14` ใน output ทั้งสองไฟล์และ `logs/` ไม่พบ; `logs/` ไม่เปลี่ยน; `tests/test_run_target.py` ผ่าน
+
+## ตาราง R14-AC → Task
+
+| AC | Task | AC | Task | AC | Task |
+|---|---|---|---|---|---|
+| R14-AC-1 | R14-T1, R14-T3 | R14-AC-2 | R14-T1, R14-T3 | R14-AC-3 | R14-T1, R14-T3 |
+| R14-AC-4 | R14-T1, R14-T3 | R14-AC-5 | R14-T1, R14-T3 | R14-AC-6 | R14-T1, R14-T3 |
+| R14-AC-7 | R14-T2, R14-T3 | R14-AC-8 | R14-T2, R14-T3 | R14-AC-9 | R14-T2, R14-T3 |
+| R14-AC-10 | R14-T2, R14-T3 | R14-AC-11 | R14-T2, R14-T3 | R14-AC-12 | R14-T2, R14-T3 |
+| R14-AC-13 | R14-T1, R14-T2, R14-T3 | R14-AC-14 | R14-T1, R14-T2, R14-T3 | R14-AC-15 | R14-T1, R14-T3 |
+| R14-AC-16 | R14-T1, R14-T2, R14-T3 | R14-AC-17 | R14-T3, R14-T | R14-AC-18 | R14-T3, R14-T |

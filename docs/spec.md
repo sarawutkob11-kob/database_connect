@@ -1486,3 +1486,128 @@ AC ใช้คำตอบที่แนะนำเป็นค่าเร�
 | R13-Q-3 | 🟢9 element ที่ไม่ใช่ dict ใน `saved_jobs` ตอน Load Preset (กด Yes): เก็บไว้ หรือทิ้ง | **เก็บไว้** — ไม่ใช่ Job ของ Profile ปัจจุบัน (สอดคล้องกับตัวนับที่ไม่นับมัน), ไม่ทำลายข้อมูลที่ไม่เข้าใจ; ในทางปฏิบัติไม่เกิดเพราะ `load_jobs` reject ตั้งแต่โหลด (R13-AC-16) |
 
 คำตอบผู้ใช้ (2026-11-23): **R13-Q-1** แก้ (ข) (ค) (ง); ยอมรับ (ก) URL ไม่ encode ที่มี `@` และ (จ) known secret ที่เป็นคำทั่วไป เป็น known limit (R13-AC-12 คงตามเดิม) · **R13-Q-2** ไม่ redact error ตอนรัน (Run / Run Job / Run All / Export / Error & Debug / reconnect) ใน Round นี้ · **R13-Q-3** element ที่ไม่ใช่ dict ใน `saved_jobs` ตอน Load Preset → เก็บไว้ในลำดับเดิม (R13-AC-16 คงตามเดิม)
+
+---
+
+# Round 14 — ซ่อนรหัสผ่านใน error ตอนรัน (ต่อจาก R13-Q-2)
+
+> ใช้เลข `R14-AC-x` / `R14-Q-x` แยกจาก Round ก่อนหน้า ไม่แก้เนื้อหา Round ก่อนหน้า
+> ที่มา: ผู้ใช้สั่งทำข้อที่ R13-Q-2 ตัดออก (ด่วน)
+> เลขบรรทัด `database_connect_gui.py` ณ 2026-11-23 (commit `00ef40b`) อาจคลาดเล็กน้อย
+
+### R14-1. เป้าหมาย / ปัญหา
+
+Round 13 redact เฉพาะ error ของ Connect / Test connection / Tables แต่ error ของ DB driver ตอน**รัน** (Run, Run Job, Run all, Export Excel) ยังออกไปดิบ ๆ ทั้ง `str(e)` และ `traceback.format_exc()` ไปยัง Execution Logs (→ `logs/run_*.log` ผ่าน `_insert_and_log` `:3316-3324`), messagebox, popup, dialog Error Details + clipboard, แท็บ Error & Debug, console (`print`) และ cell `Error` ในไฟล์ Excel. ถ้า driver / SQLAlchemy ใส่ connection string ไว้ใน error (เช่นตอน `pool_pre_ping` reconnect ใน `engine.raw_connection()` / `engine.connect()` ระหว่างรัน) รหัสผ่านจะหลุดไปทุกที่ที่กล่าวมา
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่ส่ง log / ไฟล์ Excel / screenshot ให้คนอื่น, ผู้ดูแลความปลอดภัย
+
+### R14-2. เส้นทางที่พบ (ค้นด้วย `str(e)`, `str(error)`, `format_exc`, `print_exc`, `print(... {e})`)
+
+| # | เส้นทาง | ฟังก์ชัน / บรรทัด | ปลายทาง |
+|---|---|---|---|
+| P1 | Run — worker except | `_execute_query_background.execute_in_background` `:6999-7027` (`message` `:7002`, `traceback` `:7003`, `self.last_error_details` `:7022`) | ต้นทางของ P2-P5 |
+| P2 | Run — debug print | `:7013-7019` (`Error Message`, `Full Traceback`) เมื่อ Debug mode | console |
+| P3 | Run — แสดงผล error | `on_query_error_enhanced` `:7112-7119` (`Error Message`, `Debug Traceback`) | Execution Logs + run log |
+| P4 | Run — Show Details | `_show_error_details_dialog` Label `:7172`, traceback `:7219`, `copy_error` `:7226-7233` | dialog, clipboard |
+| P5 | แท็บ Error & Debug | `_build_error_debug_tab._poll_last_error` `:9052-9060` (อ่าน `last_error_details`) | แท็บ |
+| P6 | Run — dialog ถูกปิดก่อนจบ / ผู้เรียกเดิม | `on_query_error` `:8726`, `:8732` (เรียกจาก `:7041`) | Execution Logs + run log, `messagebox.showerror` |
+| P7 | Run Job | `run_job.run_in_background` except `:10111-10113` → `finish` → `update_job_status(status="error")` `:10386` (`Error       : {error}`), popup `pd.DataFrame({"Error": [str(error)]})` `:10393` | Execution Logs + run log, popup ผลลัพธ์ (ซึ่ง export CSV/Excel ต่อได้) |
+| P8 | Run all — ต่อ Job | `run_selected_job.run_all_jobs` except `:10279-10305` → `update_job_status(..., show_popup=False)` `:10301` | Execution Logs + run log |
+| P9 | Run all — ทั้งชุดล้ม | except `:10321-10322` → `show_batch_error` `:11087` | Execution Logs + run log |
+| P10 | Export — Job ล้ม | `export_jobs_to_excel.worker` except `:11020-11040`: `log("Error : ...")` `:11028`, `log(traceback.format_exc())` `:11029`, cell `Error` `:11035` (ผ่าน `blank_oversized_cells`) | Execution Logs + run log, ไฟล์ Excel |
+| P11 | Export — fatal | `:11063-11064` → `on_done` `:10641`, `:10643` | Execution Logs + run log, `messagebox.showerror` |
+| P12 | Stop — cancel ล้ม | `stop_running_queries` `:8394-8395` `print(f"Stop: cancel failed: {e}")` (error ของ driver) | console |
+
+ตรวจแล้ว**ไม่ใช่เส้นทาง**: `show_batch_summary` (แสดงแค่ชื่อ Job ที่ล้ม), `job_results["_error"]` (ใช้ตรวจ `is None` เท่านั้น), `show_critical_error` `:11098` (ไม่มีผู้เรียก), `run_selected_job` `error_msg` `:10281` (ไม่ถูกใช้), `print("Error in error handler")` + `traceback.print_exc()` `:7124-7125` และ `Failed to append SQL` `:10962` (error ของ Tk / openpyxl ไม่ใช่ DB), debug print `Engine:` `:6965` (แสดงแค่ชื่อ dialect อยู่แล้ว)
+
+### R14-3. ขอบเขต
+
+#### In scope
+- P1-P12: ข้อความ error และ traceback ผ่าน `redact_secrets(<text>, <password ของ engine ที่รัน>)` **ที่ต้นทาง** (ก่อนเก็บลง `last_error_details` / ส่งให้ main thread / `log` / เขียน cell / ตัดความยาว / ตรวจ 32,767) — ปลายทางทั้งหมดจึงได้ข้อความเดียวกันที่ redact แล้ว
+- password = `_connected_password_for(target.engine)` อ่านครั้งเดียวบน main thread ตอนเริ่มรัน (snapshot เดียวกับ engine ของการรันนั้น) แล้วส่งให้ worker — **ไม่อ่านช่อง Password** และไม่อ่าน `_connected_password` ซ้ำใน worker
+- P12 ใช้ `_connected_password_for(self.engine)` + pattern
+- `on_query_error` (P6) redact ซ้ำด้วย pattern + `_connected_password_for(self.engine)` เพื่อคุมผู้เรียกที่ส่ง exception ดิบ (redact ซ้ำบนข้อความที่ redact แล้วไม่เปลี่ยนผล)
+
+#### Out of scope
+- redact ข้อความ SQL ของผู้ใช้เอง (cell `Query`, กล่อง Failed Query, ส่วน `QUERY` ในแท็บ Error & Debug, `print("Query: ...")`, `SQL:` / `SQL         :` ใน Execution Logs / run log) — ตาม R14-Q-1
+- เปลี่ยน `_SECRET_PATTERNS` / เกณฑ์ 4 ตัว / known limit (ก) (จ) ของ R13-Q-1
+- เปลี่ยนรูปแบบข้อความ, layout dialog, ตัวนับ, ลำดับการทำงาน; เส้นทางที่ระบุว่า "ไม่ใช่เส้นทาง" ใน R14-2
+- error ของ Connect / Test connection / Tables (ทำแล้วใน R12 / R13), commit
+
+### R14-4. User stories
+- **R14-US-1**: ในฐานะผู้ใช้ที่รัน query / Job แล้วล้ม ฉันต้องการเห็นสาเหตุจากฐานข้อมูลโดยไม่มีรหัสผ่านบนจอ ใน log ใน console หรือในไฟล์ Excel เพื่อส่งต่อให้ทีมอื่นได้อย่างปลอดภัย
+- **R14-US-2**: ในฐานะผู้ใช้ที่ไม่มี error เกี่ยวกับรหัส ฉันต้องการให้ข้อความ error และผลรันเหมือนเดิมทุกตัวอักษร
+
+### R14-5. Acceptance criteria
+
+วิธีทดสอบ: `unittest` แบบ stub เหมือน Round 13 (`DatabaseConnectorGUI.__new__`, patch `threading.Thread` ให้รัน target ทันที, `root.after` เรียกทันที, patch `messagebox` / `print` / `tk.Label` / `tk.Text` / `tk.Toplevel`, `read_sql_dataframe` / `_execute_modification` raise) ไม่ต่อ DB จริง ไม่เปิด Tk จริง; Export เขียนไฟล์จริงใน temp dir แล้วอ่านด้วย `openpyxl`; ไฟล์ test ใหม่อยู่ใน `tests/test_r14_*.py`
+
+นิยาม:
+- `PW = "S3cr;t}PW-14"`; engine ของการรัน `E` และ `_connected_password = (E, PW)`; ช่อง Password = `"field-pw-x"` (ต่างจาก `PW`)
+- "error ที่มีรหัส" (subTest): (1) ODBC ดิบ `... PWD={S3cr;t}}PW-14};Encrypt=yes ... Login failed for user 'u'.`; (2) `odbc_connect=` + `quote_plus(<ODBC ข้อ 1>)` + ` Login failed for user 'u'.`; (3) `bad password S3cr;t}PW-14 for u` (รหัสตรงตัว ไม่มี `PWD=`)
+- "ไม่รั่ว" = ไม่มี `PW`, `quote_plus(PW)`, `S3cr`, `PW-14`, `}}PW-14`, `%7D%7DPW-14`; "ไม่ mask เกิน" = ยังมี `Login failed for user 'u'` (หรือ `bad password` / `for u`)
+- "traceback" = `traceback.format_exc()` ของ exception ที่มีรหัส (ข้อความ exception อยู่ท้าย traceback)
+
+#### Run (P1-P6)
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-1 | **Given** `execute_query` บน `E`, query raise "error ที่มีรหัส" **When** worker จบ **Then** `last_error_details["message"]` และ `["traceback"]` "ไม่รั่ว"; `message` "ไม่ mask เกิน"; `["type"]` = ชื่อ class เดิม; `["query"]` = SQL เดิม |
+| R14-AC-2 | **Given** R14-AC-1 และ Debug mode เปิด **When** worker จบ **Then** ทุก `print` ที่จับได้ "ไม่รั่ว" (บรรทัด `Error Message:` และ `Full Traceback:`) |
+| R14-AC-3 | **Given** R14-AC-1 (Debug mode เปิดและปิด) **When** `on_query_error_enhanced` **Then** ทุกข้อความที่ `results_text.insert` ได้รับ (รวม `Debug Traceback`) และสิ่งที่ `_write_run_log` ได้รับ "ไม่รั่ว"; บรรทัด `Error Message: ` ยังอยู่ |
+| R14-AC-4 | **Given** `error_details` จาก R14-AC-1 **When** `_show_error_details_dialog` และกด `copy_error` **Then** `text` ของ Label, ข้อความที่ใส่ใน traceback Text และ `clipboard_append` "ไม่รั่ว" |
+| R14-AC-5 | **Given** `last_error_details` จาก R14-AC-1 **When** `_poll_last_error` ของแท็บ Error & Debug ทำงาน **Then** ข้อความที่ insert ลง `debug_text` "ไม่รั่ว" (ส่วน type: message และ TRACEBACK) |
+| R14-AC-6 | **Given** loading dialog ถูกปิดก่อน error มาถึง (`winfo_exists` → False) และกรณีเรียก `on_query_error(<exception ดิบ>, dialog)` ตรง ๆ โดย `self.engine = E` **When** `on_query_error` **Then** `results_text.insert` และ `messagebox.showerror` "ไม่รั่ว" |
+
+#### Run Job / Run all (P7-P9)
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-7 | **Given** `run_job` บน `E`, query raise "error ที่มีรหัส" **When** จบ **Then** บรรทัด `Error       : ...` ใน Execution Logs / run log และ cell `Error` ของ DataFrame ที่ส่งให้ `show_table_popup` "ไม่รั่ว" และ "ไม่ mask เกิน"; `Status      : Fail`, `_finish_job_result_report(1, 0, 1)` เหมือนเดิม |
+| R14-AC-8 | **Given** Run all 3 Job (SELECT ผ่าน, SELECT ล้มด้วย "error ที่มีรหัส", SELECT ผ่าน) **When** จบ **Then** Execution Logs / run log "ไม่รั่ว"; ตัวนับ Total / Success / Fail = 3 / 2 / 1 เหมือนเดิม; และกรณี Job modify ล้มยังหยุด loop ตามเดิม |
+| R14-AC-9 | **Given** Run all ที่ loop ภายนอก raise "error ที่มีรหัส" (เช่น `update_job_status` scheduling ล้ม) **When** `show_batch_error` **Then** Execution Logs / run log "ไม่รั่ว" และปุ่มกลับมา normal เหมือนเดิม |
+
+#### Export Excel (P10-P11)
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-10 | **Given** Export 2 Job บน `E` (Job A ผ่าน, Job B raise "error ที่มีรหัส") **When** export จบ **Then** ใน Excel sheet ของ B: `Status` = `Failed`, cell `Error` "ไม่รั่ว" และ "ไม่ mask เกิน", cell `Query` = SQL เดิมทุกตัวอักษร; บรรทัด `Error : ` และ traceback ใน Execution Logs / run log "ไม่รั่ว"; summary `Success: 1`, `Failed: 1`, `Warning: 0` เหมือนเดิม |
+| R14-AC-11 | **Given** Job ล้มด้วยข้อความ error ที่ (ก) ยาวดิบ > 32,767 แต่หลัง redact ≤ 32,767 (มี `PW` ซ้ำหลายครั้ง) และ (ข) ยาวดิบ ≤ 32,767 แต่หลัง redact > 32,767 (`PWD=` ว่างหลายครั้ง → `PWD=***`) **When** export **Then** (ก) cell `Error` = ข้อความที่ redact แล้ว ไม่มี Warning ของคอลัมน์ `Error`; (ข) cell `Error` ว่าง + log Warning `column 'Error' is over Excel's 32,767-character limit` ตามเดิม — ยืนยันว่า redact **ก่อน** ตรวจความยาว |
+| R14-AC-12 | **Given** worker export raise "error ที่มีรหัส" นอก loop ของ Job (fatal, เช่น patch `_ensure_export_target_writable`) **When** `on_done` **Then** `Error: ...` ใน Execution Logs / run log และ `messagebox.showerror` "ไม่รั่ว"; ข้อความขึ้นต้น `<ชื่อ class>: ` ตามเดิม |
+
+#### แหล่งของรหัส / อื่น ๆ
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-13 | **Given** Run / Run Job / Run all / Export เริ่มบน `E` แล้ว**ระหว่างรัน** `_connected_password` ถูกเปลี่ยนเป็น `(E2, "Other-PW-99")` และ `self.engine = E2` (reconnect) **When** error แบบ (3) ของ `E` มาถึง **Then** ทุกปลายทางของเส้นทางนั้น "ไม่รั่ว" (ใช้รหัส snapshot ตอนเริ่ม); ช่อง Password ไม่ถูกอ่านใน worker (`_FakeEntry.get` ไม่ถูกเรียกหลังเริ่มรัน) |
+| R14-AC-14 | **Given** engine ที่ไม่ได้มาจาก Connect (`_connected_password_for(E) is None`) **When** error แบบ (1) / (2) **Then** "ไม่รั่ว" (ผ่าน pattern); แบบ (3) ไม่ถูกแก้ (known limit — ตาม R14-Q-3) |
+| R14-AC-15 | **Given** `self.engine = E`, connection ปลอมที่ `cancel()` raise "error ที่มีรหัส" **When** `stop_running_queries` **Then** `print` ที่จับได้ "ไม่รั่ว" และยังขึ้นต้น `Stop: cancel failed: ` |
+
+#### ข้อกำหนดเดิมที่ต้องคง
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-16 | **Given** error ที่ไม่มีรหัส (`ORA-00942: table or view does not exist`, `could not translate host name "x" to address`, ข้อความ SQLAlchemy ที่มี `[SQL: SELECT 1]` และลิงก์ `https://sqlalche.me/e/20/f405`) **When** ผ่าน P1-P12 **Then** ทุกปลายทาง (Execution Logs, run log, messagebox, popup, dialog, clipboard, Error & Debug, print, cell `Error` ใน Excel) เท่ากับพฤติกรรมเดิมทุกตัวอักษร และตัวนับ Success / Failed / Warning เท่าเดิม |
+| R14-AC-17 | **Given** test ใหม่ทั้งหมด **When** รัน **Then** ไม่มี `PW` / ชิ้นส่วนรหัสใน stdout / stderr, ใน `logs/` หรือไฟล์ใดนอก temp dir; `last_error_details`, `job_results`, `RunTarget`, `ConnectionInfo` ไม่มี field password (`tests/test_run_target.py` ผ่าน); ทุกบรรทัดที่มี `redact_secrets(` ยังยาว ≤ 95 (test R13-AC-9 เดิมผ่าน) |
+| R14-AC-18 | **Given** แก้ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบ ((ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง บน `cp874` + redirect stdout/stderr ไปไฟล์) **Then** ทั้งสองแบบ `OK` จำนวน test เท่ากัน และ ≥ 1182 + จำนวน test ใหม่ใน `tests/test_r14_*.py`; test เดิมไม่ถูกแก้ |
+
+**สรุปจำนวน AC Round 14**: 18 ข้อ (Run 6, Run Job / Run all 3, Export 3, แหล่งรหัส / อื่น ๆ 3, ข้อกำหนดเดิม 3)
+
+### R14-6. ข้อจำกัด / สมมติฐาน
+- ยังไม่มีหลักฐานว่า driver ใส่รหัสใน error ตอนรันจริง — ปิดความเสี่ยงล่วงหน้า ทดสอบด้วยข้อความจำลองเท่านั้น
+- error ของ SQLAlchemy มี `[SQL: ...]` อยู่ในข้อความ error — เมื่อ redact ทั้งข้อความ error ส่วน SQL **ภายในข้อความ error** ที่ตรง pattern (`password='x'`) จะถูก mask ด้วย (ฝั่งปลอดภัย) ขณะที่ช่อง SQL แยก (cell `Query` ฯลฯ) ไม่ถูกแตะตาม R14-Q-1
+- run log ได้ข้อความจาก `results_text.insert` ที่ถูกห่อ → redact ก่อน insert ครอบ run log; `print` / messagebox / Excel / clipboard ได้ข้อความเดียวกันที่ redact ที่ต้นทาง
+- รหัสอยู่ใน memory เท่านั้น ไม่ถูกเก็บใน `error_details` / `job_results` / log (ส่งผ่านเป็น argument / closure ของ worker)
+- Minimal diff: แก้เฉพาะจุด P1-P12 + การส่งรหัสจาก main thread ให้ worker; PEP 8, บรรทัด `redact_secrets(` ≤ 95; ห้าม commit
+
+### R14-7. คำถามที่ยังไม่มีคำตอบ
+
+AC เขียนตามคำตอบที่แนะนำ ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R14-Q-1 | redact ข้อความ SQL ของผู้ใช้เอง (cell `Query` ใน Excel, กล่อง Failed Query, ส่วน QUERY ในแท็บ Error & Debug, `print("Query: ...")`, `SQL:` ใน Execution Logs / run log) ที่อาจมี `password=` หรือไม่ | **ไม่ redact** — เป็นข้อความที่ผู้ใช้เขียนเอง ไม่ใช่รหัสของ connection; การ redact จะทำให้ SQL ใน Excel / log ไม่ตรงกับที่รันจริงและกระทบ SQL ปกติ (เช่น `WHERE password = 'x'` ในตาราง user) — R14-AC-1 / R14-AC-10 ตรวจว่า SQL คงเดิม |
+| R14-Q-2 | traceback เต็ม (แท็บ Error & Debug, Show Details, Copy, `Debug Traceback` ใน Execution Logs, log ของ Export, debug print) redact แค่ไหน | **redact ทั้งข้อความ traceback ด้วย `redact_secrets` (pattern + รหัสที่รู้ค่า) แต่คง traceback ไว้ครบ** ไม่ตัด / ไม่ซ่อนทั้งก้อน — ยังใช้ debug ได้; ข้อเสียคือบรรทัด source ของ library ที่ตรง pattern (เช่น `url.password = x`) อาจถูก mask บางส่วน (ฝั่งปลอดภัย) |
+| R14-Q-3 | engine ที่ไม่มีรหัสเก็บไว้ (`_connected_password_for` → `None`) ควร fallback ใช้ค่าในช่อง Password หรือไม่ | **ไม่ fallback — ใช้ pattern อย่างเดียว** ตามหลัก "รหัสของ engine ที่รันอยู่ ไม่ใช่ช่องกรอก" (ช่องกรอกอาจถูกแก้แล้วไม่ใช่รหัสของ engine); ในการใช้งานจริง engine มาจาก `connect_database` เสมอจึงมีรหัสเก็บไว้ — R14-AC-14 pin ไว้ |
+
+คำตอบผู้ใช้ (2026-11-23): **R14-Q-1** ไม่ redact SQL ที่ผู้ใช้เขียนเอง (cell `Query`, Failed Query, QUERY ในแท็บ Error & Debug, `SQL:` ใน log) · **R14-Q-2** redact ทั้งข้อความด้วย `redact_secrets` แต่คง traceback ไว้ครบ · **R14-Q-3** engine ที่ไม่มีรหัสเก็บไว้ใช้ pattern อย่างเดียว ไม่อ่านช่อง Password (R14-AC-1..18 คงตามเดิม)
