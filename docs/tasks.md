@@ -637,3 +637,244 @@
 | R7-AC-22 | R7-T6, R7-T7 | R7-AC-23 | R7-T6, R7-T7 | R7-AC-24 | R7-T7 |
 | R7-AC-25 | R7-T6, R7-T7 | R7-AC-26 | R7-T6, R7-T7 | R7-AC-27 | R7-T6, R7-T7, R7-T8 |
 | R7-AC-28 | R7-T8 | | | | |
+
+---
+
+# Round 8 — Bugfix B1: `load_jobs` ทิ้ง Job ทั้งหมดเมื่อเขียน migration กลับไม่สำเร็จ
+
+> อ้างอิง: `docs/spec.md` หัวข้อ Round 8 (R8-AC-1 ถึง R8-AC-15), `docs/design.md` หัวข้อ Round 8 (R8-D1 ถึง R8-D8)
+> R8-Q ที่ผู้ใช้อนุมัติ: Q-1 `print` 1 บรรทัดมี guard แบบ R7-1 ไม่มี dialog / Q-2 ลบ `<jobs_file>.tmp` best-effort ใน `load_jobs` เท่านั้น ไม่แก้ `write_json_atomic` / Q-3 ไม่ retry
+> ขอบเขต: แก้เฉพาะ `load_jobs` ใน `database_connect_gui.py` — บัค B2-B16 อยู่นอกขอบเขต
+> ทุก test ใหม่ห้าม print อักขระนอก cp874 ลง stdout จริง (R8-AC-15 mode ข)
+
+- [x] R8-T1: แยก write-back ของ migration ออกจาก `try` ของการอ่านใน `load_jobs`
+  - ผล QA: `git diff database_connect_gui.py` มี hunk เดียวอยู่ใน `load_jobs` (9509-9533); test ใหม่ R8-T2 ผ่านทั้งหมด
+  - ไฟล์: `database_connect_gui.py` — `load_jobs` (~9482-9521) เท่านั้น
+  - ทำอะไร: ตาม R8-D2 — ย้าย `# บันทึกกลับเฉพาะกรณีพบข้อมูลเก่า` / `if modified:` / `write_json_atomic(self.jobs_file, jobs, indent=4)` และ `return jobs` ออกไปหลัง `except` เดิม; ครอบ `write_json_atomic` ด้วย `try / except Exception as e:` ใหม่ ซึ่ง (1) `try: os.remove(f"{self.jobs_file}.tmp") except Exception: pass` (ต้องใช้ `os.remove`) (2) `try: print(f"Cannot write migrated jobs back to {self.jobs_file}: {e}") except Exception: pass` แล้วไปต่อ `return jobs`; ไม่ตั้ง `_jobs_save_blocked`, ไม่เรียก `_handle_unreadable_file` / `messagebox`; `except` เดิม (print `Error loading jobs` + `_handle_unreadable_file` + `return []`) และ loop เติม `"profile"` คงเดิมทุกตัวอักษร; ไม่แตะ `write_json_atomic`, `preserve_unreadable_file`, `_handle_unreadable_file`, `save_jobs`, loader อื่น; ไม่เพิ่ม flag / retry / dialog
+  - ตรวจด้วยตนเอง: `python -m unittest tests.test_r2_reset_parameter_qa tests.test_bugfix_h3 tests.test_r7_console_print` ผ่าน
+  - AC ที่ครอบคลุม: R8-AC-1 ถึง R8-AC-14 (โค้ด)
+
+- [x] R8-T2: เขียน `tests/test_r8_load_jobs_writeback.py`
+  - ผล QA: 18 test ใหม่ OK; focused (r8 + r2_reset_parameter_qa + bugfix_h3 + r7_console_print) `Ran 86 tests` OK ทั้ง PYTHONIOENCODING=utf-8 และ cp874 redirect ไฟล์; รัน test ใหม่กับโค้ดก่อนแก้ (HEAD) ล้ม 14 failures + 5 errors (จับบั๊ก B1 ได้จริง)
+  - ขึ้นกับ: R8-T1
+  - ไฟล์: `tests/test_r8_load_jobs_writeback.py` (ใหม่)
+  - ทำอะไร: ตาม R8-D6 — stub `GUI.__new__` + `jobs_file` ใน `TemporaryDirectory` + `saved_profiles` + `_jobs_save_blocked = False`; patch `app.messagebox` ทุก test; ไฟล์รุ่นเก่า (Job ไม่มี `"profile"` + Job `"P2"`, ค่าซ้อน, ไทย); เขียนกลับล้มสองแบบ (ก) `app.os.replace` raise `PermissionError` (ข) `app.write_json_atomic` raise `OSError`
+  - ทดสอบ:
+    - AC-1 / AC-2: คืน list ครบ ลำดับและค่าเดิม, Job ไม่มี key ได้ `"P1"` (หรือ `"DEFAULT"` เมื่อ `saved_profiles = {}`), `"P2"` คงเดิม, ไม่มี exception
+    - AC-3 / AC-4 / AC-5: ไม่มี `showwarning` / `showerror` / `showinfo`, `_handle_unreadable_file` ไม่ถูกเรียก, ไม่มีไฟล์ `_unreadable_`, `_jobs_save_blocked is False`, bytes ของ `saved_jobs.json` เท่าเดิม
+    - AC-6: แบบ (ก) ไม่มี `saved_jobs.json.tmp` เหลือ; `app.os.remove` raise `OSError` → ยังคืนครบไม่มี exception (ปลด patch ก่อนออกจาก tempdir)
+    - AC-7: stdout `io.StringIO` → 1 บรรทัดมี `saved_jobs.json` + ข้อความ error; stdout cp874 strict (error message มีอักขระนอก cp874) และ stdout ที่ `write` raise `OSError` → AC-1..5 ยังจริง
+    - AC-8 / AC-9: ปลด patch → append `NEW` → `save_jobs()` `is True`, ไม่มี `showerror`, ไฟล์ = Job เดิม (มี `"profile"`) + `NEW`; `load_jobs()` อีกครั้งด้วย `wraps` spy → `write_json_atomic` ไม่ถูกเรียก, ค่าคืน == ไฟล์
+    - AC-10: เขียนกลับสำเร็จ → ไฟล์ == ค่าคืน, เนื้อไฟล์ `indent=4`, ไม่มี `.tmp` / `_unreadable_` / dialog
+    - AC-11: ทุก Job มี `"profile"` และ `[]` → spy ไม่ถูกเรียก, bytes + `st_mtime_ns` ไม่เปลี่ยน, ไม่มี dialog
+    - AC-12: JSON เสีย / `{}` / `[1]` / bytes decode ไม่ได้ → `[]`, `showwarning` 1 ครั้ง title `"Saved Jobs not loaded"` ข้อความขึ้นต้น `Cannot read saved_jobs.json:`, สำเนา `saved_jobs_unreadable_*.json` bytes เท่าเดิม, `_jobs_save_blocked is False`, spy ไม่ถูกเรียก, ไฟล์ไม่เปลี่ยน (capture stdout)
+    - AC-13: JSON เสีย + `preserve_unreadable_file` คืน `None` → `[]`, `_jobs_save_blocked is True`, `save_jobs()` คืน `False` ไฟล์ไม่เปลี่ยน
+    - AC-14: ไม่มีไฟล์ → `[]`, ไม่มี dialog, directory ว่าง
+  - Focused: `python -m unittest tests.test_r8_load_jobs_writeback tests.test_r2_reset_parameter_qa tests.test_bugfix_h3 tests.test_r7_console_print tests.test_script_groups_block`
+  - AC ที่ครอบคลุม: R8-AC-1, R8-AC-2, R8-AC-3, R8-AC-4, R8-AC-5, R8-AC-6, R8-AC-7, R8-AC-8, R8-AC-9, R8-AC-10, R8-AC-11, R8-AC-12, R8-AC-13, R8-AC-14
+
+- [x] R8-T3: Regression ทั้งชุด Round 8 (สอง mode encoding)
+  - หมายเหตุ: ผู้ใช้สั่งเลื่อน (ยังไม่รันทั้งชุด)
+  - สถานะ (2026-11-23): ผ่าน — รันหลังแก้ Round 12 (follow-up) `python -m unittest discover -s tests -p "test_*.py"` → `Ran 1147 tests ... OK` ทั้ง (ก) `PYTHONIOENCODING=utf-8` และ (ข) ไม่ตั้ง (cp874, redirect stdout+stderr ไปไฟล์)
+  - ขึ้นกับ: R8-T1, R8-T2
+  - ไฟล์: ทุก test เดิม + `tests/test_r8_load_jobs_writeback.py` (QA รันอย่างเดียว)
+  - ทำอะไร: รัน `python -m unittest discover -s tests -p "test_*.py"` บน Windows code page cp874 สองแบบตาม R7-AC-28: (ก) `PYTHONIOENCODING=utf-8`; (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` และ redirect stdout+stderr ไปไฟล์หรือ pipe (`> out.txt 2>&1`); ยืนยันทั้งสองแบบ `OK`, จำนวน test เท่ากัน และ ≥ 1007 + จำนวน test ใหม่ของ R8-T2; test เดิมไม่ต้องแก้ — ถ้ามี test เดิมล้มหรือ mode (ข) ล้มจาก `print` นอก `load_jobs` ให้รายงานหัวหน้า ไม่แก้เอง
+  - AC ที่ครอบคลุม: R8-AC-15
+
+## ตาราง R8-AC → Task
+
+| R8-AC | Task | R8-AC | Task | R8-AC | Task |
+|---|---|---|---|---|---|
+| R8-AC-1 | R8-T1, R8-T2 | R8-AC-2 | R8-T1, R8-T2 | R8-AC-3 | R8-T1, R8-T2 |
+| R8-AC-4 | R8-T1, R8-T2 | R8-AC-5 | R8-T1, R8-T2 | R8-AC-6 | R8-T1, R8-T2 |
+| R8-AC-7 | R8-T1, R8-T2 | R8-AC-8 | R8-T1, R8-T2 | R8-AC-9 | R8-T1, R8-T2 |
+| R8-AC-10 | R8-T1, R8-T2 | R8-AC-11 | R8-T1, R8-T2 | R8-AC-12 | R8-T1, R8-T2 |
+| R8-AC-13 | R8-T1, R8-T2 | R8-AC-14 | R8-T1, R8-T2 | R8-AC-15 | R8-T3 |
+
+---
+
+# Round 9 — Bugfix B2: Load Preset ที่มี element เสียทำให้ Job ของ Profile ปัจจุบันหาย
+
+> อ้างอิง: `docs/spec.md` หัวข้อ Round 9 (R9-AC-1 ถึง R9-AC-16), `docs/design.md` หัวข้อ Round 9 (R9-D1 ถึง R9-D9)
+> R9-Q ที่ผู้ใช้อนุมัติ: Q-1 ปฏิเสธทั้งไฟล์ / Q-2 แสดงในรายการตามเดิม แล้ว `showerror` ตอนกด Load / Q-3 dict + `"name"` และ `"query"` เป็น string ไม่ว่าง / Q-4 `"jobs": []` ไม่ถือว่าเสีย / Q-5 exception ไม่คาดคิด → `_restore_jobs_snapshot` + `showerror` (มีข้อความ exception) ไม่ re-raise / Q-6 รันเฉพาะ focused รอบนี้
+> ขอบเขต: แก้เฉพาะ `load_selected` ใน `load_preset_dialog` ของ `database_connect_gui.py` — B1 (Round 8, `load_jobs` ยังไม่ commit) ห้ามแตะ; B3-B16 อยู่นอกขอบเขต
+> ทุก test ใหม่ห้าม print อักขระนอก cp874 ลง stdout จริง
+
+- [x] R9-T1: Validate element ของ preset ก่อนแตะข้อมูล + rollback exception ใน `load_selected`
+  - ผล QA: focused 57 tests OK ทั้ง PYTHONIOENCODING=utf-8 และ cp874 redirect; diff R9 อยู่ใน `load_selected` เท่านั้น
+  - ไฟล์: `database_connect_gui.py` — `load_selected` ใน `load_preset_dialog` (~5515-5575) เท่านั้น
+  - ทำอะไร: ตาม R9-D2 / R9-D3
+    1. ต่อจาก `jobs = data.get("jobs", [])` ทันที (ก่อน `current_profile = ...`, `current_profile_jobs`, `askyesno`): loop `enumerate(jobs, start=1)` ตรวจตามลำดับ ไม่ใช่ `dict` → `is not a job object`; `"name"` ไม่ใช่ `str` / `.strip()` ว่าง → `has no valid 'name' (must be non-empty text)`; `"query"` เช่นเดียวกัน → `has no valid 'query' (must be non-empty text)`; เจอตัวแรก → `messagebox.showerror("Invalid Preset", f"Preset '{preset_name}' cannot be loaded.\n\nJob #{position} {problem}.\n\nYour current jobs were not changed.", parent=dialog)` แล้ว `return`
+    2. คง snapshot 3 บรรทัดไว้นอก/ก่อน `try`; ครอบ "กรอง `self.saved_jobs` → loop ตั้ง `"profile"` + append → `saved = self.save_jobs()`" ด้วย `try / except Exception as e:` ซึ่ง `_restore_jobs_snapshot(saved_jobs_before, original_jobs, jobs_snapshot)` → `messagebox.showerror("Load Preset Failed", f"Preset '{preset_name}' was not loaded. Your current jobs were not changed.\n\n{type(e).__name__}: {e}", parent=dialog)` → `return` (ไม่ re-raise)
+    3. หลัง `try`: `if not saved:` → `_restore_jobs_snapshot(...)` + `return` แบบเดิม **ไม่มี** `showerror` เพิ่ม; ส่วน `update_jobs_list` / `results_text` / `showinfo` / `dialog.destroy()` อยู่นอก `try` เดิมทุกตัวอักษร
+  - ห้าม: แตะส่วนสร้างรายการ preset (~5497-5513), `save_jobs`, `_restore_jobs_snapshot`, `write_json_atomic`, `load_jobs`; สร้าง helper / method / flag ใหม่; refactor (`profile_combo.get()` สองครั้งคงเดิม)
+  - ตรวจด้วยตนเอง: `python -m unittest tests.test_bugfix_h3 tests.test_bugfix_m5 tests.test_r8_load_jobs_writeback` ผ่าน
+  - AC ที่ครอบคลุม: R9-AC-1 ถึง R9-AC-14 (โค้ด)
+
+- [x] R9-T2: เขียน `tests/test_r9_load_preset_validation.py` และรัน focused
+  - ผล QA: test ใหม่ 19 test (51 subTest ใน matrix) ผ่าน; focused 57 tests OK สอง mode; กับโค้ดก่อน R9 ล้ม 59 (จับบัค B2 ได้ รวมผล probe `['U-job', 'ok', 'new']`); test_r3_script_groups_io 145 OK
+  - ขึ้นกับ: R9-T1
+  - ไฟล์: `tests/test_r9_load_preset_validation.py` (ใหม่)
+  - ทำอะไร: ตาม R9-D7 — ใช้ `make_job_stub` / `fake_dialog_widgets` แบบ `tests/test_bugfix_h3.py`; `profile_combo` = `"PROD"`; `jobs_file` ใน `TemporaryDirectory`; `_jobs_save_blocked = False`; สถานะเริ่มต้น `P-job0`, `U-job`, `P-job1`, `P-job2` (ค่าซ้อน + ไทย) เขียนด้วย `save_jobs()` จริง; patch `app.messagebox` ทุก test; ควบคุม `curselection` บน instance ของ `_FakeListbox` เมื่อต้องเลือก preset อื่น / ไม่เลือก (หา index จาก `listbox.items`)
+  - ทดสอบ:
+    - AC-1 / AC-2 / AC-3 / AC-4: matrix element เสียด้วย `subTest` (ไม่ใช่ dict 5 แบบ; ไม่มี `"name"` / `"query"`; `None` / ตัวเลข / list / `""` / `"   "`) × ตำแหน่ง กลาง / แรก / สุดท้าย + probe `[ok, None]` + element ที่ 2 และ 3 เสีย → `saved_jobs` ไม่เปลี่ยน (identity + ค่า), ไม่มี `askyesno` / `save_jobs` (spy) / `update_jobs_list` / `results_text` / `showinfo` / destroy, `showerror` 1 ครั้ง `parent=dialog` มีชื่อ preset + `Job #<n> `, bytes `saved_jobs.json` และ preset เท่าเดิม, Job ปกติใน `preset_data` ไม่มี `"profile"`
+    - AC-5: ต่อจาก AC-1 append `new` → `save_jobs()` `is True`, ไฟล์ = 4 Job เดิม + `new`
+    - AC-6: dialog เดียวกัน reject preset เสียแล้วเลือก preset ปกติ + Yes → สำเร็จตาม AC-9
+    - AC-7: listbox แสดงทั้ง preset เสียและปกติด้วยรูปแบบเดิม; JSON เสีย / `"jobs"` ไม่ใช่ list ถูกข้ามพร้อม `skipped` (capture stdout)
+    - AC-8: `save_jobs` mock แก้ in-place แล้ว `raise RuntimeError("boom")` → ไม่หลุด, identity + ค่า, `showerror` 1 ครั้งมี `boom`, ไม่มี success, ดิสก์ไม่เปลี่ยน
+    - AC-9 / AC-10 / AC-11 / AC-12: preset ปกติ (ข้อความ `askyesno` เต็ม, ลำดับ, `"profile": "PROD"`, ไฟล์ == memory, success ครบ, ไม่มี `showerror`); ตอบ No; `[]` และไม่มี `"jobs"` → `with 0 jobs`, `saved_jobs == [U-job]`; ไม่เลือก → `showwarning` เดิม
+    - AC-13: `save_jobs` คืน `False` หลังแก้ in-place → restore, `showerror.assert_not_called()`
+    - AC-14: `save_jobs` จริง (ก) `app.write_json_atomic` raise `OSError` (ข) `_jobs_save_blocked = True` → `showerror` 1 ครั้งด้วยข้อความเดิมของ `save_jobs`, ไม่มี `showinfo`, ไฟล์ไม่เปลี่ยน
+  - Focused (R9-Q-6): `python -m unittest tests.test_r9_load_preset_validation tests.test_bugfix_h3 tests.test_bugfix_m5 tests.test_r8_load_jobs_writeback` ต้อง OK โดยไม่แก้ test เดิม; แนะนำยืนยันว่า test ใหม่ล้มกับโค้ดก่อนแก้ (จับบัค B2 ได้จริง)
+  - AC ที่ครอบคลุม: R9-AC-1, R9-AC-2, R9-AC-3, R9-AC-4, R9-AC-5, R9-AC-6, R9-AC-7, R9-AC-8, R9-AC-9, R9-AC-10, R9-AC-11, R9-AC-12, R9-AC-13, R9-AC-14, R9-AC-15
+
+- [x] R9-T3: Regression ทั้งชุด Round 9 (สอง mode encoding)
+  - หมายเหตุ: ผู้ใช้สั่งเลื่อน (ยังไม่รันทั้งชุด — R9-Q-6)
+  - สถานะ (2026-11-23): ผ่าน — รันหลังแก้ Round 12 (follow-up) `python -m unittest discover -s tests -p "test_*.py"` → `Ran 1147 tests ... OK` ทั้ง (ก) `PYTHONIOENCODING=utf-8` และ (ข) ไม่ตั้ง (cp874, redirect stdout+stderr ไปไฟล์)
+  - ขึ้นกับ: R9-T1, R9-T2
+  - ไฟล์: ทุก test เดิม + `tests/test_r9_load_preset_validation.py` (QA รันอย่างเดียว)
+  - ทำอะไร: รัน `python -m unittest discover -s tests -p "test_*.py"` บน Windows code page cp874 สองแบบตาม R7-AC-28 / R8-AC-15: (ก) `PYTHONIOENCODING=utf-8`; (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` และ redirect stdout+stderr ไปไฟล์หรือ pipe; ยืนยันทั้งสองแบบ `OK` จำนวน test เท่ากัน และไม่มี test เดิมถูกแก้ — ถ้าล้มให้รายงานหัวหน้า ไม่แก้เอง
+  - AC ที่ครอบคลุม: R9-AC-16
+
+## ตาราง R9-AC → Task
+
+| R9-AC | Task | R9-AC | Task | R9-AC | Task |
+|---|---|---|---|---|---|
+| R9-AC-1 | R9-T1, R9-T2 | R9-AC-2 | R9-T1, R9-T2 | R9-AC-3 | R9-T1, R9-T2 |
+| R9-AC-4 | R9-T1, R9-T2 | R9-AC-5 | R9-T1, R9-T2 | R9-AC-6 | R9-T1, R9-T2 |
+| R9-AC-7 | R9-T1, R9-T2 | R9-AC-8 | R9-T1, R9-T2 | R9-AC-9 | R9-T1, R9-T2 |
+| R9-AC-10 | R9-T1, R9-T2 | R9-AC-11 | R9-T1, R9-T2 | R9-AC-12 | R9-T1, R9-T2 |
+| R9-AC-13 | R9-T1, R9-T2 | R9-AC-14 | R9-T1, R9-T2 | R9-AC-15 | R9-T2 |
+| R9-AC-16 | R9-T3 | | | | |
+
+---
+
+# Round 10 — Bugfix B3: Export Excel ทำไฟล์ `.xlsx` เดิมหายเมื่อ export ไม่จบ
+
+> อ้างอิง: `docs/spec.md` หัวข้อ Round 10 (R10-AC-1 ถึง R10-AC-21), `docs/design.md` หัวข้อ Round 10 (R10-D1 ถึง R10-D8)
+> R10-Q ที่ผู้ใช้อนุมัติ: Q-1 temp `<stem>.<สุ่ม>.tmp.xlsx` ด้วย `mkstemp` ในโฟลเดอร์ปลายทาง / Q-2 Stop คงเดิม (ผ่าน temp + replace) / Q-3 ตรวจล็อกตอนเริ่ม fail เร็ว; replace ล้ม → เก็บ temp แจ้งสอง path ไม่ retry / Q-4 fatal → คงไฟล์เดิม ลบ temp / Q-5 ปรับเฉพาะ harness test_r4 / Q-6 ไม่ล้าง temp ค้าง / Q-7 ไม่มี `"query"` ยัง fatal แต่แสดงสาเหตุจริง / Q-8 ไม่รวมจุดอื่น / Q-9 ลบ temp ไม่ได้ → log 1 บรรทัด / Q-10 รันเฉพาะ focused
+> ขอบเขต: `database_connect_gui.py` — import ส่วนหัว, helper ระดับ module 4 ตัว และ `worker()` ใน `export_jobs_to_excel`; ห้ามแตะ `load_jobs` / `load_preset_dialog` (Round 8-9 ยังไม่ commit), `on_done`, ส่วนก่อนเริ่ม worker, เนื้อ loop ราย Job และ B4-B16
+> ทุก test ใหม่ห้าม print อักขระนอก cp874 ลง stdout จริง
+
+- [x] R10-T1: เขียนผ่าน temp + `os.replace` ใน worker ของ `export_jobs_to_excel`
+  - ผล QA (R10-T2): test ใหม่ 42 ตัวผ่านกับโค้ดนี้; diff R10 อยู่เฉพาะ import / helper 4 ตัว / worker ของ export ไม่แตะ hunk R8-R9
+  - ไฟล์: `database_connect_gui.py` เท่านั้น — import (~2-15), helper ใหม่ต่อจาก `_excel_text_too_long` (~134), `worker()` (~10501-10806)
+  - ทำอะไร: ตาม R10-D2 / R10-D3
+    1. เพิ่ม `import contextlib`, `import tempfile` และ `BinaryIO`, `Iterator` ใน `from typing import ...`
+    2. เพิ่ม helper 4 ตัวตาม signature ใน R10-D2: `_ensure_export_target_writable(file_path: str) -> None` (`os.open` `O_RDWR | O_BINARY` ไม่ create / truncate; ล้ม → raise ชนิดเดิม ข้อความ `Cannot write to {file_path}. ...` พร้อม `strerror`), `_create_export_temp_file(file_path: str) -> Tuple[BinaryIO, str]` (`mkstemp(prefix=f"{stem}.", suffix=".tmp.xlsx", dir=<abspath dir>)` + `os.fdopen(fd, "wb")`), `_excel_writer_saved_on_success(handle: BinaryIO) -> Iterator[Any]` (`contextlib.contextmanager`: `pd.ExcelWriter(handle, engine="openpyxl")` → `yield` → `writer.close()` เฉพาะเมื่อไม่มี exception), `_discard_export_temp(temp_path: str) -> Optional[str]` (`os.remove`; `FileNotFoundError` → `None`; `OSError` อื่น → `"<Type>: <strerror>"`)
+    3. ใน `worker()`: ประกาศ `temp_handle` / `temp_path` / `keep_temp` ก่อน `try`; แทน `with pd.ExcelWriter(file_path, engine="openpyxl") as writer:` ด้วย `_ensure_export_target_writable(file_path)` → `temp_handle, temp_path = _create_export_temp_file(file_path)` → `with _excel_writer_saved_on_success(temp_handle) as writer:` (indent เดิม, body loop + sheet `Export` ไม่แตะแม้แต่ตัวเดียว)
+    4. หลัง `with`: `temp_handle.close()` → `try: os.replace(temp_path, file_path)` / `except OSError` → `keep_temp = True` + `fatal_error` ข้อความตาม R10-D3 (มี `<Type>:`, `file_path`, `strerror`, `The completed export was kept at: {temp_path}`) / `else: temp_path = None`
+    5. คง `except Exception as e: fatal_error = f"{type(e).__name__}: {str(e)}"` แล้วเพิ่ม `finally:` ปิด `temp_handle` ถ้ายังเปิด (กลืน `OSError`) และถ้า `temp_path` ไม่ใช่ `None` และไม่ `keep_temp` → `_discard_export_temp`; ล้ม → `log(f"⚠️ Could not delete temporary file: {temp_path} ({remove_error})\n")`
+    6. `elapsed` / `self.root.after(... on_done ...)` คงเดิมหลัง `try`
+  - ห้าม: แตะ `on_done`, ส่วนก่อนเริ่ม worker (~10318-10429), local helper ใน worker (~10431-10499), เนื้อ loop ราย Job (~10503-10798), `write_json_atomic`, `load_jobs`, `load_preset_dialog`; เปลี่ยนข้อความ log / ตัวนับเดิม; retry; ล้าง temp ค้าง; แตะจุดเขียนไฟล์อื่น (Q-8); แก้ไฟล์ใน `tests/`
+  - ตรวจด้วยตนเอง: `python -m unittest tests.test_r7_excel_cell_limit tests.test_bugfix_c2 tests.test_bugfix_m2 tests.test_run_engine_batch tests.test_bugfix_c3 tests.test_r2_oracle_slash tests.test_run_entry_block tests.test_r2_table_data_refresh` ผ่าน (**ไม่รวม** `tests.test_r4_excel_row_limit` — คาดว่าล้มจนกว่า R10-T2 ปรับ harness; R10-R7)
+  - AC ที่ครอบคลุม: R10-AC-1 ถึง R10-AC-17, R10-AC-19 (โค้ด)
+
+- [x] R10-T2: ปรับ harness `tests/test_r4_excel_row_limit.py` + เขียน `tests/test_r10_export_atomic_write.py` และรัน focused
+  - ผล QA: test ใหม่ 42 ตัว (AC-1..19; AC-14/15 แบบ CreateFileW รันจริงบน win32); harness test_r4 ปรับ 3 จุด (import tempfile, `_FakeWriter.close()`, path ใน TemporaryDirectory) ไม่แตะ assertion; focused 14 ไฟล์ `Ran 246 tests` OK ทั้ง PYTHONIOENCODING=utf-8 และ cp874 redirect; กับโค้ดก่อนแก้ (สำเนาใน scratchpad) ล้ม 24 failures + 4 errors (AC-1 เห็น 0 byte, AC-10 เห็น IndexError); ไม่มีไฟล์แปลกใน repo
+  - ขึ้นกับ: R10-T1
+  - ไฟล์: `tests/test_r4_excel_row_limit.py` (harness เท่านั้น), `tests/test_r10_export_atomic_write.py` (ใหม่)
+  - ทำอะไร:
+    1. Harness test_r4 ตาม R10-D5 / R10-Q-5: `run_export` ใช้ `tempfile.TemporaryDirectory()` และให้ `asksaveasfilename` คืน `os.path.join(<tmp>, "export.xlsx")`; เพิ่ม `def close(self): pass` ใน `_FakeWriter`; **ห้ามแตะ assertion**; ยืนยันว่าไม่มีไฟล์ใหม่ใน working directory ของ repo หลังรัน; รายงานรายการบรรทัดที่ปรับ
+    2. Test ใหม่ตาม R10-D6 ครบ R10-AC-1 ถึง R10-AC-19 (AC-14 / AC-15 ส่วน `CreateFileW` skip เมื่อไม่ใช่ win32; AC-15 มีแบบ patch `os.replace` ที่ไม่ขึ้นกับ OS; AC-4 ใช้ subprocess + `kill()` — ถ้าทำไม่ได้บนเครื่องนี้ให้ตั้ง `[!]` และรายงาน ไม่ตัด AC เอง)
+    3. แนะนำยืนยันว่า test ใหม่ล้มกับโค้ดก่อนแก้ (จับบัค B3 ได้จริง: AC-1 เห็น 0 byte, AC-10 เห็น `IndexError`)
+  - Focused (R10-Q-10) — ต้อง `OK` ทั้ง `PYTHONIOENCODING=utf-8` และแบบไม่ตั้ง (cp874, redirect stdout+stderr):
+    `python -m unittest tests.test_r10_export_atomic_write tests.test_r7_excel_cell_limit tests.test_bugfix_c2 tests.test_bugfix_m2 tests.test_r4_excel_row_limit tests.test_r2_table_data_refresh tests.test_r4_profile_mismatch tests.test_run_entry_block tests.test_r8_load_jobs_writeback tests.test_r9_load_preset_validation tests.test_run_engine_batch tests.test_bugfix_c3 tests.test_r2_oracle_slash tests.test_confirm_destination`
+    (8 ไฟล์แรกตาม R10-AC-21, `test_r8` / `test_r9` ตาม R10-AC-20, 4 ไฟล์ท้ายเพราะรัน worker จริงหรือตรวจ source ของ `export_jobs_to_excel`)
+  - AC ที่ครอบคลุม: R10-AC-1, R10-AC-2, R10-AC-3, R10-AC-4, R10-AC-5, R10-AC-6, R10-AC-7, R10-AC-8, R10-AC-9, R10-AC-10, R10-AC-11, R10-AC-12, R10-AC-13, R10-AC-14, R10-AC-15, R10-AC-16, R10-AC-17, R10-AC-18, R10-AC-19, R10-AC-20
+
+- [x] R10-T3: Regression ทั้งชุด Round 10 (สอง mode encoding)
+  - หมายเหตุ: ผู้ใช้สั่งเลื่อน (ยังไม่รันทั้งชุด — R10-Q-10)
+  - สถานะ (2026-11-23): ผ่าน — รันหลังแก้ Round 12 (follow-up) `python -m unittest discover -s tests -p "test_*.py"` → `Ran 1147 tests ... OK` ทั้ง (ก) `PYTHONIOENCODING=utf-8` และ (ข) ไม่ตั้ง (cp874, redirect stdout+stderr ไปไฟล์)
+  - ขึ้นกับ: R10-T1, R10-T2
+  - ไฟล์: ทุก test เดิม + `tests/test_r10_export_atomic_write.py` (QA รันอย่างเดียว)
+  - ทำอะไร: รัน `python -m unittest discover -s tests -p "test_*.py"` บน Windows code page cp874 สองแบบตาม R7-AC-28: (ก) `PYTHONIOENCODING=utf-8`; (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` และ redirect stdout+stderr ไปไฟล์หรือ pipe; ยืนยันทั้งสองแบบ `OK` จำนวน test เท่ากัน และไม่มี test เดิมถูกแก้นอกจาก harness test_r4 — ถ้าล้มให้รายงานหัวหน้า ไม่แก้เอง
+  - AC ที่ครอบคลุม: R10-AC-21
+
+## ตาราง R10-AC → Task
+
+| R10-AC | Task | R10-AC | Task | R10-AC | Task |
+|---|---|---|---|---|---|
+| R10-AC-1 | R10-T1, R10-T2 | R10-AC-2 | R10-T1, R10-T2 | R10-AC-3 | R10-T1, R10-T2 |
+| R10-AC-4 | R10-T1, R10-T2 | R10-AC-5 | R10-T1, R10-T2 | R10-AC-6 | R10-T1, R10-T2 |
+| R10-AC-7 | R10-T1, R10-T2 | R10-AC-8 | R10-T1, R10-T2 | R10-AC-9 | R10-T1, R10-T2 |
+| R10-AC-10 | R10-T1, R10-T2 | R10-AC-11 | R10-T1, R10-T2 | R10-AC-12 | R10-T1, R10-T2 |
+| R10-AC-13 | R10-T1, R10-T2 | R10-AC-14 | R10-T1, R10-T2 | R10-AC-15 | R10-T1, R10-T2 |
+| R10-AC-16 | R10-T1, R10-T2 | R10-AC-17 | R10-T1, R10-T2 | R10-AC-18 | R10-T2 |
+| R10-AC-19 | R10-T1, R10-T2 | R10-AC-20 | R10-T2 | R10-AC-21 | R10-T3 |
+
+---
+
+# Round 11 — Bugfix B4: Header "target" และ Tables ใช้ค่าจากช่องกรอก ไม่ใช่ connection จริง
+
+> อ้างอิง: `docs/spec.md` หัวข้อ Round 11 (R11-AC-1 ถึง R11-AC-22), `docs/design.md` หัวข้อ Round 11 (R11-D1 ถึง R11-D10)
+> R11-Q ที่ผู้ใช้อนุมัติ: Q-1 เตือนที่ header เท่านั้น / Q-2 ต่อท้าย `target_sub` + สี `#D97706` (`UI["warn"]`) / Q-3 แก้ Password อย่างเดียวไม่นับ / Q-4 เทียบ 5 ช่องหลัง strip, port `split(":")[0]`, case-sensitive / Q-5 เก็บ password ใน attribute ส่วนตัวตอน Connect ผูกกับ engine / Q-6 ไม่มี password (ทุก database, ไม่ใช่ Oracle) → block `⛔` ให้ Connect ใหม่ / Q-7 `info is None` → พฤติกรรมเดิม / Q-8 Save Job ไม่รวม / Q-9 รันเฉพาะ focused (R11-AC-22 เลื่อน)
+> ขอบเขต: `database_connect_gui.py` เท่านั้น ตาม R11-D1 "ขอบเขต"; ห้ามแตะ `ConnectionInfo` / `RunTarget`, `_capture_run_target`, `_block_if_profile_mismatch`, `_confirm_data_change`, `execute_query`, worker ของ `list_tables`, Save Job / Save Profile, hunk Round 8-10 (ยังไม่ commit) และ B5-B16
+> **รอตัดสิน R11-R1 ก่อนเริ่ม R11-T1**: `test_run_engine_batch.py::test_info_db_type_wins_over_screen_at_start` ขัดกับ R11-AC-16 / Q-6 — tasks ด้านล่างเขียนตามทางเลือก (ก) ที่แนะนำ (QA ปรับ harness 1 บรรทัด ไม่แตะ assertion); ถ้าเลือก (ข) architect ต้องแก้ R11-D5 / tasks ก่อน
+> ทุก test ใหม่ห้าม print อักขระนอก cp874 ลง stdout จริง
+
+- [x] R11-T1: Header + `list_tables` ใช้ snapshot ของ connection และเก็บ / ล้าง password ผูกกับ engine
+  - ไฟล์: `database_connect_gui.py` เท่านั้น — ต่อจาก `RunTarget` (~412), `__init__` (`self.engine = None` ~2419, closure `_refresh_target_summary` ~2694-2709), `connect_database` (~7715), `_replace_engine` (~7735-7748), ต่อจาก `_capture_run_target` (~7762), `list_tables` (~9185-9199), `_reset_profile_connection_state` (~11138)
+  - ทำอะไร: ตาม R11-D2 ถึง R11-D5
+    1. ระดับ module ต่อจาก `RunTarget`: ค่าคงที่ `_TARGET_MISMATCH_NOTE = "  ·  ⚠ ช่อง Details ไม่ตรงกับ connection — กด Connect เพื่อใช้ค่าใหม่"` และ `_target_summary_text(db_type: str, user: str, host: str, port: str, database: str) -> Tuple[str, str]` (ข้อความคัดลอกจาก `:2701-2702` ทุกตัวอักษร)
+    2. `__init__`: ต่อจาก `self.engine = None` เพิ่ม `self._connected_password: Optional[Tuple[Any, str]] = None`
+    3. `_replace_engine(self, engine, info: Optional[ConnectionInfo] = None, password: Optional[str] = None) -> None`: ต่อจากบรรทัด `self._run_target = ...` เพิ่ม `self._connected_password = (engine, password) if engine is not None and password is not None else None`; ส่วน dispose เดิมไม่แตะ
+    4. `connect_database` ทางสำเร็จ: `self._replace_engine(engine, info, password=password)` (password ไม่ strip); ทางล้ม / early return ไม่แก้
+    5. `_reset_profile_connection_state`: ต่อจาก `self._run_target = None` เพิ่ม `self._connected_password = None`
+    6. Method ใหม่ต่อจาก `_capture_run_target` ตาม signature ใน R11-D3 / R11-D4: `_connected_password_for(self, engine: Any) -> Optional[str]` (`getattr(self, "_connected_password", None)`, คืนค่าเมื่อ `stored[0] is engine` เท่านั้น), `_details_differ_from(self, info: ConnectionInfo) -> bool` (5 ช่อง strip, port `strip().split(":")[0]`, ไม่อ่าน `db_password` / `profile_combo`), `_update_target_summary(self, target_main: Any, target_sub: Any) -> bool` (มี `info` → ข้อความจาก `info` + คำเตือน + `fg=UI["warn"]` เมื่อไม่ตรง; ไม่มี `info` → ข้อความจากช่องกรอกแบบเดิม `fg=UI["muted"]`; เช็ก `cget("text")` / `str(cget("fg"))` ก่อน `config`; `tk.TclError` → คืน `False`)
+    7. Closure `_refresh_target_summary` เหลือ `if self._update_target_summary(target_main, target_sub): self.root.after(500, _refresh_target_summary)` (ชื่อ / docstring / การเรียกครั้งแรก ~2721 คงเดิม)
+    8. `list_tables`: แทน ~9185-9199 ตาม R11-D5 — `info = target.info`; มี `info` → `db_type = info.db_type`, `current_db_name = info.database`, `password = self._connected_password_for(engine)`, ถ้า `password is None and not current_db_name and db_type != "Oracle"` → `results_text.insert(tk.END, "⛔ Tables ไม่ได้เริ่มงาน: ไม่มีรหัสผ่านของ connection ปัจจุบัน — กด Connect ใหม่แล้วลองอีกครั้ง\n")` + `see(tk.END)` + `return` (ก่อน "Fetching..." / `inspect_btn` / dialog / Thread), ไม่งั้น `connection_credentials = (info.user, password or "", info.host, info.port)`; ไม่มี `info` → โค้ดเดิมทุกตัวอักษร (ลำดับ `db_type` → `db_name` → user → password → host → port)
+  - ห้าม: เพิ่ม field ใน `ConnectionInfo` / `RunTarget`; แก้ worker `fetch_tables_in_background` (~9212-9440); ใส่ password ใน log / print / ข้อความใด; แตะ `_capture_run_target`, `_block_if_profile_mismatch`, `_confirm_data_change`, `execute_query`, `_refresh_conn_badge`, Save Job / Save Profile, hunk Round 8-10; เพิ่ม event binding; แก้ไฟล์ใน `tests/`
+  - ตรวจด้วยตนเอง: `python -m unittest tests.test_run_target tests.test_bugfix_h1 tests.test_list_tables_stop tests.test_r4_profile_mismatch tests.test_run_entry_block tests.test_confirm_destination tests.test_profile_connect_block` ผ่าน; `tests.test_run_engine_batch` คาดว่าล้ม 1 test (`test_info_db_type_wins_over_screen_at_start`) จนกว่า R11-T2 ปรับ harness ตาม R11-R1 (ก) — ห้ามแก้โค้ดให้ test นั้นผ่านโดยเลี่ยง Q-6
+  - AC ที่ครอบคลุม: R11-AC-1 ถึง R11-AC-9, R11-AC-11 ถึง R11-AC-20 (โค้ด)
+  - สถานะ developer (2026-11-20): โค้ดครบตาม R11-D2 ถึง R11-D5 ด้วยทางเลือก R11-R1 (ก) ที่ผู้ใช้อนุมัติ — module `:415-426`, `__init__` `:2433`, closure `:2708-2711`, `connect_database` `:7717`, `_replace_engine` `:7737-7757`, method ใหม่ `:7775-7831`, `list_tables` `:9254-9285`, `_reset_profile_connection_state` `:11225`; worker ไม่แตะ; `ast.parse` ผ่าน; `tests.test_bugfix_h1 tests.test_run_engine_batch` 17 tests ล้ม 1 ตามคาด (`test_info_db_type_wins_over_screen_at_start` รอ harness ใน R11-T2) — รอ qa-tester
+
+- [x] R11-T2: เขียน `tests/test_r11_connection_target_snapshot.py` + ปรับ harness ตาม R11-R1 และรัน focused
+  - สถานะ qa-tester (2026-11-20): ผ่าน — ไฟล์ใหม่ 45 tests (R11-AC-1 ถึง R11-AC-20); harness 1 บรรทัดใน `tests/test_run_engine_batch.py:424` (`stub._connected_password = (engine_a, "pw")` ก่อน `threads = self._start(stub)`, ไม่แตะ assertion); focused 14 ไฟล์ `Ran 276 tests ... OK` ทั้ง `PYTHONIOENCODING=utf-8` และ cp874 + redirect; กับโค้ดก่อนแก้ (`git show HEAD:database_connect_gui.py`) ไฟล์ใหม่ล้ม 38/45 tests (11 failures + 41 errors นับ subTest) เช่น header แสดง `prod-db`, `get_connection_string` ได้ `other/pw-prod/prod-db/9999` — 7 tests ที่ผ่านกับโค้ดเดิมเป็น regression lock (AC-10 x2, AC-17, AC-9 closure x2, AC-16 ทาง database ปัจจุบัน, AC-18 leak check); R11-AC-22 ยังรอ (R11-T3)
+  - ขึ้นกับ: R11-T1 (และคำตอบ R11-R1)
+  - ไฟล์: `tests/test_r11_connection_target_snapshot.py` (ใหม่), `tests/test_run_engine_batch.py` (harness 1 บรรทัดเท่านั้น ถ้าอนุมัติ R11-R1 (ก))
+  - ทำอะไร:
+    1. Harness ตาม R11-R1 (ก): ใน `test_info_db_type_wins_over_screen_at_start` เพิ่ม `stub._connected_password = (engine_a, "pw")` ก่อน `threads = self._start(stub)`; **ห้ามแตะ assertion / test อื่น**; รายงานบรรทัดที่ปรับ
+    2. Test ใหม่ตาม R11-D8 ครบ R11-AC-1 ถึง R11-AC-20 (นิยาม "snapshot UAT" / "ช่องกรอก PROD" ตาม spec R11-4): header ผ่าน `_update_target_summary` + closure ผ่าน AST (AC-9); `execute_query` regression (AC-10); `list_tables` + worker ด้วย `_Thread` จับ args, `forbid_get` (AC-13), block `⛔` (AC-16), Oracle (AC-15), info None (AC-17); password ผ่าน `connect_database` จริง (patch `create_engine` / `messagebox`) + `_connected_password_for` / `_connected_password is None` (AC-18, AC-19, AC-20)
+    3. แนะนำยืนยันว่า test ใหม่ล้มกับโค้ดก่อนแก้ (จับบัค B4 ได้จริง: header แสดง `prod-db`, `get_connection_string` ได้ค่าจากช่องกรอก)
+  - Focused (R11-Q-9) — ต้อง `OK` ทั้ง `PYTHONIOENCODING=utf-8` และแบบไม่ตั้ง (cp874, redirect stdout+stderr):
+    `python -m unittest tests.test_r11_connection_target_snapshot tests.test_run_target tests.test_bugfix_h1 tests.test_run_engine_batch tests.test_list_tables_stop tests.test_bugfix_c1 tests.test_r4_profile_mismatch tests.test_run_entry_block tests.test_confirm_destination tests.test_profile_connect_block tests.test_profile_password tests.test_r8_load_jobs_writeback tests.test_r9_load_preset_validation tests.test_r10_export_atomic_write`
+    (ไฟล์ใหม่ + 13 ไฟล์ตาม R11-AC-21)
+  - AC ที่ครอบคลุม: R11-AC-1, R11-AC-2, R11-AC-3, R11-AC-4, R11-AC-5, R11-AC-6, R11-AC-7, R11-AC-8, R11-AC-9, R11-AC-10, R11-AC-11, R11-AC-12, R11-AC-13, R11-AC-14, R11-AC-15, R11-AC-16, R11-AC-17, R11-AC-18, R11-AC-19, R11-AC-20, R11-AC-21
+
+- [x] R11-T3: Regression ทั้งชุด Round 11 (สอง mode encoding)
+  - หมายเหตุ: ผู้ใช้สั่งเลื่อน (ยังไม่รันทั้งชุด — R11-Q-9)
+  - สถานะ (2026-11-23): ผ่าน — รันหลังแก้ Round 12 (follow-up) `python -m unittest discover -s tests -p "test_*.py"` → `Ran 1147 tests ... OK` ทั้ง (ก) `PYTHONIOENCODING=utf-8` และ (ข) ไม่ตั้ง (cp874, redirect stdout+stderr ไปไฟล์)
+  - ขึ้นกับ: R11-T1, R11-T2
+  - ไฟล์: ทุก test เดิม + `tests/test_r11_connection_target_snapshot.py` (QA รันอย่างเดียว)
+  - ทำอะไร: รัน `python -m unittest discover -s tests -p "test_*.py"` บน Windows code page cp874 สองแบบตาม R7-AC-28: (ก) `PYTHONIOENCODING=utf-8`; (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` และ redirect stdout+stderr ไปไฟล์หรือ pipe; ยืนยันทั้งสองแบบ `OK` จำนวน test เท่ากัน และไม่มี test เดิมถูกแก้นอกจาก harness ตาม R11-R1 — ถ้าล้มให้รายงานหัวหน้า ไม่แก้เอง
+  - AC ที่ครอบคลุม: R11-AC-22
+
+## ตาราง R11-AC → Task
+
+| R11-AC | Task | R11-AC | Task | R11-AC | Task |
+|---|---|---|---|---|---|
+| R11-AC-1 | R11-T1, R11-T2 | R11-AC-2 | R11-T1, R11-T2 | R11-AC-3 | R11-T1, R11-T2 |
+| R11-AC-4 | R11-T1, R11-T2 | R11-AC-5 | R11-T1, R11-T2 | R11-AC-6 | R11-T1, R11-T2 |
+| R11-AC-7 | R11-T1, R11-T2 | R11-AC-8 | R11-T1, R11-T2 | R11-AC-9 | R11-T1, R11-T2 |
+| R11-AC-10 | R11-T2 | R11-AC-11 | R11-T1, R11-T2 | R11-AC-12 | R11-T1, R11-T2 |
+| R11-AC-13 | R11-T1, R11-T2 | R11-AC-14 | R11-T1, R11-T2 | R11-AC-15 | R11-T1, R11-T2 |
+| R11-AC-16 | R11-T1, R11-T2 | R11-AC-17 | R11-T1, R11-T2 | R11-AC-18 | R11-T1, R11-T2 |
+| R11-AC-19 | R11-T1, R11-T2 | R11-AC-20 | R11-T1, R11-T2 | R11-AC-21 | R11-T2 |
+| R11-AC-22 | R11-T3 | | | | |
+
+---
+
+# Round 12 — Follow-up: ข้อเสนอแนะ 🟢 จาก review Round 8–11 (2026-11-23)
+
+- [x] R12-1 (R8 🟢1): `write_json_atomic` ลบ `.tmp` เองเฉพาะเมื่อ call นี้เปิดไฟล์ได้แล้ว; `load_jobs` ไม่ลบ `.tmp` เอง (ไม่แตะ `.tmp` ที่ไม่ได้สร้าง) — R8-AC-6 tests ปรับตาม + test ใหม่ `test_ac6_tmp_not_created_by_this_call_is_left_alone`
+- [x] R12-2 (R8 🟢2–4): `test_ac7_stdout_none` ทดสอบ `sys.stdout = None` จริงทั้งสอง mode; type hints ใน test; comment ใน `load_jobs` เป็นภาษาไทย
+- [x] R12-3 (R9 🟢1–2): comprehension `current_profile_jobs` ข้าม element ที่ไม่ใช่ dict; test ใหม่: exception ระหว่าง filter ถูก rollback, element เสียใน `saved_jobs` ไม่หลุด exception ก่อน confirm
+- [x] R12-4 (R10 🟢1, 3, 4): `mkstemp` ล้ม → ข้อความอ้าง path ที่ผู้ใช้เลือก (ไม่โชว์ temp path); temp path ใช้ separator แบบเดียวกับ path ที่เลือก; test ใหม่: handle ปิดก่อน `os.replace` / `os.remove` (ไม่ขึ้นกับ OS), `mkstemp` ล้ม, separator
+- [x] R12-5 (R10 🟢2): `_replace_export_with_retry` — retry `os.replace` เฉพาะ `PermissionError` รอ `EXPORT_REPLACE_RETRY_DELAYS` = 0.2 / 0.5 / 1.0 วินาที (รวมสูงสุด 4 ครั้ง ~1.7 วินาที) แล้วจึงเก็บ temp + แจ้ง path เหมือนเดิม; error อื่นไม่ retry — ผู้ใช้สั่งแก้ (2026-11-23) แทน R10-Q-3 เดิม; R10-AC-15 จึงเปลี่ยนจาก replace 1 ครั้งเป็น 1 + จำนวน retry; test ใหม่: lock สั้น ๆ แล้วสำเร็จ, ค่า delay, OSError อื่นไม่ retry
+- [x] R12-6 (R11 🟢1): ไม่ส่ง password เข้า thread ของ Tables เมื่อ worker ไม่ใช้ (database ปัจจุบัน / Oracle)
+- [x] R12-7 (R11 🟢2): `redact_secrets()` ปิด `PWD=` / `password=` (ทั้งแบบปกติและ URL-encoded), userinfo ใน URL และรหัสผ่านที่รู้ค่า — ใช้กับ print / traceback ใน worker ของ Tables และ `on_list_tables_error`
+- [x] R12-8 (R11 🟢3–5): `_details_differ_from` strip port ทั้งสองฝั่งหลัง split (`"5432 :x"` ไม่เตือนค้าง); type hints `_replace_engine(engine: Any)` / `_refresh_target_summary() -> None`; test ตั้ง password ผ่าน `_replace_engine` แทน tuple ภายใน
+- [x] R12-9 (R12 review 🟡1): `RedactSecretsTests.test_patterns_and_known_secret` เทียบผล `redact_secrets` ทั้งบรรทัด (ODBC / URL-encoded มี `;Encrypt=yes` ต่อท้าย) + ตรวจว่าชิ้นส่วนรหัสในรูปที่ปรากฏจริง (`p@ss`, `p%40ss`, `w}}rd`, `rd}`, `%7D%7Drd`) ไม่หลุด — ยืนยันแล้วว่า test ล้มเมื่อ regex ไม่รองรับ `}}` / `%7D%7D` (mask ได้ครึ่งเดียว)
+  - QA: mutation เพิ่ม (patch `app._SECRET_PATTERNS` ใน process): ODBC แบบไม่หยุดที่ `;` (`[^&\s'\"]*` / ต่อท้ายปีกกาปิด) และ URL-encoded แบบไม่หยุดที่ `%3B` → test ล้มทุกแบบ (mask กิน `;Encrypt=yes`); pattern เดิม → ผ่าน. Regression 2 mode (utf-8 / cp874 redirect) → `Ran 1147 tests ... OK` ทั้งคู่
+- [x] R12-T: Regression ทั้งชุด สอง mode encoding → `Ran 1147 tests ... OK` ทั้งคู่

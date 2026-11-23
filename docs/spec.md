@@ -799,3 +799,568 @@ stdout ที่ encode "❌" ไม่ได้ หมายถึง `io.TextI
 | R7-Q-3 | R7-3: Job ที่ไป sheet Skipped / Failed และมีข้อความเกิน limit ควรนับเป็น Warning เพิ่มหรือไม่ | ไม่ — คงนับเป็น Skipped / Failed (สถานะที่รุนแรงกว่า และไม่นับซ้ำสองหมวด) แต่เขียน log warning; Job ที่ไป No Data หรือ Success เท่านั้นที่เปลี่ยนเป็น Warning |
 | R7-Q-4 | R7-5: หลัง rollback ควรเลือกกลุ่ม / script ใดในหน้าต่าง | เลือกกลุ่มที่เลือกอยู่ก่อนกด (ตามชื่อก่อนแก้) และ script index ก่อนกด (หรือ index ใกล้สุดที่มีอยู่); สำหรับ `new_group` คงกลุ่มที่เลือกอยู่เดิม |
 | R7-Q-5 | R7-3: บรรทัด SQL ที่เกิน limit ควรเว้นว่าง (เหมือน C-2) หรือตัดข้อความให้เหลือ 32,767 | เว้นว่างตามที่ผู้ใช้สั่ง "ใช้พฤติกรรมเดียวกับ C-2" — บันทึกไว้เพื่อยืนยันเท่านั้น |
+
+---
+
+# Round 8 — Bugfix B1: `load_jobs` ทิ้ง Job ทั้งหมดเมื่อเขียน migration กลับไม่สำเร็จ
+
+> ใช้เลข `R8-AC-x` และ `R8-Q-x` แยกจาก Round ก่อนหน้า ไม่แก้เนื้อหา Round ก่อนหน้า
+> ที่มา: รายงาน bug-hunter ข้อ B1 (ยืนยันด้วย probe แล้ว) ผู้ใช้สั่งให้แก้ **เฉพาะ B1** — บัค B2 ถึง B16 อยู่นอกขอบเขตทั้งหมด
+> ไฟล์ที่เกี่ยวข้อง: `database_connect_gui.py` — `write_json_atomic` (`:71-79`), `preserve_unreadable_file` (`:82-96`), `__init__` เรียก `self.saved_jobs = self.load_jobs()` (`:2374`), `load_jobs` (`:9482-9521`, จุดบัค `:9513-9514` และ `:9518-9521`), `_handle_unreadable_file` (`:9523-9545`), `save_jobs` (`:9547-9561`)
+> เลขบรรทัดอ้างอิงไฟล์ ณ วันที่เขียน spec (2026-11-20) อาจคลาดเคลื่อนเล็กน้อย
+
+### R8-1. เป้าหมาย
+
+`load_jobs` อ่านและ parse `saved_jobs.json` แล้วเติม key `"profile"` ให้ Job รุ่นเก่า (ชื่อ Profile แรกใน `saved_profiles` หรือ `"DEFAULT"`) จากนั้นเขียนกลับด้วย `write_json_atomic(self.jobs_file, jobs, indent=4)` **ภายใน `try` เดียวกับการอ่าน** ถ้าการเขียนกลับล้ม (เช่น OneDrive ล็อกไฟล์ → `os.replace` raise `PermissionError`) exception ตกไป `except Exception` ที่ถือว่า "ไฟล์อ่านไม่ได้":
+
+1. แสดง warning `Cannot read saved_jobs.json: ...` ทั้งที่ไฟล์อ่านได้ปกติ
+2. สร้างสำเนา `saved_jobs_unreadable_<time>.json` และ `return []` → รายการ Job ในแอปว่าง
+3. เพราะสำเนาสำเร็จ `_jobs_save_blocked` จึงเป็น `False` → Save Job ครั้งถัดไปเขียนทับไฟล์ด้วยรายการที่มีแค่ Job ใหม่ = **Job เดิมหายถาวร** (เหลือเพียงในสำเนา `_unreadable_`)
+4. ถ้าล้มที่ `os.replace` จะมีไฟล์ `saved_jobs.json.tmp` ค้าง
+
+หลักฐาน probe: patch `os.replace` ให้ raise `PermissionError` → `load_jobs()` คืน `[]`, `_jobs_save_blocked` = `False`, เรียก `save_jobs()` หลังเพิ่ม Job `NEW` แล้วไฟล์เหลือ `[{'name': 'NEW', ...}]`
+
+เป้าหมาย: เมื่อ parse สำเร็จแล้ว ความล้มเหลวของการเขียน migration กลับต้อง **ไม่** ถูกตีความเป็น "ไฟล์อ่านไม่ได้" — แอปต้องได้ Job ครบ (มี `"profile"` ใน memory) และ save ครั้งถัดไปต้องไม่ทำ Job หาย
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่มี `saved_jobs.json` รุ่นเก่า (Job ไม่มี key `"profile"`) และเก็บโฟลเดอร์แอปบน OneDrive หรือที่อื่นที่ไฟล์อาจถูกล็อกชั่วคราวตอนเปิดแอป
+
+### R8-2. ขอบเขต
+
+#### In scope
+
+- แยกการเขียน migration กลับ (`write_json_atomic` ใน `load_jobs`) ออกจาก `try` ของการอ่าน / parse / validate: ถ้าการเขียนกลับ raise `Exception` ใด ๆ ให้
+  - คืน `jobs` ที่อ่านได้ (รวม `"profile"` ที่เติมแล้วใน memory)
+  - ไม่เรียก `_handle_unreadable_file` (ไม่มี warning "Cannot read", ไม่มีสำเนา `_unreadable_`) และไม่ตั้ง `_jobs_save_blocked = True`
+  - เขียน log ลง console ตาม R8-Q-1 โดย `print` ต้องไม่ทำให้ `load_jobs` raise (แนวทางเดียวกับ R7-1 — ครอบ `try / except Exception: pass`)
+  - ลบไฟล์ `<jobs_file>.tmp` ที่อาจค้างจาก `write_json_atomic` แบบ best-effort ตาม R8-Q-2 (ถ้าลบไม่ได้ให้ข้าม ไม่ raise)
+- กรณีไฟล์อ่านไม่ได้จริง (JSON เสีย, โครงสร้างไม่ใช่ list ของ dict, เปิดไฟล์ไม่ได้, decode ไม่ได้) คงพฤติกรรมเดิมทุกประการ
+- กรณีไม่มี Job ต้อง migrate คงพฤติกรรมเดิม (ไม่เขียนไฟล์)
+
+#### Out of scope
+
+- บัค B2 ถึง B16 จากรายงาน bug-hunter ทั้งหมด
+- การแก้ `write_json_atomic` (ฟังก์ชันกลางที่ `save_jobs` / `save_profiles` / `save_script_groups` ใช้ร่วม) รวมถึงการให้มันลบ `.tmp` เองเมื่อล้ม
+- การแก้ `_handle_unreadable_file`, `preserve_unreadable_file`, `save_jobs` และข้อความ dialog เดิม
+- `load_profiles`, `load_script_groups` หรือ loader อื่น แม้จะมีรูปแบบคล้ายกัน
+- การเปลี่ยนกฎเลือก Profile ที่เติมให้ Job รุ่นเก่า (Profile แรก หรือ `"DEFAULT"`), การเปลี่ยน `indent=4` ของการเขียนกลับ
+- การ retry การเขียนกลับ หรือการแสดง dialog ใหม่ (ดู R8-Q-1)
+- Refactor / rename / commit
+
+### R8-3. User stories
+
+- **R8-US-1**: ในฐานะผู้ใช้ที่มี Job รุ่นเก่าและเปิดแอปขณะ OneDrive ล็อก `saved_jobs.json` ฉันต้องการเห็น Job ของฉันครบ เพื่อทำงานต่อได้ตามปกติ
+- **R8-US-2**: ในฐานะผู้ใช้คนเดียวกัน ฉันต้องการให้การ Save Job ครั้งถัดไปไม่ลบ Job เดิมของฉัน เพื่อไม่สูญเสียข้อมูลถาวร
+- **R8-US-3**: ในฐานะผู้ใช้ที่ไฟล์ `saved_jobs.json` เสียจริง ฉันต้องการให้แอปยังเก็บสำเนาและเตือนเหมือนเดิม
+
+### R8-4. Acceptance criteria
+
+วิธีทดสอบทุกข้อเป็น `unittest` ใช้ stub (`DatabaseConnectorGUI.__new__`, ตั้ง `jobs_file` ใน `tempfile.TemporaryDirectory()`, `saved_profiles`, `_jobs_save_blocked = False` ตามแนวทาง `tests/test_r2_reset_parameter_qa.py:579-590`), `unittest.mock.patch` สำหรับ `messagebox`, `os.replace` / `write_json_atomic` (ของ module `database_connect_gui`) และ `sys.stdout`; ไม่เปิดหน้าต่าง Tk จริง ไฟล์ test ใหม่: `tests/test_r8_load_jobs_writeback.py`
+
+นิยาม:
+- "ไฟล์รุ่นเก่า" = `saved_jobs.json` ที่เป็น list ของ Job อย่างน้อย 2 ตัว โดยมีอย่างน้อย 1 ตัวไม่มี key `"profile"` และอย่างน้อย 1 ตัวมี `"profile"` อยู่แล้ว (เช่น `"P2"`) รวม Job ที่มีค่าซ้อน (dict / list) และอักษรไทย
+- "เขียนกลับล้ม" ทดสอบสองแบบ: (ก) patch `os.replace` ให้ raise `PermissionError` (เหมือน probe — `.tmp` ถูกสร้างแล้ว) และ (ข) patch `write_json_atomic` ให้ raise `OSError` (ล้มก่อนสร้าง `.tmp`)
+- "ไฟล์บนดิสก์ไม่เปลี่ยน" = bytes ของ `saved_jobs.json` เท่ากับก่อนเรียก
+
+#### เขียน migration กลับล้มเหลว
+
+| AC | Given / When / Then |
+|---|---|
+| R8-AC-1 | **Given** ไฟล์รุ่นเก่า, `saved_profiles = {"P1": {...}, "P2": {...}}` และเขียนกลับล้ม (ทั้งแบบ ก และ ข) **When** เรียก `load_jobs()` **Then** ไม่มี exception หลุดออก, คืน list ที่จำนวน ลำดับ และค่าทุก key ตรงกับไฟล์ ยกเว้น Job ที่ไม่มี `"profile"` ได้ `"profile": "P1"` (Profile แรก) และ Job ที่มี `"profile": "P2"` อยู่แล้วคงเป็น `"P2"` |
+| R8-AC-2 | **Given** เหมือน R8-AC-1 แต่ `saved_profiles = {}` **When** `load_jobs()` **Then** Job ที่ไม่มี key ได้ `"profile": "DEFAULT"` และ Job อื่นครบเหมือน R8-AC-1 |
+| R8-AC-3 | **Given** เหมือน R8-AC-1 **When** `load_jobs()` **Then** ไม่มีการเรียก `messagebox.showwarning` (ไม่มีข้อความ `Cannot read saved_jobs.json`), ไม่มี `showerror` / `showinfo` ใด ๆ และ `_handle_unreadable_file` ไม่ถูกเรียก |
+| R8-AC-4 | **Given** เหมือน R8-AC-1 **When** `load_jobs()` **Then** ใน directory ของ `jobs_file` ไม่มีไฟล์ที่ชื่อมี `_unreadable_` และ `_jobs_save_blocked` ยังเป็น `False` (ไม่ถูกตั้งเป็น `True`) |
+| R8-AC-5 | **Given** เหมือน R8-AC-1 **When** `load_jobs()` **Then** `saved_jobs.json` บนดิสก์ไม่เปลี่ยน (bytes เท่ากับก่อนเรียก — Job รุ่นเก่ายังไม่มี `"profile"` ในไฟล์) |
+| R8-AC-6 | **Given** เหมือน R8-AC-1 แบบ (ก) ซึ่ง `write_json_atomic` สร้าง `saved_jobs.json.tmp` ก่อน `os.replace` ล้ม **When** `load_jobs()` จบ **Then** ไม่มีไฟล์ `saved_jobs.json.tmp` เหลืออยู่ (R8-Q-2); และถ้าการลบ `.tmp` เองก็ล้ม (patch `os.remove` ให้ raise `OSError`) `load_jobs()` ยังคืน Job ครบตาม R8-AC-1 ไม่มี exception |
+| R8-AC-7 | **Given** เหมือน R8-AC-1 และ stdout เป็น `io.StringIO` **When** `load_jobs()` **Then** มีบรรทัด log ลง stdout 1 ครั้งที่มีชื่อไฟล์ `saved_jobs.json` และข้อความ error ของ exception (R8-Q-1); และเมื่อ stdout เป็น `io.TextIOWrapper(io.BytesIO(), encoding="cp874", errors="strict")` หรือ `write` raise `OSError` ผลของ R8-AC-1 ถึง R8-AC-5 ยังเป็นจริง ไม่มี exception |
+
+#### Save ครั้งถัดไปหลังเขียนกลับล้ม
+
+| AC | Given / When / Then |
+|---|---|
+| R8-AC-8 | **Given** `load_jobs()` ตาม R8-AC-1 แล้ว (ตั้ง `stub.saved_jobs` = ผลที่คืน) และปลดการ patch ที่ทำให้เขียนล้ม **When** append Job ใหม่ `NEW` แล้วเรียก `save_jobs()` **Then** คืน `True`, ไม่มี `showerror`, และ `saved_jobs.json` ที่อ่านกลับมามี Job เดิมทุกตัว (ค่าเดิม + `"profile"` ที่เติมแล้ว) ตามด้วย `NEW` — ตรงข้ามกับผล probe ที่เหลือแค่ `[{'name': 'NEW', ...}]` |
+| R8-AC-9 | **Given** เหมือน R8-AC-8 แล้ว **When** เรียก `load_jobs()` อีกครั้ง (ไม่มีการ patch) **Then** ไม่มีการเขียนไฟล์ (ไม่มี Job ต้อง migrate แล้ว — `write_json_atomic` ไม่ถูกเรียก) และคืน list เท่ากับที่บันทึกใน R8-AC-8 |
+
+#### กรณีเดิมที่ต้องไม่เปลี่ยน (regression lock)
+
+| AC | Given / When / Then |
+|---|---|
+| R8-AC-10 | **Given** ไฟล์รุ่นเก่าและการเขียนกลับสำเร็จ **When** `load_jobs()` **Then** พฤติกรรมเดิม: คืน Job ครบพร้อม `"profile"` ที่เติม, ไฟล์บนดิสก์ถูกเขียนใหม่ให้ทุก Job มี `"profile"` (`json.load` ได้ค่าเท่ากับที่คืน, เขียนด้วย `indent=4`), ไม่มี `.tmp` ค้าง, ไม่มี dialog, ไม่มีสำเนา `_unreadable_` |
+| R8-AC-11 | **Given** ไฟล์ที่ทุก Job มี `"profile"` อยู่แล้ว (รวม list ว่าง `[]`) **When** `load_jobs()` **Then** คืน list เท่ากับไฟล์, `write_json_atomic` ไม่ถูกเรียก (assert ด้วย mock wrapper), ไฟล์บนดิสก์ไม่เปลี่ยน (bytes และ mtime) และไม่มี dialog |
+| R8-AC-12 | **Given** ไฟล์อ่านไม่ได้จริงแต่ละแบบ: JSON เสีย (เช่น `[{"name": "a",`), JSON ที่ไม่ใช่ list (`{}`), list ที่มีสมาชิกไม่ใช่ dict (`[1]`), และ bytes ที่ decode UTF-8 ไม่ได้ **When** `load_jobs()` **Then** พฤติกรรมเดิม: คืน `[]`, `messagebox.showwarning` ถูกเรียก 1 ครั้งด้วย title `"Saved Jobs not loaded"` และข้อความขึ้นต้น `Cannot read saved_jobs.json:`, มีสำเนา `saved_jobs_unreadable_<time>.json` ที่ bytes เท่ากับไฟล์เดิม, `_jobs_save_blocked` = `False`, `write_json_atomic` ไม่ถูกเรียก และไฟล์เดิมไม่เปลี่ยน |
+| R8-AC-13 | **Given** ไฟล์อ่านไม่ได้จริง (JSON เสีย) และ `preserve_unreadable_file` คืน `None` (สำเนาไม่ได้) **When** `load_jobs()` **Then** พฤติกรรมเดิม: คืน `[]`, `_jobs_save_blocked` = `True` และ `save_jobs()` ครั้งถัดไปคืน `False` ไม่เขียนไฟล์ (test เดิม `tests/test_bugfix_h3.py`, `tests/test_r7_console_print.py` ยังผ่านโดยไม่แก้) |
+| R8-AC-14 | **Given** ไม่มีไฟล์ `saved_jobs.json` **When** `load_jobs()` **Then** คืน `[]`, ไม่มี dialog, ไม่สร้างไฟล์ใด ๆ — พฤติกรรมเดิม |
+
+#### Regression
+
+| AC | Given / When / Then |
+|---|---|
+| R8-AC-15 | **Given** แก้ B1 ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบตาม R7-AC-28: (ก) ตั้ง `PYTHONIOENCODING=utf-8` และ (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` บนเครื่อง code page `cp874` และ redirect stdout+stderr ไปไฟล์หรือ pipe **Then** ทั้งสองแบบได้ `OK` ไม่มี failure / error, จำนวน test เท่ากันทั้งสองแบบ และไม่น้อยกว่าจำนวนก่อนแก้ (1007) บวก test ใหม่ของ Round 8; test เดิมไม่ต้องแก้ |
+
+**สรุปจำนวน AC Round 8**: 15 ข้อ — unittest ทั้งหมด (เขียนกลับล้ม: 7, save ครั้งถัดไป: 2, regression lock: 5, full suite: 1)
+
+### R8-5. ข้อจำกัด / สมมติฐาน
+
+- Minimal diff: แก้เฉพาะ `load_jobs` ใน `database_connect_gui.py`; ไม่ refactor ไม่ rename; PEP 8 + type hints เท่าที่จำเป็น
+- การแยก `try`: การอ่าน / `json.load` / validate / เติม `"profile"` อยู่ใน `try` เดิม (ล้ม → `_handle_unreadable_file` ตามเดิม); การเขียนกลับอยู่ใน `try` แยกที่จับ `Exception` และไม่ส่งต่อไป `except` เดิม
+- เมื่อเขียนกลับล้ม การ migrate ยังค้างอยู่เฉพาะใน memory; จะลงไฟล์เมื่อ (1) `save_jobs()` ครั้งถัดไปสำเร็จ (เขียน `self.saved_jobs` ทั้งหมดที่มี `"profile"` แล้ว) หรือ (2) เปิดแอปครั้งถัดไปแล้วเขียนกลับสำเร็จ — ถือว่ายอมรับได้เพราะไม่มีข้อมูลหาย
+- `load_jobs` ถูกเรียกใน `__init__` (`:2374`) ก่อนสร้าง widget จึงยังไม่มี `results_text` สำหรับ log; การแจ้งจึงใช้ console (`print`) ตาม R8-Q-1
+- `.tmp` ที่ค้างไม่ทำให้ข้อมูลเสีย (การ save ครั้งถัดไปเปิด `.tmp` แบบ `"w"` เขียนทับ) การลบจึงเป็น best-effort เพื่อความสะอาดเท่านั้น และทำใน `load_jobs` ไม่ใช่ใน `write_json_atomic` (R8-Q-2)
+- สมมติว่า `saved_profiles` ถูกโหลดก่อน `load_jobs` (ตามลำดับใน `__init__` `:2373-2374`) ซึ่งเป็นพฤติกรรมเดิม
+- ห้าม commit
+
+### R8-6. คำถามที่ยังไม่มีคำตอบ
+
+ทุกข้อมีคำตอบที่แนะนำซึ่ง AC ข้างต้นใช้เป็นค่าเริ่มต้นแล้ว ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R8-Q-1 | เมื่อเขียน migration กลับล้ม ควรแจ้งผู้ใช้อย่างไร: (ก) log ลง console อย่างเดียว, (ข) แสดง `messagebox.showwarning` เพิ่ม, (ค) เงียบ | (ก) `print` 1 บรรทัดที่มีชื่อไฟล์และ error ครอบด้วย guard ตาม R7-1 — Job ครบใน memory และจะถูกบันทึกเมื่อ save ครั้งถัดไป จึงไม่ต้องรบกวนผู้ใช้ด้วย dialog ตอนเปิดแอป; ไม่มี `results_text` ให้ log ในจังหวะนี้ (R8-AC-3, R8-AC-7) |
+| R8-Q-2 | ควรลบ `saved_jobs.json.tmp` ที่ค้างหลังเขียนกลับล้มหรือไม่ และลบที่ไหน | ลบแบบ best-effort ใน `load_jobs` (เฉพาะไฟล์ `<jobs_file>.tmp`, ลบไม่ได้ให้ข้าม) โดยไม่แก้ `write_json_atomic` ซึ่งใช้ร่วมกับ save อื่น — การแก้ `write_json_atomic` อยู่นอกขอบเขต B1 (R8-AC-6) ถ้าผู้ใช้ไม่ต้องการ ให้ตัด R8-AC-6 ออก |
+| R8-Q-3 | หลังเขียนกลับล้ม ควรตั้ง flag ให้พยายาม migrate / เขียนกลับอีกครั้งในระหว่าง session หรือไม่ | ไม่ — `save_jobs()` ครั้งถัดไปเขียนข้อมูลที่ migrate แล้วอยู่แล้ว (R8-AC-8) การ retry เพิ่มเป็น scope creep |
+
+---
+
+# Round 9 — Bugfix B2: Load Preset ที่มี element เสียทำให้ Job ของ Profile ปัจจุบันหาย
+
+> ใช้เลข `R9-AC-x` และ `R9-Q-x` แยกจาก Round ก่อนหน้า ไม่แก้เนื้อหา Round ก่อนหน้า
+> ที่มา: รายงาน bug-hunter ข้อ B2 (ยืนยันด้วย probe แล้ว) ผู้ใช้สั่งให้แก้ **เฉพาะ B2** — บัค B3 ถึง B16 อยู่นอกขอบเขตทั้งหมด; การแก้ของ Round 8 (B1, `load_jobs`) ยังไม่ commit และห้ามแตะ
+> ไฟล์ที่เกี่ยวข้อง: `database_connect_gui.py` — `load_preset_dialog` (`:5456-5602`): สร้างรายการ preset (`:5497-5513`, ตรวจเพียง `"jobs"` เป็น list ที่ `:5505`), `load_selected` (`:5515-5575`, จุดบัค: กรอง `self.saved_jobs` `:5547-5549` → loop `job["profile"] = ...` `:5552-5556` → `save_jobs` + rollback `:5558-5562`); `save_jobs` (`:9559-9573`); `_restore_jobs_snapshot` (`:9575-9580`, มาจาก R5-H-3); test เดิม `tests/test_bugfix_h3.py` `LoadPresetTests` (`:498-`)
+> เลขบรรทัดอ้างอิงไฟล์ ณ วันที่เขียน spec (2026-11-20 — หลังแก้ Round 8 ที่ยังไม่ commit) อาจคลาดเคลื่อนเล็กน้อย
+
+### R9-1. เป้าหมาย
+
+`load_selected` ใน `load_preset_dialog` แก้ `self.saved_jobs` **ก่อน** ตรวจว่า element ใน `"jobs"` ของ preset ใช้ได้:
+
+1. `self.saved_jobs = [job ... if job.get("profile") != current_profile]` (`:5547`) — Job ของ Profile ปัจจุบันถูกตัดออก (เป็น list ใหม่)
+2. loop `job["profile"] = current_profile` (`:5554`) — ถ้า element ไม่ใช่ dict (`null`, ตัวเลข, string, list) raise `TypeError` ทันที
+3. exception หลุดออกจาก callback โดยไม่มี rollback — `_restore_jobs_snapshot` ถูกเรียกเฉพาะเมื่อ `save_jobs()` คืน `False` (`:5558-5562`)
+
+ผล: Job ของ Profile ปัจจุบันหายจาก memory (บางส่วนของ preset ที่อยู่ก่อน element เสียถูก append ไปแล้ว) และ save ใด ๆ ต่อมา (Save Job / Edit / Delete) เขียนสถานะนี้ลงไฟล์ → **หายถาวร**
+
+หลักฐาน probe: preset `"jobs": [{"name": "ok", ...}, null]`, Profile `PROD` มี `P-job0..2`, Profile อื่นมี `U-job` → กด Load + ยืนยัน → `TypeError: 'NoneType' object does not support item assignment`; in-memory เหลือ `['U-job', 'ok']`; หลัง Save Job `new` แล้ว `saved_jobs.json` = `['U-job', 'ok', 'new']`
+
+ผลการตรวจโค้ดเพิ่มเติม (รูปแบบ element อื่นที่ทำให้พัง):
+
+| รูปแบบ element / preset | ผลในโค้ดปัจจุบัน |
+|---|---|
+| ไม่ใช่ dict: `null`, `1`, `"x"`, `[]`, `true` | `TypeError` ที่ `:5554` → Job หายตามข้างต้น (บัคหลัก) |
+| dict ที่ไม่มี `"query"` หรือ `"name"` | Load สำเร็จและบันทึกลงไฟล์ แต่พังภายหลัง: `edit_job` ใช้ `job["name"]` / `job["query"]` (`:4202`, `:4226`) → `KeyError`; `load_job_to_editor` (`:4158`, `:4162`); การแสดงผล Run All / export ใช้ `job["name"]` / `job["query"]` (`:9943`, `:9977`, `:10010`, `:10094`, `:10117`, `:10186`, `:10474`) |
+| dict ที่ `"query"` / `"name"` ไม่ใช่ string (เช่น `null`, ตัวเลข, list) หรือเป็น string ว่าง / มีแต่ช่องว่าง | Load สำเร็จแต่ข้อมูลผิดจากที่แอปสร้างเองเสมอ (Save Job / Edit Job ปฏิเสธชื่อและ SQL ว่าง `:4332-4338`, `:9633`) และพังหรือทำงานผิดเมื่อนำไปใช้ (`tk.Text.insert` / `assess_sql` / การรัน) |
+| `"jobs": []` หรือไม่มี key `"jobs"` | ไม่พัง: ยืนยันข้อความ "replace N jobs with 0 jobs" แล้วลบ Job ของ Profile ปัจจุบันทั้งหมดและบันทึก — เป็นผลที่ผู้ใช้ยืนยันเองอย่างชัดแจ้ง (ดู R9-Q-4) |
+| top-level ไม่ใช่ dict / JSON เสีย / `"jobs"` ไม่ใช่ list | ไม่พัง: ถูกข้ามตอนสร้างรายการ (`:5512-5513` `print` "skipped") — พฤติกรรมเดิม |
+| `save_jobs()` คืน `False` (เขียนไฟล์ล้ม / `_jobs_save_blocked`) | rollback ด้วย `_restore_jobs_snapshot` ถูกต้องอยู่แล้ว (R5-H-3, lock โดย `tests/test_bugfix_h3.py` `LoadPresetTests`) |
+
+เป้าหมาย: preset ที่มี element เสีย **ต้องไม่เปลี่ยน `self.saved_jobs`** ทั้งใน memory และบนดิสก์, ผู้ใช้ต้องได้รับแจ้งว่า preset ใช้ไม่ได้, และ exception ที่ไม่คาดคิดใด ๆ ระหว่างการแทนที่ Job ต้องถูก rollback แบบเดียวกับกรณี save ล้ม โดย preset ปกติทำงานเหมือนเดิมทุกประการ
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่แก้ไฟล์ `preset_*.json` ด้วยมือ หรือมีไฟล์ preset เสีย (เช่นจาก OneDrive sync) และผู้ใช้ทุกคนที่มี Job ของ Profile ปัจจุบันซึ่งจะถูกแทนที่ตอน Load Preset
+
+### R9-2. ขอบเขต
+
+#### In scope
+
+- **Validate ก่อนแตะข้อมูล**: ใน `load_selected` ตรวจทุก element ของ `"jobs"` ตามนิยาม "element ที่ใช้ได้" (R9-Q-3) **ก่อน** `messagebox.askyesno` และก่อนแก้ `self.saved_jobs` (R9-Q-1, R9-Q-2):
+  - ถ้ามี element ที่ใช้ไม่ได้อย่างน้อย 1 ตัว → ปฏิเสธทั้ง preset: แสดง `messagebox.showerror` 1 ครั้ง (parent = dialog) ระบุชื่อ preset และลำดับ (1-based) ของ element แรกที่เสียพร้อมเหตุผลสั้น ๆ, ไม่ถามยืนยัน, ไม่แก้ `self.saved_jobs`, ไม่เรียก `save_jobs`, ไม่แก้ dict ของ preset, dialog ยังเปิดอยู่ให้เลือก preset อื่นได้
+- **Rollback สำหรับ exception ที่ไม่คาดคิด**: ครอบบล็อกตั้งแต่การกรอง `self.saved_jobs` ถึงการเรียก `save_jobs()` ด้วย `try / except Exception` ที่เรียก `_restore_jobs_snapshot(saved_jobs_before, original_jobs, jobs_snapshot)` แล้วแจ้ง `messagebox.showerror` (R9-Q-5) และ return โดยไม่มีผลสำเร็จ (ไม่ `update_jobs_list`, ไม่เขียน `results_text`, ไม่ `showinfo`, ไม่ปิด dialog) — exception ไม่หลุดออกจาก callback
+- คงทาง rollback เดิมเมื่อ `save_jobs()` คืน `False` ทุกประการ (R5-H-3)
+- คงพฤติกรรมของ preset ปกติทุกประการ (ข้อความยืนยัน, ลำดับ Job, การตั้ง `"profile"`, ข้อความสำเร็จ)
+
+#### Out of scope
+
+- บัค B1 (แก้แล้วใน Round 8 — ห้ามแตะ `load_jobs`) และ B3 ถึง B16 ทั้งหมด
+- การเปลี่ยนการสร้างรายการ preset (`:5497-5513`): ยังแสดง preset ที่มี element เสียตามเดิม (R9-Q-2), ยังข้ามไฟล์ JSON เสีย / `"jobs"` ไม่ใช่ list ด้วย `print` เดิม
+- การ validate `saved_jobs.json` ใน `load_jobs`, การ validate Job ที่มีอยู่แล้วใน `self.saved_jobs`, หรือการแก้จุดที่ใช้ `job["name"]` / `job["query"]` ที่อื่น
+- `save_preset_dialog` (รวมการเขียน `run_index` ลง Job ใน memory) และการ `job.get("profile")` แบบไม่มี default ใน Load / Save Preset (ยกไว้แล้วใน R7 Out of scope)
+- การทำ deep-copy ของ dict ใน preset ก่อน append (preset dict ถูก append เข้า `self.saved_jobs` โดยตรงตามเดิม) และการที่ `"profile"` ใน dict ของ preset ถูกแก้ค้างไว้เมื่อ `save_jobs()` ล้ม (ไม่กระทบไฟล์ preset และ `saved_jobs`)
+- การเปลี่ยนพฤติกรรม preset ที่ `"jobs"` ว่าง (R9-Q-4), การเพิ่ม key ที่ต้องมีนอกเหนือ `"name"` / `"query"`, การ validate ค่า key อื่น (`database`, `db_type`, `excel_parameters`, ...)
+- exception ที่เกิด **หลัง** `save_jobs()` คืน `True` (เช่นใน `update_jobs_list`) — ไฟล์ถูกเขียนแล้ว การ rollback memory จะทำให้ memory ไม่ตรงกับดิสก์
+- `save_jobs`, `_restore_jobs_snapshot`, `write_json_atomic` และข้อความ dialog เดิม
+- Refactor / rename / commit
+
+### R9-3. User stories
+
+- **R9-US-1**: ในฐานะผู้ใช้ที่เผลอ Load preset ที่ไฟล์เสีย ฉันต้องการให้ Job ของ Profile ปัจจุบันยังอยู่ครบทั้งในแอปและในไฟล์ เพื่อไม่สูญเสียงานถาวร
+- **R9-US-2**: ในฐานะผู้ใช้คนเดียวกัน ฉันต้องการเห็นข้อความบอกว่า preset ไหนใช้ไม่ได้และเสียที่ตำแหน่งใด เพื่อไปแก้ไฟล์ได้
+- **R9-US-3**: ในฐานะผู้ใช้ preset ปกติ ฉันต้องการให้ Load Preset ทำงานเหมือนเดิม
+
+### R9-4. Acceptance criteria
+
+วิธีทดสอบทุกข้อเป็น `unittest` ตามแนวทาง `tests/test_bugfix_h3.py` `LoadPresetTests` (stub จาก `make_job_stub`, `fake_dialog_widgets`, กดปุ่ม Load ด้วย `command()`), `unittest.mock.patch.object(app, "messagebox")`, `tempfile.TemporaryDirectory()` เป็นโฟลเดอร์ของ `jobs_file` / preset; ไม่เปิด Tk จริง ไม่ต่อฐานข้อมูล ไฟล์ test ใหม่: `tests/test_r9_load_preset_validation.py`
+
+นิยาม:
+- "สถานะเริ่มต้น" = `profile_combo.get()` คืน `"PROD"`; `self.saved_jobs` มี `P-job0`, `P-job1`, `P-job2` (`"profile": "PROD"`) และ `U-job` (`"profile": "UAT"`) สลับลำดับกัน รวมค่าซ้อน (dict / list) และอักษรไทย; `saved_jobs.json` บนดิสก์มีเนื้อหาเดียวกัน (เขียนด้วย `save_jobs()` จริง)
+- "element เสีย" = ชุด matrix: ไม่ใช่ dict (`None`, `1`, `"x"`, `[]`, `True`); dict ที่ไม่มี `"query"`; ไม่มี `"name"`; `"query"` / `"name"` เป็น `None`, ตัวเลข, list; `"query"` / `"name"` เป็น `""` หรือ `"   "` (ตาม R9-Q-3)
+- "preset เสีย" = `{"created": "...", "jobs": [<Job ปกติ>, <element เสีย>, <Job ปกติ>]}` (element เสียไม่อยู่ตำแหน่งแรก เพื่อจับกรณี append ไปบางส่วนแบบ probe) และกรณี element เสียอยู่ตำแหน่งแรก / สุดท้าย
+- "`saved_jobs` ไม่เปลี่ยน" = `stub.saved_jobs is` list object เดิม, แต่ละ element `is` dict object เดิมตามลำดับเดิม, และ `==` deep-copy ที่เก็บไว้ก่อนกด Load
+- "ดิสก์ไม่เปลี่ยน" = bytes ของ `saved_jobs.json` และ `preset_*.json` เท่ากับก่อนกด Load
+
+#### Preset เสีย — ปฏิเสธก่อนแตะข้อมูล
+
+| AC | Given / When / Then |
+|---|---|
+| R9-AC-1 | **Given** สถานะเริ่มต้นและ preset เสีย (ทุกแบบใน matrix ด้วย `subTest`, รวมกรณี probe `[{ok}, null]`) **When** เลือก preset แล้วกด Load **Then** ไม่มี exception หลุดออก และ `saved_jobs` ไม่เปลี่ยน (ไม่มี `ok` ถูก append, `P-job0..2` ยังอยู่) |
+| R9-AC-2 | **Given** เหมือน R9-AC-1 **When** กด Load **Then** `messagebox.askyesno` ไม่ถูกเรียก, `save_jobs` ไม่ถูกเรียก (spy), `update_jobs_list` ไม่ถูกเรียก, `results_text` ไม่ถูกเขียน, `showinfo` ไม่ถูกเรียก และ dialog ไม่ถูก destroy |
+| R9-AC-3 | **Given** เหมือน R9-AC-1 **When** กด Load **Then** `messagebox.showerror` ถูกเรียก 1 ครั้งด้วย `parent=dialog` และข้อความมีชื่อ preset และลำดับ 1-based ของ element **แรก** ที่เสีย (เช่น preset ที่ element ที่ 2 และ 3 เสีย → ระบุ `2`) |
+| R9-AC-4 | **Given** เหมือน R9-AC-1 **When** กด Load **Then** ดิสก์ไม่เปลี่ยน (`saved_jobs.json` และไฟล์ preset) และ dict ของ Job ปกติใน preset (ที่อยู่ใน `preset_data`) ไม่ถูกเพิ่ม / แก้ key `"profile"` |
+| R9-AC-5 | **Given** กด Load preset เสียแล้วตาม R9-AC-1 (ใช้ `save_jobs` จริง) **When** append Job ใหม่ `new` (`"profile": "PROD"`) แล้วเรียก `save_jobs()` **Then** คืน `True` และ `saved_jobs.json` ที่อ่านกลับมา = Job เดิมทั้ง 4 ตัวตามลำดับเดิม ตามด้วย `new` — ตรงข้ามกับผล probe `['U-job', 'ok', 'new']` |
+| R9-AC-6 | **Given** dialog เดียวกันหลังปฏิเสธ preset เสียตาม R9-AC-1 และมี preset ปกติอีกไฟล์ในรายการ **When** เลือก preset ปกติแล้วกด Load + ยืนยัน **Then** โหลดสำเร็จตาม R9-AC-9 (preset เสียไม่ทิ้งสถานะค้างที่กระทบการโหลดครั้งถัดไป) |
+| R9-AC-7 | **Given** โฟลเดอร์มี preset เสียและ preset ปกติ **When** เปิด `load_preset_dialog()` **Then** รายการใน listbox เหมือนเดิม: ทั้งสองไฟล์ปรากฏ ด้วยข้อความรูปแบบเดิม `"<name> (<len(jobs)> jobs) - <created[:10]>"` (R9-Q-2); ไฟล์ JSON เสีย / `"jobs"` ไม่ใช่ list ยังถูกข้ามพร้อม `print` เดิม |
+
+#### Rollback เมื่อเกิด exception ที่ไม่คาดคิด
+
+| AC | Given / When / Then |
+|---|---|
+| R9-AC-8 | **Given** สถานะเริ่มต้น, preset ปกติ และ `save_jobs` ถูก patch ให้แก้ `self.saved_jobs` (append / แก้ค่าซ้อนของ Job เดิม) แล้ว raise `RuntimeError("boom")` **When** กด Load + ยืนยัน **Then** ไม่มี exception หลุดออก, `saved_jobs` ไม่เปลี่ยน (identity + ค่า ตามนิยาม), ไม่มี `update_jobs_list` / `results_text` / `showinfo`, dialog ไม่ถูก destroy, `messagebox.showerror` ถูกเรียก 1 ครั้งและข้อความมี `boom` (R9-Q-5), และ `saved_jobs.json` บนดิสก์ไม่เปลี่ยน |
+
+#### Preset ปกติ (regression lock)
+
+| AC | Given / When / Then |
+|---|---|
+| R9-AC-9 | **Given** สถานะเริ่มต้นและ preset ปกติ 2 Job (ตัวหนึ่งไม่มี key `"profile"`, อีกตัวมี `"profile": "UAT"`, มี key อื่นเช่น `database`, `run_index`, `excel_parameters`) **When** กด Load + ยืนยัน (`save_jobs` จริง) **Then** `askyesno` ถูกเรียก 1 ครั้งด้วยข้อความเดิม (`... replace current 3 jobs with 2 jobs from preset.`), `saved_jobs` = `[U-job, <preset job 1>, <preset job 2>]` (Job Profile อื่นคงอยู่ลำดับเดิม ตามด้วย Job ของ preset ตามลำดับในไฟล์) โดย Job ของ preset ทุกตัวมี `"profile": "PROD"` และ key อื่นคงค่าเดิม, `saved_jobs.json` บนดิสก์เท่ากับ `saved_jobs`, `update_jobs_list` 1 ครั้ง, `results_text` มี `Loaded preset: <name>` และ `Jobs loaded: 2`, `showinfo` 1 ครั้ง, dialog ถูก destroy, ไม่มี `showerror`, ไฟล์ preset ไม่เปลี่ยน |
+| R9-AC-10 | **Given** preset ปกติ **When** กด Load แล้วตอบ No ใน `askyesno` **Then** `saved_jobs` ไม่เปลี่ยน, `save_jobs` ไม่ถูกเรียก, ไม่มี dialog error / success — พฤติกรรมเดิม |
+| R9-AC-11 | **Given** preset ที่ `"jobs": []` และ preset ที่ไม่มี key `"jobs"` **When** กด Load + ยืนยัน **Then** พฤติกรรมเดิม (R9-Q-4): ข้อความยืนยันระบุ `with 0 jobs`, Job ของ `PROD` ถูกลบ, `saved_jobs` = `[U-job]` และบันทึกลงไฟล์, `showinfo` สำเร็จ, ไม่มี `showerror` |
+| R9-AC-12 | **Given** ไม่ได้เลือก preset ใน listbox **When** กด Load **Then** `showwarning("Warning", "Please select a preset", parent=dialog)` เหมือนเดิม และไม่มีการตรวจ / แก้ข้อมูล |
+
+#### Rollback เดิมเมื่อ save ล้ม (regression lock R5-H-3)
+
+| AC | Given / When / Then |
+|---|---|
+| R9-AC-13 | **Given** สถานะเริ่มต้น, preset ปกติ และ `save_jobs` คืน `False` หลังแก้ `self.saved_jobs` in-place **When** กด Load + ยืนยัน **Then** พฤติกรรมเดิม: `saved_jobs` ไม่เปลี่ยน (identity + ค่า), ไม่มี `update_jobs_list` / `results_text` / `showinfo`, dialog ไม่ถูก destroy, ไฟล์ preset ไม่เปลี่ยน และ **ไม่มี** `showerror` เพิ่มจากโค้ดของ Round 9 (error dialog มาจาก `save_jobs` เท่านั้น) |
+| R9-AC-14 | **Given** สถานะเริ่มต้น, preset ปกติ และ `save_jobs` จริงที่ล้มสองแบบ: (ก) patch `write_json_atomic` ให้ raise `OSError` (ข) `_jobs_save_blocked = True` **When** กด Load + ยืนยัน **Then** `saved_jobs` ไม่เปลี่ยน, `saved_jobs.json` บนดิสก์ไม่เปลี่ยน, `showerror` ถูกเรียก 1 ครั้งด้วยข้อความเดิมของ `save_jobs` (`Failed to save jobs:` / `could not be read when the app started`) และไม่มี `showinfo` |
+| R9-AC-15 | **Given** test เดิม `tests/test_bugfix_h3.py` (`LoadPresetTests`), `tests/test_bugfix_m5.py`, `tests/test_r3_script_groups_io.py` และ `tests/test_r8_load_jobs_writeback.py` **When** รันหลังแก้ **Then** ผ่านโดยไม่แก้ test เดิม |
+
+#### Regression ทั้งชุด (ผู้ใช้เลื่อนได้)
+
+| AC | Given / When / Then |
+|---|---|
+| R9-AC-16 | **Given** แก้ B2 ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบตาม R7-AC-28 / R8-AC-15: (ก) ตั้ง `PYTHONIOENCODING=utf-8` และ (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` บนเครื่อง code page `cp874` และ redirect stdout+stderr ไปไฟล์หรือ pipe **Then** ทั้งสองแบบได้ `OK`, จำนวน test เท่ากันทั้งสองแบบ และไม่มี test เดิมถูกแก้ — **AC นี้แยกไว้ให้ผู้ใช้เลื่อนได้** (Round 8 ผู้ใช้สั่งรันเฉพาะ focused: ถ้าเลื่อน ให้รัน focused `tests.test_r9_load_preset_validation tests.test_bugfix_h3 tests.test_bugfix_m5 tests.test_r8_load_jobs_writeback` แทน และบันทึกว่า R9-AC-16 รอ) |
+
+**สรุปจำนวน AC Round 9**: 16 ข้อ — unittest ทั้งหมด (preset เสีย: 7, rollback exception: 1, preset ปกติ: 4, rollback เดิม R5: 3, full suite (เลื่อนได้): 1)
+
+### R9-5. ข้อจำกัด / สมมติฐาน
+
+- Minimal diff: แก้เฉพาะ `load_selected` ภายใน `load_preset_dialog` ใน `database_connect_gui.py`; ไม่ refactor ไม่ rename; ไม่แตะ `load_jobs` (Round 8 ยังไม่ commit); PEP 8 + type hints สำหรับ helper ใหม่ (ถ้ามี)
+- การตรวจทำกับ `data` ที่ cache ไว้ใน `preset_data` ตอนเปิด dialog (ไม่อ่านไฟล์ใหม่) — สอดคล้องกับพฤติกรรมเดิม
+- นิยาม "element ที่ใช้ได้" (ค่าเริ่มต้นตาม R9-Q-3): `isinstance(job, dict)` และ `"name"` กับ `"query"` เป็น `str` ที่ `.strip()` แล้วไม่ว่าง — ตรงกับสิ่งที่ Save Job / Edit Job รับประกันเสมอ (`:9633`, `:4332-4338`) ดังนั้น preset ที่แอปสร้างเองผ่านทุกตัว; key `"profile"` ใน preset จะถูกเขียนทับอยู่แล้วจึงไม่ตรวจ
+- การ validate ทำก่อน `askyesno` เพื่อไม่ให้ผู้ใช้ยืนยันการแทนที่ที่จะไม่เกิดขึ้น; ข้อความ `showerror` มีชื่อ preset + ลำดับ element แรกที่เสีย + เหตุผล รูปแบบที่เหลือกำหนดในขั้น design (ใช้ title เช่น `"Invalid Preset"`)
+- `try / except Exception` ครอบเฉพาะช่วงกรอง → loop → `save_jobs()`; ทาง `save_jobs()` คืน `False` ยังใช้ `_restore_jobs_snapshot` + `return` เดิม (ไม่มี dialog เพิ่ม — R9-AC-13); exception หลัง save สำเร็จไม่อยู่ใน `try` (Out of scope)
+- snapshot (`saved_jobs_before`, `original_jobs`, `jobs_snapshot`) ต้องถูกสร้างก่อนเข้า `try` และก่อนแก้ข้อมูลใด ๆ (ตามโค้ดเดิม `:5542-5544`)
+- ห้าม commit
+
+### R9-6. คำถามที่ยังไม่มีคำตอบ
+
+ทุกข้อมีคำตอบที่แนะนำซึ่ง AC ข้างต้นใช้เป็นค่าเริ่มต้นแล้ว ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R9-Q-1 | preset ที่มี **บาง** element เสีย: (ก) ปฏิเสธทั้งไฟล์ หรือ (ข) ข้ามตัวเสียแล้วโหลดที่เหลือ | (ก) ปฏิเสธทั้งไฟล์ — การ Load **แทนที่** Job ทั้งหมดของ Profile ถ้าข้ามบางตัว ผู้ใช้จะเสีย Job เดิมแลกกับ preset ที่ไม่ครบโดยอาจไม่รู้ตัว; ผู้ใช้แก้ไฟล์แล้วโหลดใหม่ได้ (R9-AC-1 ถึง R9-AC-4) |
+| R9-Q-2 | ควรซ่อน preset ที่มี element เสียจากรายการ (ตรวจตอนสร้างรายการเหมือน `"jobs"` ไม่ใช่ list) หรือแสดงแล้วปฏิเสธตอนกด Load | แสดงตามเดิมแล้วปฏิเสธตอนกด Load พร้อม `showerror` — การซ่อนแจ้งได้แค่ `print` ลง console ผู้ใช้จะไม่รู้ว่า preset หายไปเพราะอะไร (ไม่ตรงข้อกำหนด "แจ้งผู้ใช้") และไม่ต้องแก้ส่วนสร้างรายการ (R9-AC-7) |
+| R9-Q-3 | "element ที่ใช้ได้" ต้องเข้มแค่ไหน: (ก) แค่เป็น dict, (ข) dict + มี `"query"`, (ค) dict + `"name"` และ `"query"` เป็น string ไม่ว่าง | (ค) — ตรงกับที่แอปบังคับตอน Save / Edit Job และกันพังภายหลังที่ `edit_job` / Run All / export ซึ่งใช้ `job["name"]` / `job["query"]` โดยตรง; preset ที่แอปสร้างเองผ่านเสมอ ถ้าผู้ใช้ต้องการผ่อนเป็น (ข) ให้ตัดกรณี `"name"` ออกจาก matrix ของ R9-AC-1 |
+| R9-Q-4 | preset ที่ `"jobs": []` หรือไม่มี key `"jobs"` ควรถือว่าเสียหรือไม่ (ปัจจุบันลบ Job ของ Profile ทั้งหมดหลังผู้ใช้ยืนยัน "with 0 jobs") | ไม่ถือว่าเสีย คงพฤติกรรมเดิม (R9-AC-11) — ไม่ใช่ crash ไม่มีข้อมูลหายโดยไม่ตั้งใจเพราะข้อความยืนยันบอกจำนวน 0 ชัดเจน; การเปลี่ยนเป็น scope creep |
+| R9-Q-5 | exception ที่ไม่คาดคิดในช่วงแทนที่ Job (หลังผ่าน validate): rollback แล้ว (ก) แสดง `showerror` ที่มีข้อความ exception, (ข) rollback แล้ว re-raise ให้ Tk พิมพ์ traceback, (ค) rollback เงียบ | (ก) — ผู้ใช้รู้ว่า Load ไม่สำเร็จและข้อมูลเดิมยังอยู่ ไม่มี traceback หลุด (R9-AC-8); ทาง `save_jobs()` คืน `False` คงเดิมไม่มี dialog ซ้ำ (R9-AC-13) |
+| R9-Q-6 | R9-AC-16 (full suite สองแบบ encoding) จะรันใน Round นี้หรือเลื่อนแบบ Round 8 | ให้ผู้ใช้ตัดสิน — ถ้าเลื่อน ให้รัน focused ตามที่ระบุใน R9-AC-16 แทน |
+
+---
+
+# Round 10 — Bugfix B3: Export Excel ทำไฟล์ `.xlsx` เดิมหายเมื่อ export ไม่จบ
+
+> ใช้เลข `R10-AC-x` และ `R10-Q-x` แยกจาก Round ก่อนหน้า ไม่แก้เนื้อหา Round ก่อนหน้า
+> ที่มา: รายงาน bug-hunter ข้อ B3 (ยืนยันด้วย probe แล้ว) ผู้ใช้สั่งให้แก้ **เฉพาะ B3** — บัค B4 ถึง B16 อยู่นอกขอบเขตทั้งหมด (รวม B12 กด Stop แล้วขึ้น "Export Excel เรียบร้อย"); การแก้ของ Round 8 (`load_jobs`) และ Round 9 (`load_preset_dialog`) ยังไม่ commit และห้ามแตะ
+> ไฟล์ที่เกี่ยวข้อง: `database_connect_gui.py` — `export_jobs_to_excel` (`:10318-10808`): เลือกไฟล์ `asksaveasfilename` (`:10353-10360`), log เริ่มต้น `📁 File:` (`:10376`), `on_done` (`:10392-10416`: ทาง fatal `:10395-10401`, ทางสำเร็จ `📁 Saved to:` `:10408` + `showinfo` `:10411-10416`), `worker` (`:10430-10806`): **`pd.ExcelWriter(file_path, engine="openpyxl")` `:10502`** (จุดบัค), `job["query"]` นอก `try` ราย Job `:10508`, Stop `:10504-10506`, `try` ราย Job `:10527` / `except Exception as job_err` `:10772-10792`, sheet `Export` เมื่อไม่มี sheet `:10794-10798`, `except Exception as e` → `fatal_error` `:10800-10801`; callers: Export Group `:5246`, Export ผลของ Job เดียว `export_to_excel_result` `:9113-9121`; `on_closing` + "Confirm Exit" (`:14141-14152`); test เดิมที่เกี่ยวข้อง `tests/test_r7_excel_cell_limit.py`, `tests/test_bugfix_c2.py`, `tests/test_bugfix_m2.py`, `tests/test_r4_excel_row_limit.py` (mock `pd.ExcelWriter` `:224-226`), `tests/test_r2_table_data_refresh.py` (`:342-350`)
+> เลขบรรทัดอ้างอิงไฟล์ ณ วันที่เขียน spec (2026-11-20 — หลังแก้ Round 8-9 ที่ยังไม่ commit; รายงาน bug-hunter อ้าง `:10456` / `:10462` ซึ่งเลื่อนมาเป็น `:10502` / `:10508`) อาจคลาดเคลื่อนเล็กน้อย
+
+### R10-1. เป้าหมาย
+
+`pd.ExcelWriter(file_path)` เปิดไฟล์ปลายทางแบบ `"wb"` **ทันที** ตอนเข้า `with` (`:10502`) ก่อนรัน query ของ Job แรก ซึ่งอาจใช้เวลาหลายชั่วโมง ไฟล์ปลายทางจึงเป็น 0 byte ตลอดการ export และเนื้อหาจริงถูกเขียนตอน `__exit__` เท่านั้น ถ้าผู้ใช้เลือกเขียนทับรายงาน `.xlsx` เดิม:
+
+1. ปิดแอประหว่าง export (ตอบ Yes ใน "Confirm Exit" → `root.destroy()` → thread `daemon=True` ถูกตัดทิ้ง), process ถูก kill หรือเครื่องดับ → **ไฟล์เดิมหาย เหลือ 0 byte**
+2. exception ที่หลุดออกนอก `try` ราย Job (เช่น `job["query"]` `:10508` ของ Job ที่ไม่มี key `"query"`, ชื่อ Job ไม่ใช่ dict, exception ภายใน `except job_err` เอง หรือการ save workbook ล้ม) → ถ้ามี sheet แล้ว `__exit__` เขียน workbook **บางส่วน** ทับไฟล์เดิม; ถ้ายังไม่มี sheet `__exit__` raise `IndexError: At least one sheet must be visible` ซึ่ง **บังสาเหตุจริง** — `fatal_error` และ dialog แสดง `IndexError` แทน `KeyError: 'query'` และไฟล์เดิมเหลือ 0 byte
+
+หลักฐาน probe: ไฟล์เดิม 11,980 bytes → ภายใน `with pd.ExcelWriter(...)` ขนาด 0 bytes; exception ก่อนมี sheet → `__exit__` raise `IndexError: At least one sheet must be visible`
+
+ผลการตรวจโค้ด — ทุกทางออกของ worker ในโค้ดปัจจุบัน:
+
+| ทางออก | ผลต่อไฟล์ปลายทางปัจจุบัน | ข้อความ / log ปัจจุบัน |
+|---|---|---|
+| สำเร็จครบทุก Job (รวม Job ที่ Failed / Skipped / No Data ราย Job ซึ่งถูกจับใน `try` ราย Job) | workbook ใหม่ทับไฟล์เดิม ✅ | `🏁 Export Excel Completed`, `📁 Saved to: <file_path>`, `showinfo` "Export Success" |
+| กด Stop ระหว่างทาง | workbook ของ Job ที่เสร็จแล้วทับไฟล์เดิม; Stop ก่อน Job แรก → sheet `Export` (`Status = Stopped`) ทับไฟล์เดิม | `⏹ Stopped — N job(s) not exported` + ข้อความสำเร็จ (B12 — นอกขอบเขต) |
+| exception นอก `try` ราย Job หลังมี sheet แล้ว | workbook บางส่วนทับไฟล์เดิม | `❌ EXPORT EXCEL FAILED` + `showerror` ด้วยสาเหตุจริง |
+| exception นอก `try` ราย Job ก่อนมี sheet | ไฟล์เดิมเหลือ 0 byte | `IndexError: At least one sheet must be visible` (บังสาเหตุจริง) |
+| การ save workbook ตอน `__exit__` ล้ม (ดิสก์เต็ม, OneDrive ล็อก ฯลฯ) | ไฟล์เดิมเหลือ 0 byte หรือเขียนไม่ครบ | `❌ EXPORT EXCEL FAILED` |
+| ไฟล์ปลายทางถูก Excel เปิดค้างตอนเริ่ม | `PermissionError` ทันทีที่ `pd.ExcelWriter(...)` ก่อนรัน query ใด ๆ ไฟล์เดิมไม่เปลี่ยน | `❌ EXPORT EXCEL FAILED` (fail เร็ว — พฤติกรรมที่ดีและต้องคงไว้) |
+| ปิดแอป / kill process ระหว่าง export | ไฟล์เดิมเหลือ 0 byte | — |
+| ไม่มี Job / ยกเลิก dialog เลือกไฟล์ / ยกเลิก dialog reuse / busy / Profile ไม่ตรง / ไม่ได้ Connect / ไม่มี `openpyxl` | ไม่แตะไฟล์ (return ก่อนเริ่ม worker) | ข้อความเดิม |
+
+เป้าหมาย: ไฟล์ปลายทางเดิม **ไม่ถูกเปิด / ตัด / แก้** จนกว่า workbook ใหม่จะถูกเขียนครบสมบูรณ์ แล้วจึงแทนที่ในขั้นเดียว (`os.replace`) ถ้า export ไม่สำเร็จ ไฟล์เดิมต้องคงอยู่ครบ ไม่มีไฟล์ชั่วคราวค้าง (ยกเว้นกรณีที่ระบุใน R10-Q-3 / R10-Q-6) และผู้ใช้ต้องเห็นสาเหตุจริงของความล้มเหลว โดยผลลัพธ์ของ export ที่สำเร็จเหมือนเดิมทุกประการ
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่ export รายงานทับไฟล์เดิม (Export Excel / Export Group / Export ผลของ Job เดียว ซึ่งใช้ `export_jobs_to_excel` ตัวเดียวกัน) โดยเฉพาะงานที่ใช้เวลานาน
+
+### R10-2. ขอบเขต
+
+#### In scope
+
+- **เขียนลงไฟล์ชั่วคราวแล้วแทนที่**: worker ของ `export_jobs_to_excel` เขียน workbook ลงไฟล์ชั่วคราวในโฟลเดอร์เดียวกับไฟล์ปลายทาง (ชื่อตาม R10-Q-1) และเรียก `os.replace(<temp>, file_path)` เฉพาะเมื่อ workbook ถูก save ครบสมบูรณ์โดยไม่มี fatal error; ไฟล์ปลายทางไม่ถูกเปิดเพื่อเขียนก่อนจังหวะนั้น
+- **ล้มแล้วลบ temp**: ทุกทางที่ไม่ไปถึง `os.replace` (fatal exception, save workbook ล้ม) ลบไฟล์ชั่วคราวแบบ best-effort; ลบไม่ได้ให้ข้าม (ไม่ raise) และบันทึกตาม R10-Q-9
+- **ไม่บังสาเหตุจริง**: `fatal_error` / `showerror` / Execution Logs ต้องแสดง exception ต้นเหตุ (ชนิด + ข้อความ) ไม่ใช่ `IndexError: At least one sheet must be visible` หรือ error จากการ close / ลบ temp ที่เกิดตามมา
+- **ไฟล์ปลายทางถูกล็อก**: ตรวจตั้งแต่ก่อนรัน query (คงพฤติกรรม fail เร็วแบบเดิม) และจัดการกรณี `os.replace` ล้มตาม R10-Q-3
+- **Stop**: พฤติกรรมของไฟล์ตาม R10-Q-2 (ค่าเริ่มต้น = เหมือนเดิม คือ workbook บางส่วนแทนที่ไฟล์ปลายทาง แต่ผ่าน temp + `os.replace`)
+- **path ที่แสดง**: log `📁 File:` / `📁 Saved to:` และ `showinfo` แสดง `file_path` ปลายทางเหมือนเดิม; path ของ temp แสดงเฉพาะกรณีที่ระบุใน R10-Q-3 / R10-Q-9
+- ครอบทั้ง 3 ทางเข้า (Export Excel, Export Group `:5246`, `export_to_excel_result` `:9121`) โดยอัตโนมัติเพราะใช้ worker เดียวกัน
+
+#### Out of scope
+
+- บัค B4 ถึง B16 ทั้งหมด — รวม **B12** (Stop แล้ว `on_done` ขึ้น `Export Excel เรียบร้อย` / `Export Success`): Round นี้ไม่แก้ข้อความ / ตัวนับ / dialog ของ Stop; AC ของ Round นี้จึง **ไม่ assert** ข้อความสำเร็จ / ไม่สำเร็จในกรณี Stop
+- Round 8 (`load_jobs`) และ Round 9 (`load_preset_dialog`) ที่ยังไม่ commit — ห้ามแตะ
+- การย้าย `job["query"]` (`:10508`) เข้า `try` ราย Job ให้กลายเป็น Job Failed แทน fatal (R10-Q-7) — Round นี้แค่ทำให้ error จริงไม่ถูกบัง
+- การเปลี่ยนเนื้อหา workbook (sheet, cell, รูปแบบ, การตรวจ 32,767 ของ R7, row limit ของ R4, `force_literal_strings` / `data_type = "s"`), ตัวนับ Success / Warning / Failed / Skipped และข้อความ log อื่นของ worker
+- การ retry `os.replace`, การล้าง temp ที่ค้างจาก Round ก่อน / จากการ kill process ตอนเปิดแอปครั้งถัดไป (R10-Q-6), การเปลี่ยนข้อความ "Confirm Exit" หรือการรอ worker ก่อนปิดแอป
+- การเก็บ attribute / ACL / creation time ของไฟล์เดิม (ไฟล์ใหม่แทนที่ทั้งไฟล์)
+- จุดอื่นที่เขียนไฟล์ลงปลายทางโดยตรง (R10-Q-8): `export_selected` ในหน้าต่างเลือกค่า (`:14084` `to_excel(save_path)`), `export_to_csv` (`:9098-9106`), Export Profiles / Groups JSON (`:3419`, `:4500`) — ทั้งหมดเขียนข้อมูลที่อยู่ใน memory แล้วจบทันที ไม่มี query ยาวคั่น
+- `write_json_atomic` และ helper กลางอื่น, refactor / rename / commit
+
+### R10-3. User stories
+
+- **R10-US-1**: ในฐานะผู้ใช้ที่ export ทับรายงาน `.xlsx` เดิม ฉันต้องการให้ไฟล์เดิมยังอยู่ครบถ้าฉันปิดแอป, process ตาย หรือ export ล้มกลางทาง เพื่อไม่เสียรายงานเดิม
+- **R10-US-2**: ในฐานะผู้ใช้คนเดียวกัน ฉันต้องการเห็นสาเหตุจริงที่ export ล้ม เพื่อแก้ไขได้ถูกจุด
+- **R10-US-3**: ในฐานะผู้ใช้ที่ export สำเร็จ ฉันต้องการได้ไฟล์ผลลัพธ์เหมือนเดิมทุกประการ ที่ path ที่ฉันเลือก โดยไม่มีไฟล์แปลกปลอมค้างในโฟลเดอร์
+- **R10-US-4**: ในฐานะผู้ใช้ที่เปิดไฟล์ปลายทางใน Excel ค้างไว้ ฉันต้องการรู้ตั้งแต่ต้นว่าเขียนไม่ได้ และถ้าไฟล์ถูกล็อกตอนท้าย ฉันต้องการไม่เสียผล export ที่รันมาหลายชั่วโมง
+
+### R10-4. Acceptance criteria
+
+วิธีทดสอบทุกข้อเป็น `unittest` ตามแนวทาง `tests/test_r7_excel_cell_limit.py` `_ExportCase` (stub จาก `DatabaseConnectorGUI.__new__`, `root.after` เรียก callback ทันที, patch `filedialog.asksaveasfilename`, `threading.Thread` → `_ImmediateThread`, `messagebox`, `read_sql_dataframe` เป็น callback ของ test) ใช้ `pandas` / `openpyxl` จริงเขียนไฟล์จริงใน `tempfile.TemporaryDirectory()`; ไม่ต่อฐานข้อมูล ไม่เปิด Tk จริง ไฟล์ test ใหม่: `tests/test_r10_export_atomic_write.py`
+
+นิยาม:
+- "ไฟล์เดิม" = `.xlsx` ที่ถูกต้องซึ่งสร้างด้วย `openpyxl` ก่อน export ที่ `file_path` (มี sheet / ค่าที่จำได้) — เก็บ bytes และ `os.stat().st_size` ไว้ก่อนเริ่ม
+- "ไฟล์เดิมไม่เปลี่ยน" = bytes ของ `file_path` เท่ากับก่อนเริ่ม (และ `openpyxl.load_workbook` เปิดได้ค่าเดิม)
+- "ไม่มี temp ค้าง" = ชุดชื่อไฟล์ในโฟลเดอร์ปลายทางหลัง export เท่ากับชุดก่อน export (บวก `file_path` ถ้าเดิมไม่มีและ export สำเร็จ)
+- "Job ชุดมาตรฐาน" = 4 Job ที่ครอบทุก sheet type: Success (มีข้อมูล), No Data, Skipped (ไม่ใช่ SELECT), Failed ราย Job (`read_sql_dataframe` raise `RuntimeError`)
+- "fatal ก่อนมี sheet" = Job แรกไม่มี key `"query"`; "fatal หลังมี sheet" = Job แรกปกติ, Job ที่สองไม่มี key `"query"` (`KeyError` ที่ `:10508` นอก `try` ราย Job — ทางเดียวกับ probe)
+- "temp path" = path ของไฟล์ชั่วคราวที่ worker สร้าง (test หาได้จาก spy บน `os.replace` หรือจากไฟล์ใหม่ในโฟลเดอร์)
+
+#### ไฟล์เดิมไม่เปลี่ยนจนกว่า export สำเร็จ
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-1 | **Given** ไฟล์เดิมที่ `file_path` และ Job ชุดมาตรฐาน **When** `read_sql_dataframe` ถูกเรียกแต่ละครั้ง (callback ของ test อ่าน `file_path` ณ ขณะนั้น) **Then** ทุกครั้ง bytes ของ `file_path` เท่ากับไฟล์เดิม (ไม่ใช่ 0 byte) — ตรงข้ามกับผล probe |
+| R10-AC-2 | **Given** เหมือน R10-AC-1 **When** export สำเร็จ **Then** workbook ถูกเขียนลงไฟล์อื่นก่อนแล้ว `os.replace` (spy ที่เรียกของจริง) ถูกเรียก **1 ครั้ง** ด้วย `dst == file_path` และ `os.path.dirname(src) == os.path.dirname(file_path)` (โฟลเดอร์เดียวกัน — R10-Q-1); ไม่มีการเปิด `file_path` ด้วย mode เขียนก่อน `os.replace` |
+| R10-AC-3 | **Given** ในโฟลเดอร์ปลายทางมีไฟล์อื่นของผู้ใช้อยู่ก่อน รวมไฟล์ชื่อ `<stem>.tmp.xlsx` และ `<stem>.xlsx.tmp` **When** export สำเร็จ และ export ที่ fatal (ทั้งสองแบบ) **Then** ไฟล์อื่นทุกไฟล์มี bytes เท่าเดิมและไม่ถูกลบ (temp ต้องไม่ชนกับไฟล์ที่มีอยู่ — R10-Q-1) |
+| R10-AC-4 | **Given** ไฟล์เดิมที่ `file_path` และ Job 2 ตัว **When** subprocess ที่รัน export บน stub เดียวกัน ถูก `Popen.kill()` ระหว่าง `read_sql_dataframe` ของ Job ที่สอง (child ส่งสัญญาณ "อยู่ใน query" ทาง stdout แล้วรอ) **Then** หลัง process ตาย `file_path` เป็นไฟล์เดิม (bytes เท่าเดิม) — จำลองการปิดแอป / kill process; ไฟล์ temp อาจค้างได้ตาม R10-Q-6 (test ไม่ assert เรื่อง temp ในข้อนี้) |
+
+#### Export สำเร็จ — ผลเหมือนเดิม
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-5 | **Given** ไฟล์เดิมที่ `file_path` และ Job ชุดมาตรฐาน **When** export **Then** `file_path` เป็น workbook ใหม่ที่ชื่อ sheet, ลำดับ sheet, ค่าทุก cell, `data_type` ของ cell string และ annotation SQL **เท่ากับ** workbook ที่ export ชุดเดียวกันไปยัง path ใหม่ที่ไม่เคยมีไฟล์ (เทียบด้วย `openpyxl`), ไม่มี sheet / ค่าจากไฟล์เดิมหลงเหลือ, ไม่มี temp ค้าง, ตัวนับใน log `Success: 2`, `Warning: 0`, `Failed: 1`, `Skipped (not SELECT): 1` (No Data นับ Success ตามเดิม) |
+| R10-AC-6 | **Given** `file_path` ยังไม่มีไฟล์ **When** export Job ชุดมาตรฐาน **Then** `file_path` ถูกสร้าง, เปิดด้วย `openpyxl` ได้ 4 sheet ตามเดิม และในโฟลเดอร์มีไฟล์ใหม่เพียง `file_path` (ไม่มี temp ค้าง) |
+| R10-AC-7 | **Given** export สำเร็จตาม R10-AC-5 **When** ตรวจข้อความ **Then** Execution Logs มี `📁 File: <file_path>` และ `📁 Saved to: <file_path>`, `showinfo` ถูกเรียก 1 ครั้ง (title `"Export Success"`) และข้อความมี `file_path`; temp path **ไม่** ปรากฏใน Execution Logs หรือ dialog ใด; ไม่มี `showerror` |
+| R10-AC-8 | **Given** Job ที่ Failed ราย Job (exception ใน `try` ราย Job เช่น `read_sql_dataframe` raise, เกิน row limit ของ R4) อยู่ปนกับ Job ปกติ **When** export **Then** ไม่ถือเป็น fatal: `file_path` ถูกแทนที่ด้วย workbook ที่มี sheet `Failed` ของ Job นั้นครบตามเดิม และไม่มี temp ค้าง — พฤติกรรมเดิม |
+
+#### Export ล้ม (fatal) — ไฟล์เดิมคงอยู่ ไม่มี temp ค้าง error จริงไม่ถูกบัง
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-9 | **Given** ไฟล์เดิมและ "fatal หลังมี sheet" **When** export **Then** ไฟล์เดิมไม่เปลี่ยน (ไม่ถูกแทนที่ด้วย workbook บางส่วน — เปลี่ยนจากพฤติกรรมเดิมตาม R10-Q-4), ไม่มี temp ค้าง, `os.replace` ไม่ถูกเรียก, `showerror` ถูกเรียก 1 ครั้ง title `"Export Error"` ข้อความมี `KeyError` และ `query`, Execution Logs มี `❌ EXPORT EXCEL FAILED` และ `Error: KeyError: ...`, ไม่มี `showinfo` |
+| R10-AC-10 | **Given** ไฟล์เดิมและ "fatal ก่อนมี sheet" **When** export **Then** เหมือน R10-AC-9 และข้อความใน `showerror` / Execution Logs **ไม่มี** `IndexError` และ `At least one sheet must be visible` (สาเหตุจริง `KeyError: 'query'` ไม่ถูกบัง) |
+| R10-AC-11 | **Given** ไฟล์เดิม, Job ปกติ และการ save workbook ล้ม (patch `openpyxl.workbook.workbook.Workbook.save` หรือ close ของ writer ให้ raise `OSError("disk full")` หลังเขียน temp ไปบางส่วน) **When** export **Then** ไฟล์เดิมไม่เปลี่ยน, ไม่มี temp ค้าง, `os.replace` ไม่ถูกเรียก, `showerror` 1 ครั้งข้อความมี `disk full` |
+| R10-AC-12 | **Given** เหมือน R10-AC-9 / R10-AC-11 และการลบ temp เองล้ม (patch `os.remove` / `os.unlink` ให้ raise `PermissionError`) **When** export **Then** ไม่มี exception หลุดออกจาก worker, `on_done` ถูกเรียก 1 ครั้ง, ข้อความใน `showerror` เป็นสาเหตุต้นเหตุ (`KeyError` / `disk full`) **ไม่ใช่** `PermissionError` ของการลบ, ไฟล์เดิมไม่เปลี่ยน และ Execution Logs มีบรรทัดระบุ temp path ที่ลบไม่ได้ (R10-Q-9) |
+| R10-AC-13 | **Given** ไฟล์เดิมและ `read_sql_dataframe` raise `BaseException` ที่ไม่ใช่ `Exception` (เช่น `SystemExit`) ระหว่าง Job **When** worker ทำงาน (test จับ exception ที่หลุดออก) **Then** ไฟล์เดิมไม่เปลี่ยน และไม่มี temp ค้าง (การลบ temp อยู่ในทาง `finally` หรือเทียบเท่า) — exception นั้นยังหลุดออกเหมือนเดิม (ไม่ถูกกลืน) |
+
+#### ไฟล์ปลายทางถูกล็อก
+
+"ล็อกแบบ Excel" = handle ที่เปิดด้วย `CreateFileW` (`ctypes`) โดย `dwShareMode = FILE_SHARE_READ` (ไม่อนุญาตเขียน / ลบ) เหมือนที่ Excel ถือไฟล์ที่เปิดอยู่; test ส่วนนี้ skip เมื่อ `sys.platform != "win32"`
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-14 | **Given** ไฟล์เดิมที่ถูกล็อกแบบ Excel ตั้งแต่ก่อนเริ่ม **When** export **Then** fail ก่อนรัน query (R10-Q-3): `read_sql_dataframe` **ไม่ถูกเรียก**, `showerror` 1 ครั้ง title `"Export Error"` ข้อความมี `file_path` และสาเหตุ (`PermissionError` / ข้อความว่าไฟล์ถูกเปิดอยู่), ไฟล์เดิมไม่เปลี่ยน, ไม่มี temp ค้าง — คงพฤติกรรม fail เร็วของโค้ดเดิม |
+| R10-AC-15 | **Given** ไฟล์เดิมไม่ถูกล็อกตอนเริ่ม แต่ถูกล็อกแบบ Excel ใน `read_sql_dataframe` ของ Job สุดท้าย (จำลองผู้ใช้เปิดไฟล์ระหว่าง export) และ test แบบไม่ขึ้นกับ OS ที่ patch `os.replace` ให้ raise `PermissionError` **When** export จบ **Then** (ตาม R10-Q-3) ไฟล์เดิมไม่เปลี่ยน, ไฟล์ temp ที่ save ครบ **ถูกเก็บไว้** และ `openpyxl` เปิดได้ครบทุก sheet ของ export, `showerror` 1 ครั้งข้อความมี `file_path`, temp path และสาเหตุ, Execution Logs มีข้อมูลเดียวกัน, ไม่มี `showinfo` และไม่มีไฟล์ temp อื่นค้าง |
+
+#### Stop (พฤติกรรมไฟล์เท่านั้น — ข้อความเป็นเรื่องของ B12)
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-16 | **Given** ไฟล์เดิม, 3 Job และ `_stop_event` ถูก set ใน `read_sql_dataframe` ของ Job ที่ 1 **When** export จบ **Then** (ค่าเริ่มต้น R10-Q-2) `file_path` ถูกแทนที่ด้วย workbook ที่มีเฉพาะ sheet ของ Job ที่ 1 (เหมือนผลของโค้ดเดิม), Execution Logs มี `⏹ Stopped — 2 job(s) not exported`, ไม่มี temp ค้าง; **ไม่ assert** ข้อความสำเร็จ / `showinfo` (B12) |
+| R10-AC-17 | **Given** ไฟล์เดิมและ `_stop_event` ถูก set ก่อน Job แรก **When** export จบ **Then** (ค่าเริ่มต้น R10-Q-2) `file_path` เป็น workbook ที่มี sheet `Export` (`Status = Stopped`) เหมือนผลของโค้ดเดิม, ไม่มี temp ค้าง; ไม่ assert ข้อความ (B12) |
+
+#### ทางที่ไม่เริ่ม export (regression lock)
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-18 | **Given** ไฟล์เดิมที่ `file_path` **When** export แต่ละกรณี: ไม่มี Job (`jobs_override=[]`), `asksaveasfilename` คืน `""`, `_reuse_last_run_results` คืน `None`, `_block_if_busy` คืน `True` (ครั้งแรก และครั้งที่สองหลัง dialog), `_block_if_profile_mismatch` คืน `True`, `engine` เป็น `None` **Then** ไม่มีไฟล์ใดในโฟลเดอร์ถูกสร้าง / แก้ / ลบ (ไฟล์เดิมไม่เปลี่ยน, ไม่มี temp), worker ไม่ถูกเริ่ม และข้อความ / dialog เหมือนเดิม |
+
+#### Regression lock ของ cell limit / warning (Round 7) และ test เดิม
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-19 | **Given** ไฟล์เดิมที่ `file_path` และ Job ที่มีข้อความเกิน 32,767 UTF-16 units ทุกตำแหน่งของ R7 (cell ผลลัพธ์, `Query` ของ Skipped, `Error` / `Query` ของ Failed, บรรทัด SQL ของ No Data, บรรทัด SQL annotation) และข้อความ 32,767 units พอดี **When** export **Then** `file_path` (หลังแทนที่) มี cell ที่เกินว่าง, cell ที่ 32,767 พอดีครบ, บรรทัด log warning ทุกบรรทัด (ชื่อ Job, ตำแหน่ง, `32,767`) และตัวนับ Success / Warning / Failed / Skipped ตรงกับ R7-AC-9 ถึง R7-AC-14 ทุกประการ; cell string ยัง `data_type == "s"` (R5-AC-9) และไม่มี temp ค้าง |
+| R10-AC-20 | **Given** test เดิม `tests/test_r7_excel_cell_limit.py`, `tests/test_bugfix_c2.py`, `tests/test_bugfix_m2.py`, `tests/test_r2_table_data_refresh.py`, `tests/test_r4_excel_row_limit.py`, `tests/test_r4_profile_mismatch.py`, `tests/test_run_entry_block.py`, `tests/test_r8_load_jobs_writeback.py`, `tests/test_r9_load_preset_validation.py` **When** รันหลังแก้ **Then** ผ่านโดยไม่แก้ assertion; ข้อยกเว้นเดียวคือ harness ของ `tests/test_r4_excel_row_limit.py` ที่ mock `pd.ExcelWriter` ด้วย writer ปลอม (ไม่สร้างไฟล์จริง) และใช้ path สัมพัทธ์ `"export.xlsx"` — ปรับได้เฉพาะ harness ตาม R10-Q-5 (เช่น ให้ path อยู่ใน `TemporaryDirectory` / stub การแทนที่ไฟล์) และต้องไม่มีไฟล์ใดถูกสร้างใน working directory ของ repo ระหว่างรัน |
+
+#### Regression ทั้งชุด (ผู้ใช้เลื่อนได้)
+
+| AC | Given / When / Then |
+|---|---|
+| R10-AC-21 | **Given** แก้ B3 ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบตาม R7-AC-28: (ก) ตั้ง `PYTHONIOENCODING=utf-8` และ (ข) ไม่ตั้ง `PYTHONIOENCODING` / `PYTHONUTF8` บนเครื่อง code page `cp874` และ redirect stdout+stderr ไปไฟล์หรือ pipe **Then** ทั้งสองแบบได้ `OK`, จำนวน test เท่ากันทั้งสองแบบ และไม่มี test เดิมถูกแก้นอกจากที่ R10-AC-20 อนุญาต — **AC นี้แยกไว้ให้ผู้ใช้เลื่อนได้**: ถ้าเลื่อน ให้รัน focused `tests.test_r10_export_atomic_write tests.test_r7_excel_cell_limit tests.test_bugfix_c2 tests.test_bugfix_m2 tests.test_r4_excel_row_limit tests.test_r2_table_data_refresh tests.test_r4_profile_mismatch tests.test_run_entry_block` แทน และบันทึกว่า R10-AC-21 รอ |
+
+**สรุปจำนวน AC Round 10**: 21 ข้อ — unittest ทั้งหมด (ไฟล์เดิมไม่เปลี่ยนระหว่างรัน: 4, สำเร็จ: 4, fatal: 5, ไฟล์ล็อก: 2, Stop: 2, ทางไม่เริ่ม: 1, regression R7 + test เดิม: 2, full suite (เลื่อนได้): 1)
+
+### R10-5. ข้อจำกัด / สมมติฐาน
+
+- Minimal diff: แก้เฉพาะ worker ของ `export_jobs_to_excel` (และส่วนก่อนเริ่ม worker เท่าที่จำเป็นสำหรับการตรวจไฟล์ล็อก) ใน `database_connect_gui.py`; ไม่แตะ `on_done` ยกเว้นข้อความกรณี R10-Q-3 / R10-Q-9 ถ้า design เลือกให้ผ่าน `fatal_error`; ไม่แตะ `load_jobs` / `load_preset_dialog` (Round 8-9 ยังไม่ commit); PEP 8 + type hints สำหรับ helper ใหม่ (ถ้ามี)
+- ไฟล์ temp ต้องอยู่ **โฟลเดอร์เดียวกับปลายทาง** เพื่อให้ `os.replace` เป็นการ rename บน volume เดียวกัน (atomic บน NTFS) — ไม่ใช้ `%TEMP%`
+- `pd.ExcelWriter` ยังใช้ `engine="openpyxl"`; เนื้อหา workbook ต้องเหมือนเดิมทุก byte ที่มีความหมาย (R10-AC-5 เทียบด้วย `openpyxl` ไม่เทียบ bytes ดิบ เพราะ zip มี timestamp)
+- การตรวจ "ไฟล์ปลายทางเขียนได้" ตอนเริ่มต้องไม่แก้ไฟล์เดิม (ไม่ truncate ไม่เปลี่ยนเนื้อหา) และเมื่อปลายทางยังไม่มีไฟล์ต้องไม่สร้างไฟล์ที่ `file_path`; วิธีตรวจกำหนดในขั้น design (เช่นเปิดแบบไม่ truncate บน Windows ซึ่งจะ fail เมื่อ Excel ถือ handle อยู่) — ต้องไม่ทำให้ `tests/test_r2_table_data_refresh.py` (mock `Thread`, ปลายทางยังไม่มี) เปลี่ยนผล
+- ปิดแอป / kill process ไม่สามารถลบ temp ได้ (thread เป็น `daemon=True` และ `on_closing` ไม่รอ worker) จึงรับประกันเฉพาะว่าไฟล์เดิมไม่เปลี่ยน (R10-AC-4); temp ที่ค้างจากกรณีนี้ตาม R10-Q-6
+- `os.replace` แทนที่ทั้งไฟล์: attribute / ACL / เวลาสร้างของไฟล์เดิมไม่ถูกเก็บ; ไฟล์ปลายทางแบบ read-only ทำให้ `os.replace` ล้มและเข้าทาง R10-Q-3
+- R10-AC-4 ใช้ `subprocess` + `sys.executable`; child สร้าง stub เองแบบเดียวกับ test อื่น (ไม่เปิด Tk จริง) — ถ้า QA พบว่าทำไม่ได้บนเครื่องนี้ให้รายงานเป็น `[!]` ไม่ตัด AC เอง
+- ห้าม commit
+
+### R10-6. คำถามที่ยังไม่มีคำตอบ
+
+ทุกข้อมีคำตอบที่แนะนำซึ่ง AC ข้างต้นใช้เป็นค่าเริ่มต้นแล้ว ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R10-Q-1 | ชื่อ / ที่อยู่ไฟล์ temp: (ก) ชื่อตายตัว `<stem>.tmp.xlsx` ตามที่ bug-hunter เสนอ, (ข) ชื่อไม่ซ้ำแบบสร้าง exclusive ในโฟลเดอร์เดียวกัน เช่น `<stem>.<สุ่ม>.tmp.xlsx` (`tempfile.mkstemp(dir=<โฟลเดอร์ปลายทาง>, prefix=f"{stem}.", suffix=".tmp.xlsx")`) | (ข) — ชื่อตายตัวอาจเขียนทับ / ลบไฟล์ของผู้ใช้ที่บังเอิญชื่อตรงกัน หรือชนกันเมื่อ export สองครั้งไปปลายทางเดียวกัน (R10-AC-3); ลงท้าย `.xlsx` ให้เปิดดูได้ถ้าค้าง; ไม่ใช้ prefix `~$` (ชนกับไฟล์ lock ของ Excel) และไม่ใช้ `%TEMP%` (R10-AC-2) |
+| R10-Q-2 | กด Stop แล้วจะ (ก) แทนที่ไฟล์ปลายทางด้วย workbook บางส่วนเหมือนเดิม (ผ่าน temp + replace), (ข) ถือเป็นยกเลิก — ลบ temp และคงไฟล์เดิม, (ค) ถามผู้ใช้ตอน Stop | (ก) — คงพฤติกรรมเดิมของ Stop ให้มากที่สุดเพราะ B12 (ข้อความ / ความหมายของ Stop) อยู่นอกขอบเขต; การเปลี่ยนความหมาย Stop ควรตัดสินพร้อม B12 (R10-AC-16, R10-AC-17) ถ้าผู้ใช้เลือก (ข) ให้แก้ R10-AC-16/17 เป็น "ไฟล์เดิมไม่เปลี่ยน + ไม่มี temp" |
+| R10-Q-3 | ไฟล์ปลายทางถูกล็อก (Excel เปิดอยู่): ตอนเริ่ม และตอน `os.replace` ล้มหลังรันเสร็จ จะทำอย่างไร | ตอนเริ่ม: ตรวจก่อนรัน query แล้ว fail เร็วพร้อม `showerror` (คงพฤติกรรมเดิมที่ `ExcelWriter` fail ทันที — R10-AC-14); ตอน replace ล้ม: **เก็บ temp ที่สมบูรณ์ไว้** แล้วแจ้ง path ปลายทาง, path temp และสาเหตุ ให้ผู้ใช้ปิด Excel แล้วเปลี่ยนชื่อเอง ไม่ทิ้งผลที่รันมาหลายชั่วโมง (R10-AC-15); ไม่ retry อัตโนมัติ ไม่มี dialog ถามซ้ำ |
+| R10-Q-4 | fatal error หลังเขียนไปแล้วบาง sheet: (ก) คงไฟล์เดิม ลบ temp (เปลี่ยนจากเดิมที่เขียน workbook บางส่วนทับ), (ข) แทนที่ด้วย workbook บางส่วนเหมือนเดิม | (ก) — คือหัวใจของ B3 "ไฟล์เดิมไม่เปลี่ยนจนกว่า export สำเร็จ"; workbook บางส่วนจาก fatal ไม่มีสัญญาณบอกว่าไม่ครบ (R10-AC-9) |
+| R10-Q-5 | `tests/test_r4_excel_row_limit.py` mock `pd.ExcelWriter` ด้วย writer ปลอมที่ไม่สร้างไฟล์ และใช้ path สัมพัทธ์ `"export.xlsx"` — หลังแก้ `os.replace` จะหา temp ไม่เจอ / อาจสร้างไฟล์ใน repo: อนุญาตให้ปรับ harness หรือบังคับให้ design เข้ากันได้โดยไม่แก้ test | อนุญาตให้ปรับ **เฉพาะ harness** (path ใน `TemporaryDirectory`, stub การแทนที่ไฟล์) ไม่แตะ assertion ตามหลัก R7-AC-27 และรายงานไฟล์ที่ปรับ (R10-AC-20); ถ้า design ทำให้ผ่านได้โดยไม่แก้ก็ไม่ต้องปรับ |
+| R10-Q-6 | temp ที่ค้างจากการปิดแอป / kill process ระหว่าง export ควรถูกล้างอัตโนมัติ (เช่นตอนเปิดแอปครั้งถัดไป) หรือไม่ | ไม่ — นอกขอบเขต (ต้องสแกนโฟลเดอร์ที่ผู้ใช้เลือกซึ่งแอปไม่ได้จดไว้); ชื่อ temp ตาม R10-Q-1 บอกชัดว่าเป็นไฟล์ชั่วคราว ผู้ใช้ลบเองได้ ไฟล์เดิมปลอดภัยแล้ว (R10-AC-4) |
+| R10-Q-7 | Job ที่ไม่มี key `"query"` (`:10508` นอก `try` ราย Job) ควรเปลี่ยนเป็น Job Failed ราย Job แทนการล้มทั้ง export หรือไม่ | ไม่ใน Round นี้ — คงเป็น fatal แต่แสดงสาเหตุจริง (R10-AC-9, R10-AC-10); การเปลี่ยนเป็น Failed ราย Job เปลี่ยนตัวนับ / เนื้อหา workbook เป็น scope ใหม่ (Job ที่แอปสร้างเองมี `"query"` เสมอ และ R9 กัน preset เสียแล้ว) |
+| R10-Q-8 | จุดอื่นที่เขียนไฟล์ลงปลายทางโดยตรง — `export_selected` (`:14084` `to_excel(save_path)` ในหน้าต่างเลือกค่า), `export_to_csv` (`:9106`), Export Profiles / Groups JSON (`:3419`, `:4500`) — ควรรวมใน Round นี้หรือไม่ | ไม่รวม — ทุกจุดเขียนข้อมูลที่อยู่ใน memory แล้วจบในไม่กี่วินาที ไม่มี query ยาวคั่น ความเสี่ยงต่ำกว่า B3 มาก ถ้าผู้ใช้ต้องการให้เปิดเป็น Round แยก |
+| R10-Q-9 | เมื่อลบ temp ไม่ได้ (หลัง fatal) ควรแจ้งอย่างไร | เขียน 1 บรรทัดใน Execution Logs ระบุ temp path ที่ลบไม่ได้ (ไม่มี dialog เพิ่ม) และ `showerror` ยังแสดงสาเหตุต้นเหตุเท่านั้น (R10-AC-12) |
+| R10-Q-10 | R10-AC-21 (full suite สองแบบ encoding) จะรันใน Round นี้หรือเลื่อนแบบ Round 8-9 | ให้ผู้ใช้ตัดสิน — ถ้าเลื่อน ให้รัน focused ตามที่ระบุใน R10-AC-21 แทน |
+
+---
+
+# Round 11 — Bugfix B4: Header "target" และ Tables ใช้ค่าจากช่องกรอก ไม่ใช่ connection จริง
+
+> ใช้เลข `R11-AC-x` และ `R11-Q-x` แยกจาก Round ก่อนหน้า ไม่แก้เนื้อหา Round ก่อนหน้า
+> ที่มา: รายงาน bug-hunter ข้อ B4 (ยืนยันด้วยการอ่านโค้ดเท่านั้น **ยังไม่ได้ทดสอบกับฐานข้อมูลจริง**) ผู้ใช้สั่งให้แก้ **เฉพาะ B4** — B5 (Stop ไม่หยุด `list_tables`) และบัคอื่นทั้งหมดอยู่นอกขอบเขต; การแก้ของ Round 8-10 ที่ยังไม่ commit ห้ามแตะ
+> ไฟล์ที่เกี่ยวข้อง: `database_connect_gui.py` — label header `target_main` / `target_sub` (`:2531-2538`), closure `_refresh_target_summary` (`:2694-2709`, poll ทุก 500 ms, เรียกครั้งแรก `:2721`), badge `_refresh_conn_badge` (`:2732-2751`), `ConnectionInfo` (`:374-404`, "Never holds the password"), `RunTarget` (`:408-412`), `connect_database` (`:7651-7733`: อ่านช่องกรอก `:7654-7659`, บังคับ password ไม่ว่าง `:7663`, ล้ม → `_replace_engine(None)` `:7698`, สร้าง `ConnectionInfo` `:7707-7714`), `_replace_engine` (`:7735-7748`), `_capture_run_target` (`:7750-7762`), `_block_if_profile_mismatch` (`:8094-8117` เทียบเฉพาะชื่อ Profile), `_confirm_destination` / `_confirm_data_change` (`:8340-8398`, SELECT ไม่มี dialog), `execute_query` (`:8429-8473`), **`list_tables`** (`:9174-9448`: `current_db_name = self.db_name.get()` `:9191`, `connection_credentials` จากช่องกรอก `:9192-9199`, ทาง "ทุก database" ใช้ `engine` เดิมหา DB `:9222-9270` แล้ว `get_connection_string(... credentials ...)` + `create_engine` ราย DB `:9294-9305`, ทาง "database ปัจจุบัน" `:9397-9428`, `on_list_tables_success(..., bool(current_db_name))` `:9433-9435`), `_reset_profile_connection_state` (`:11121-11147`); test เดิมที่เกี่ยวข้อง `tests/test_run_target.py` (`test_no_password_like_field`, `test_password_never_stored`), `tests/test_bugfix_h1.py`, `tests/test_run_engine_batch.py`, `tests/test_list_tables_stop.py`, `tests/test_bugfix_c1.py`, `tests/test_r4_profile_mismatch.py`, `tests/test_run_entry_block.py`, `tests/test_confirm_destination.py`, `tests/test_profile_connect_block.py`, `tests/test_profile_password.py`
+> เลขบรรทัดอ้างอิงไฟล์ ณ วันที่เขียน spec (2026-11-20 — หลังแก้ Round 8-10 ที่ยังไม่ commit; รายงาน bug-hunter อ้าง `:2643-2658` / `:9106-9114` ซึ่งเลื่อนมาเป็น `:2694-2709` / `:9191-9199`) อาจคลาดเคลื่อนเล็กน้อย
+
+### R11-1. เป้าหมาย
+
+หลัง Connect แล้ว ผู้ใช้แก้ช่อง Host / Port / Database / User / Database Type ในแถบ Details ได้โดยไม่ต้องกด Connect ใหม่ แต่ connection จริง (`self.engine` + `ConnectionInfo` ใน `_run_target`) ยังชี้ไปที่ปลายทางเดิม สองจุดยังอ่านค่าจากช่องกรอกแทน connection จริง:
+
+1. **Header "target"** (`_refresh_target_summary` `:2694-2709`) แสดง `db_type · user@host:port` และ `Database / Service: <db>` จาก **ช่องกรอก** ทุก 500 ms ขณะที่ badge แสดง `Connected` ตัวอย่าง: Connect ไป UAT → แก้ช่อง Database/Service เป็น PROD → header แสดง PROD + `Connected` แต่ `execute_query` รันบน engine ของ UAT; SELECT ไม่มี dialog ยืนยัน (DML มีและแสดงปลายทางถูกต้องจาก snapshot) และ `_block_if_profile_mismatch` เทียบเฉพาะชื่อ Profile จึงไม่จับกรณีนี้ → ผู้ใช้เชื่อว่าผลลัพธ์มาจาก PROD
+2. **`list_tables`** อ่าน `db_name`, user, password, host, port จากช่องกรอก (`:9191-9199`): ตัดสินว่าจะ list "ทุก database" หรือ "database ปัจจุบัน" จากช่องกรอก, ใช้ engine เดิมหารายชื่อ DB แต่สร้าง engine ราย DB ด้วย host / user / port **ใหม่** จากช่องกรอก → ผลลัพธ์ผสมสอง server และ label คอลัมน์ `Database` ผิด
+
+เป้าหมาย: ขณะ Connect อยู่ ทั้ง header และ `list_tables` ใช้ปลายทางจาก `ConnectionInfo` ของ connection จริง (snapshot ตอน Connect) และ header เตือนให้เห็นชัดเมื่อช่องกรอกไม่ตรงกับ connection; ไม่มีการเก็บ password ใน `ConnectionInfo` / `RunTarget` (คงหลักเดิม)
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่สลับ UAT / PROD โดยแก้ช่อง Details และผู้ใช้ปุ่ม Tables
+
+### R11-2. ขอบเขต
+
+#### In scope
+
+- **Header ขณะ Connect**: เมื่อ `_capture_run_target()` คืน `RunTarget` ที่มี `info` ให้ `target_main` / `target_sub` แสดงค่าจาก `info` (รูปแบบข้อความเดิมทุกประการ) แทนช่องกรอก
+- **Header ขณะไม่ได้ Connect** (ยังไม่ Connect, Connect ล้ม, หลัง `_reset_profile_connection_state`) หรือ `info is None`: แสดงจากช่องกรอกเหมือนเดิม
+- **คำเตือนเมื่อช่องกรอกไม่ตรง**: ขณะ Connect และช่องกรอกต่างจาก `info` (เกณฑ์ตาม R11-Q-4) header แสดงคำเตือนตาม R11-Q-2 และกลับเป็นปกติเมื่อแก้ช่องกลับให้ตรง หรือกด Connect ใหม่สำเร็จ
+- **แยก logic header ให้ทดสอบได้**: ส่วนที่อ่านค่า + `config` label ของ `_refresh_target_summary` ย้ายเป็น method ของ `DatabaseConnectorGUI` ที่รับ label ทั้งสองเป็น argument (ชื่อกำหนดใน design) closure เดิมเรียก method นี้แล้วตั้ง `after(500, ...)` เหมือนเดิม
+- **`list_tables` ใช้ snapshot**: เมื่อ `target.info` มีค่า — การเลือกทาง "ทุก database" / "database ปัจจุบัน", label คอลัมน์ `Database`, ค่า flag ที่ส่งให้ `on_list_tables_success` และ user / host / port / db_type ของ engine ราย DB มาจาก `target.info`; password มาจากค่าที่เก็บไว้ตอน Connect ตาม R11-Q-5 — ไม่อ่านช่องกรอกใด ๆ
+- **เก็บ password ของ connection ปัจจุบัน** (ตาม R11-Q-5) ใน memory แยกจาก `ConnectionInfo` / `RunTarget`, ผูกกับ engine ปัจจุบัน, ล้างเมื่อ engine ถูกแทน / ตัด; ไม่เขียนลง Execution Logs, run log, console หรือไฟล์ใด
+- กรณีไม่มี password ที่เก็บไว้ / `info is None` ตาม R11-Q-6 / R11-Q-7
+
+#### Out of scope
+
+- **B5** (Stop ไม่หยุด `list_tables`) และบัคอื่นทั้งหมดจากรายงาน bug-hunter; Round 8-10 ที่ยังไม่ commit
+- การ block / ยืนยัน / log เพิ่มตอน Run, Run Job, Run All, Export เมื่อช่องกรอกไม่ตรง — ค่าเริ่มต้นคือเตือนที่ header เท่านั้น (R11-Q-1); `_block_if_profile_mismatch` และ `_confirm_data_change` ไม่เปลี่ยน
+- การ reconnect อัตโนมัติเมื่อแก้ช่องกรอก, ปุ่ม Disconnect, การเปลี่ยนข้อความ badge `Connected · <db_type>` หรือ `status_label`
+- จุดอื่นที่อ่านช่องกรอกขณะ Connect: Save Job (`"database": self.db_name.get()` `:9726`), Save Profile (`:11252-11263`) — R11-Q-8
+- การเพิ่ม field ใน `ConnectionInfo` / `RunTarget` (ห้ามมี field password — `test_no_password_like_field`)
+- การเปลี่ยน logic ภายในทาง "ทุก database" นอกเหนือจากแหล่งค่า (query หารายชื่อ DB, skip schema, ทาง Oracle ใช้ engine เดิม), การเปลี่ยน `get_connection_string` / `connect_database` นอกจากการเก็บ password
+- refactor / rename / commit
+
+### R11-3. User stories
+
+- **R11-US-1**: ในฐานะผู้ใช้ที่ Connect ไป UAT แล้วเผลอแก้ช่อง Database เป็น PROD ฉันต้องการให้ header ยังบอกว่า connection จริงคือ UAT และเตือนว่าช่องกรอกไม่ตรง เพื่อไม่เข้าใจผิดว่าผล SELECT มาจาก PROD
+- **R11-US-2**: ในฐานะผู้ใช้คนเดียวกัน ฉันต้องการให้ header กลับเป็นปกติเมื่อกด Connect ใหม่ เพื่อรู้ว่าตอนนี้ใช้ค่าใหม่แล้ว
+- **R11-US-3**: ในฐานะผู้ใช้ปุ่ม Tables ฉันต้องการให้รายชื่อ table มาจาก server ที่ Connect อยู่จริงทั้งหมด ไม่ผสมกับ server ที่พิมพ์ค้างในช่องกรอก
+- **R11-US-4**: ในฐานะผู้ดูแลความปลอดภัย ฉันต้องการให้ password ไม่ปรากฏใน snapshot / log / console เพิ่มขึ้นจากเดิม
+
+### R11-4. Acceptance criteria
+
+วิธีทดสอบทุกข้อเป็น `unittest` ตามแนวทาง `tests/test_run_target.py` / `tests/test_bugfix_h1.py` / `tests/test_run_engine_batch.py` (stub จาก `DatabaseConnectorGUI.__new__`, `_FakeEntry` ที่ตั้งค่าได้และ `forbid_get` ได้, label ปลอมที่จำ `text` / `fg`, `threading.Thread` ที่จับ `target` / `args` แล้วรันเอง, patch `create_engine` / `inspect` / `messagebox` / `print`) ไม่ต่อฐานข้อมูลจริง ไม่เปิด Tk จริง ไฟล์ test ใหม่: `tests/test_r11_connection_target_snapshot.py`
+
+นิยาม:
+- "snapshot UAT" = `ConnectionInfo(profile="P1", db_type="PostgreSQL", user="app", host="uat-db", port="5432", database="UAT")` ใน `_run_target = RunTarget(engine_uat, info)` และ `self.engine is engine_uat`
+- "ช่องกรอก PROD" = ช่องกรอกเหมือน snapshot UAT ทุกช่อง ยกเว้น `db_host = "prod-db"` และ `db_name = "PROD"`
+- "method header" = method ที่แยกจาก `_refresh_target_summary` ตาม R11-2 เรียกด้วย label ปลอม `target_main`, `target_sub`
+- "รูปแบบเดิม" = `main = f"{db_type} · {user}@{host}" + (f":{port}" if port else "")`, `sub = f"Database / Service: {db}" if db else "Database: (default)"` (ตาม `:2701-2702`)
+- "คำเตือน" = ข้อความตาม R11-Q-2 (ค่าเริ่มต้น: มี `⚠` และคำว่า `Connect`)
+
+#### Header
+
+| AC | Given / When / Then |
+|---|---|
+| R11-AC-1 | **Given** ไม่ได้ Connect (`engine is None`, `_run_target is None`) และช่องกรอกค่าใดก็ได้ **When** เรียก method header **Then** `target_main` / `target_sub` เท่ากับรูปแบบเดิมจากช่องกรอก (strip) — พฤติกรรมเดิม ไม่มีคำเตือน และ `target_sub` ใช้สี `UI["muted"]` |
+| R11-AC-2 | **Given** snapshot UAT และช่องกรอกตรงกับ snapshot ทุกช่อง **When** เรียก method header **Then** `target_main == "PostgreSQL · app@uat-db:5432"`, `target_sub == "Database / Service: UAT"` (ตรงกับรูปแบบเดิมทุกตัวอักษร) ไม่มีคำเตือน สี `UI["muted"]` |
+| R11-AC-3 | **Given** snapshot UAT และช่องกรอก PROD **When** เรียก method header **Then** `target_main` / `target_sub` แสดงค่าจาก snapshot (`uat-db`, `UAT`) **ไม่มี** `prod-db` / `PROD` และ header มีคำเตือน (R11-Q-2) — สีของบรรทัดที่มีคำเตือนเปลี่ยนเป็นสีเตือนที่ design กำหนด (ไม่ใช่ `UI["muted"]`) |
+| R11-AC-4 | **Given** snapshot UAT **When** แก้ช่องกรอกทีละช่องให้ต่างจาก snapshot (`db_type`, `db_user`, `db_host`, `db_port`, `db_name` — แยก subTest) แล้วเรียก method header **Then** ทุกกรณีมีคำเตือน; เมื่อแก้แค่ `db_password` หรือเปลี่ยน `profile_combo` **ไม่** มีคำเตือน (R11-Q-3; Profile ต่างเป็นหน้าที่ของ `_block_if_profile_mismatch`) |
+| R11-AC-5 | **Given** snapshot UAT **When** ช่องกรอกต่างจาก snapshot เฉพาะช่องว่างหน้า/หลัง (`" uat-db "`) หรือ port แบบ `"5432:x"` (แบบที่ `connect_database` ตัดเป็น `5432`) **Then** ไม่มีคำเตือน (เกณฑ์ R11-Q-4) |
+| R11-AC-6 | **Given** snapshot UAT + ช่องกรอก PROD (มีคำเตือน) **When** (ก) แก้ช่องกลับเป็นค่า UAT แล้วเรียก method header, (ข) เรียก `connect_database` สำเร็จด้วยช่องกรอก PROD (patch `create_engine` / `messagebox`) แล้วเรียก method header **Then** (ก) คำเตือนหาย สีกลับ `UI["muted"]`; (ข) header แสดง `prod-db` / `PROD` ไม่มีคำเตือน |
+| R11-AC-7 | **Given** snapshot UAT + ช่องกรอก PROD **When** Connect ใหม่ล้ม (`create_engine` raise) หรือ `_reset_profile_connection_state` ตัด connection แล้วเรียก method header **Then** header แสดงจากช่องกรอก (`prod-db` / `PROD`) ไม่มีคำเตือน — ตาม R11-AC-1 เพราะไม่มี connection แล้ว |
+| R11-AC-8 | **Given** `self.engine` มีค่าแต่ `_run_target` เป็น `RunTarget(engine, None)` (engine ที่ไม่ได้มาจาก `connect_database`) **When** เรียก method header **Then** แสดงจากช่องกรอกแบบเดิม ไม่มีคำเตือน (R11-Q-7) |
+| R11-AC-9 | **Given** label ปลอมที่ `config` แล้ว raise `tk.TclError` (หน้าต่างถูกปิด) **When** เรียก closure / method header **Then** ไม่มี exception หลุด และไม่ตั้ง `after` รอบถัดไป — พฤติกรรมเดิม `:2707-2709`; และเมื่อข้อความ / สีไม่เปลี่ยน ไม่เรียก `config` ซ้ำ (คงการเช็ก `cget` เดิม) |
+
+#### Run (regression lock — ค่าเริ่มต้น R11-Q-1 = เตือนที่ header เท่านั้น)
+
+| AC | Given / When / Then |
+|---|---|
+| R11-AC-10 | **Given** snapshot UAT + ช่องกรอก PROD และ SQL `SELECT 1` **When** `execute_query` **Then** `_execute_query_background` ได้ `engine is engine_uat`, ไม่มี dialog ยืนยัน, ไม่มีบรรทัด `⛔` ใน Execution Logs (ไม่ block) — พฤติกรรมเดิม; และ SQL `DELETE FROM t` ยังแสดงปลายทาง `PostgreSQL · uat-db / UAT` ใน dialog ยืนยันเหมือนเดิม |
+
+#### `list_tables` ใช้ snapshot
+
+| AC | Given / When / Then |
+|---|---|
+| R11-AC-11 | **Given** snapshot แบบ "ทุก database" (`info.database == ""`, `db_type="MySQL"`, `host="uat-db"`, `user="app"`, `port="3306"`), engine เดิมคืนรายชื่อ DB `["d1", "d2"]`, password ที่เก็บตอน Connect = `"pw-uat"` และช่องกรอก `db_host="prod-db"`, `db_user="other"`, `db_port="9999"`, `db_password="pw-prod"`, `db_name=""` **When** `list_tables` แล้วรัน worker **Then** `get_connection_string` ถูกเรียก 2 ครั้งด้วย `("MySQL", "app", "pw-uat", "uat-db", "3306", "d1")` และ `(... "d2")` — ไม่มีค่าใดจากช่องกรอก |
+| R11-AC-12 | **Given** snapshot "ทุก database" เหมือน R11-AC-11 แต่ช่องกรอก `db_name="PROD"` **When** `list_tables` **Then** ใช้ทาง "ทุก database" (engine เดิมถูก query หารายชื่อ DB, `create_engine` ราย DB ถูกเรียก) และ `on_list_tables_success` ได้ flag `False`; กลับกัน snapshot `info.database="UAT"` + ช่องกรอก `db_name=""` → ใช้ทาง "database ปัจจุบัน" (`inspect(engine_uat)`, `create_engine` ไม่ถูกเรียก), ทุกแถวมี `"Database": "UAT"` และ flag `True` |
+| R11-AC-13 | **Given** snapshot (มี `info`) **When** `list_tables` และ worker ทำงาน **Then** `get()` ของ `db_name`, `db_user`, `db_password`, `db_host`, `db_port`, `db_type` **ไม่ถูกเรียกเลย** (ใช้ `forbid_get` ตั้งแต่ก่อนเรียก) |
+| R11-AC-14 | **Given** snapshot ตาม R11-AC-11 **When** `list_tables` **Then** ค่าที่ worker ใช้ถูกจับบน main thread ก่อน `Thread.start()` (คงหลัก R5 / `test_bugfix_h1`): หลัง start แล้ว `connect_database` ไป server อื่น (snapshot + password ใหม่) worker ยังใช้ `app` / `pw-uat` / `uat-db` / `3306` ของตอนกด Tables |
+| R11-AC-15 | **Given** snapshot ทาง Oracle (`db_type="Oracle"`, `info.database==""`) และช่องกรอกต่างจาก snapshot **When** `list_tables` **Then** ใช้ `inspect(engine_uat)` เท่านั้น `create_engine` ไม่ถูกเรียก (พฤติกรรมเดิม) และไม่ต้องใช้ password ที่เก็บไว้ (ทำงานได้แม้ไม่มี password เก็บไว้) |
+| R11-AC-16 | **Given** snapshot "ทุก database" ที่ไม่ใช่ Oracle แต่ไม่มี password เก็บไว้สำหรับ engine ปัจจุบัน (เช่น stub ตั้ง `_run_target` โดยไม่ผ่าน `connect_database`) **When** `list_tables` **Then** ตามค่าเริ่มต้น R11-Q-6: Execution Logs มี 1 บรรทัดขึ้นต้น `⛔ Tables ไม่ได้เริ่มงาน` ที่บอกให้กด Connect ใหม่, thread ไม่ถูกเริ่ม, `create_engine` / `get_connection_string` ไม่ถูกเรียก, ช่องกรอกไม่ถูกอ่าน, ปุ่ม `inspect_btn` ไม่ถูกเปลี่ยนเป็น `⏳ Loading...` |
+| R11-AC-17 | **Given** `_run_target = RunTarget(engine, None)` (ไม่มี `info`) **When** `list_tables` **Then** อ่านช่องกรอกแบบเดิมทุกประการ (R11-Q-7) — `tests/test_bugfix_h1.py` และ `tests/test_run_engine_batch.py` (`test_current_db_inspects_start_engine`, `test_no_info_reads_db_type_before_thread_starts`) ผ่านโดยไม่แก้ |
+
+#### Password ของ connection ปัจจุบัน
+
+| AC | Given / When / Then |
+|---|---|
+| R11-AC-18 | **Given** `connect_database` สำเร็จด้วย password `"S3cr3t-UAT"` (patch `create_engine` ด้วย sqlite จริงแบบ `test_password_never_stored`) **When** ตรวจ **Then** `list_tables` ทาง "ทุก database" ได้ password นั้น (R11-AC-11), password **ไม่** อยู่ใน `repr` / `str` / `dataclasses.asdict` ของ `ConnectionInfo` / `RunTarget`, `target_label()`, `log_target()`, `run_log_header()`, Execution Logs, ข้อความที่ส่งเข้า `_write_run_log` และ stdout ที่ patch `print` จับได้ระหว่าง `list_tables`; `tests/test_run_target.py` (`test_no_password_like_field`, `test_password_never_stored`) ผ่านโดยไม่แก้ |
+| R11-AC-19 | **Given** Connect UAT สำเร็จ (password A) **When** (ก) Connect ไป PROD สำเร็จ (password B), (ข) Connect ใหม่ล้ม, (ค) `_reset_profile_connection_state` ตัด connection **Then** (ก) password ที่ใช้ได้คือ B เท่านั้น; (ข) และ (ค) ไม่มี password เก็บไว้ (ค่าเดิมถูกล้าง ไม่ใช่แค่ถูกบัง) — ตรวจผ่าน accessor ที่ design กำหนด |
+| R11-AC-20 | **Given** Connect UAT สำเร็จด้วย password A แล้วผู้ใช้แก้ช่อง `db_password` เป็น B โดยไม่ Connect **When** `list_tables` ทาง "ทุก database" **Then** `get_connection_string` ได้ A (password ของ connection จริง) |
+
+#### Regression
+
+| AC | Given / When / Then |
+|---|---|
+| R11-AC-21 | **Given** test เดิม `tests/test_run_target.py`, `tests/test_bugfix_h1.py`, `tests/test_run_engine_batch.py`, `tests/test_list_tables_stop.py`, `tests/test_bugfix_c1.py`, `tests/test_r4_profile_mismatch.py`, `tests/test_run_entry_block.py`, `tests/test_confirm_destination.py`, `tests/test_profile_connect_block.py`, `tests/test_profile_password.py`, `tests/test_r8_load_jobs_writeback.py`, `tests/test_r9_load_preset_validation.py`, `tests/test_r10_export_atomic_write.py` **When** รันหลังแก้ **Then** ผ่านโดยไม่แก้ test ใด (ถ้า stub เดิมขาด attribute ใหม่ ต้องแก้ที่โค้ดด้วย `getattr(..., default)` ไม่ใช่แก้ test) — **ข้อยกเว้นเดียว (R11-Q-10)**: ใน `tests/test_run_engine_batch.py` test `ListTablesEngineTests::test_info_db_type_wins_over_screen_at_start` อนุญาตให้เพิ่ม setup 1 บรรทัด `stub._connected_password = (engine_a, "pw")` ก่อน `self._start(stub)` เท่านั้น ห้ามแก้ assertion ใด และห้ามแก้ test อื่น |
+| R11-AC-22 | **Given** แก้ B4 ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบตาม R7-AC-28 ((ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง บน `cp874` + redirect) **Then** ทั้งสองแบบ `OK` จำนวน test เท่ากัน — **AC นี้แยกไว้ให้ผู้ใช้เลื่อนได้** (R11-Q-9): ถ้าเลื่อน ให้รัน focused `tests.test_r11_connection_target_snapshot` + ทุกไฟล์ใน R11-AC-21 แทน และบันทึกว่า R11-AC-22 รอ |
+
+**สรุปจำนวน AC Round 11**: 22 ข้อ — unittest ทั้งหมด (header: 9, Run regression: 1, `list_tables`: 7, password: 3, regression test เดิม: 1, full suite (เลื่อนได้): 1)
+
+### R11-5. ข้อจำกัด / สมมติฐาน
+
+- บัคยืนยันด้วยการอ่านโค้ดเท่านั้น; การทดสอบทั้งหมดใช้ stub / mock ไม่ต่อ DB จริง — ผล "ไม่ผสมสอง server" ยืนยันระดับ argument ที่ส่งให้ `get_connection_string` / `create_engine` เท่านั้น
+- Minimal diff: แก้ `_refresh_target_summary` (แยก method), `list_tables` (เฉพาะแหล่งค่า + ทาง R11-Q-6), `connect_database` / `_replace_engine` / `_reset_profile_connection_state` (เฉพาะเก็บ / ล้าง password); ไม่แตะ `ConnectionInfo` / `RunTarget` / `_block_if_profile_mismatch` / `_confirm_data_change`; PEP 8 + type hints สำหรับ method ใหม่
+- `ConnectionInfo` เก็บ `user` / `host` / `database` แบบ strip แล้ว ขณะที่ engine เดิมสร้างจากค่าไม่ strip (`:7673-7675`) — `list_tables` ใช้ค่าจาก `info` (strip) ซึ่งถือว่าถูกต้องกว่า; password ใช้ค่าตามที่ใช้สร้าง engine (ไม่ strip)
+- ใน flow จริงของแอป engine ถูกตั้งผ่าน `connect_database` → `_replace_engine(engine, info)` เท่านั้น จึงมี `info` และ password (ไม่ว่าง ตาม `:7663`) เสมอขณะ Connect; กรณี `info is None` / ไม่มี password เกิดใน stub / test เท่านั้น
+- password ที่เก็บไว้อยู่ใน memory เท่านั้น (เทียบเท่าที่ engine URL ถืออยู่แล้ว) ไม่เพิ่มการเปิดเผยใหม่
+- Header ยัง poll ทุก 500 ms; ไม่เพิ่ม event binding ใหม่
+- ห้าม commit
+
+### R11-6. คำถามที่ยังไม่มีคำตอบ
+
+ทุกข้อมีคำตอบที่แนะนำซึ่ง AC ข้างต้นใช้เป็นค่าเริ่มต้นแล้ว ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R11-Q-1 | เมื่อช่องกรอกไม่ตรงกับ connection จะ (ก) เตือนที่ header เท่านั้น, (ข) (ก) + เขียน 1 บรรทัดเตือนใน Execution Logs ตอนเริ่ม Run / Tables / Run Job / Export แล้วรันต่อ, (ค) block ทุกทางเข้าแบบ `_block_if_profile_mismatch` จนกว่าจะ Connect ใหม่หรือแก้ช่องกลับ, (ง) dialog ยืนยันแม้เป็น SELECT | (ก) — header แสดงปลายทางจริงแล้ว ผู้ใช้เห็นความจริงก่อนกด Run; minimal diff ไม่กระทบทางเข้า / test เดิม (R11-AC-10). (ค) ปลอดภัยสุดแต่เพิ่ม scope ทุกทางเข้า + ต้องแก้ test entry-block; ถ้าผู้ใช้เลือก (ข)/(ค)/(ง) ต้องเพิ่ม AC ใหม่และแก้ R11-AC-10 |
+| R11-Q-2 | ข้อความ / ตำแหน่งคำเตือนบน header | ต่อท้าย `target_sub` เป็น `"<sub เดิม>  ·  ⚠ ช่อง Details ไม่ตรงกับ connection — กด Connect เพื่อใช้ค่าใหม่"` และเปลี่ยนสี `target_sub` เป็นสีเตือน (เช่น `#D97706` แบบ pill `warn`); ไม่ระบุว่าช่องไหนต่าง ไม่เพิ่ม widget ใหม่ — AC assert เฉพาะ `⚠`, `Connect` และสีไม่ใช่ `UI["muted"]` |
+| R11-Q-3 | การแก้ช่อง Password อย่างเดียว (โดยไม่ Connect) ควรนับว่า "ไม่ตรง" หรือไม่ | ไม่นับ — password ไม่เปลี่ยนปลายทาง และการเทียบต้องอ่าน password ที่เก็บไว้ในทุก poll 500 ms โดยไม่จำเป็น (R11-AC-4) |
+| R11-Q-4 | เกณฑ์ "ตรงกัน" | เทียบ 5 ช่อง `db_type`, `user`, `host`, `port`, `database` หลัง `strip()`; port ตัดด้วย `split(":")[0]` แบบเดียวกับ `connect_database`; เทียบแบบ case-sensitive (ตามที่ `ConnectionInfo` เก็บ) — host `UAT-DB` กับ `uat-db` จึงนับว่าต่าง (เตือนเกินดีกว่าเตือนขาด) |
+| R11-Q-5 | `list_tables` ทาง "ทุก database" ต้องใช้ password — เอามาจากไหน: (ก) เก็บใน attribute ส่วนตัวของ GUI ตอน Connect สำเร็จ ผูกกับ engine (แยกจาก `ConnectionInfo` / `RunTarget`), (ข) ดึงจาก `engine.url` ของ SQLAlchemy (`url.set(database=...)`) ไม่ต้องเก็บเพิ่ม, (ค) ใช้ช่อง Password เฉพาะเมื่อช่องอื่นตรงกับ snapshot ไม่งั้น block | (ก) — ตรงกับที่ bug-hunter เสนอ ทำงานเหมือนกันทุก db_type; (ข) ใช้ไม่ได้ตรง ๆ กับ SQL Server ที่ใช้ `odbc_connect` (ต้อง parse / สร้าง connection string ใหม่) และผูกกับ SQLAlchemy internals; (ค) ยังพังเมื่อผู้ใช้แก้ password อย่างเดียว (R11-AC-20) |
+| R11-Q-6 | มี `info` แต่ไม่มี password เก็บไว้ (เกิดได้เฉพาะ stub / อนาคต) ในทาง "ทุก database" ที่ไม่ใช่ Oracle จะ (ก) block พร้อม log ให้กด Connect ใหม่, (ข) fallback ไปอ่านช่อง Password, (ค) list เฉพาะรายชื่อ DB โดยไม่เข้าแต่ละ DB | (ก) — ไม่ผสมแหล่งค่า (หัวใจของ B4) และไม่เดา; ทาง "database ปัจจุบัน" และ Oracle ไม่ต้องใช้ password จึงทำงานต่อได้ (R11-AC-15, R11-AC-16) |
+| R11-Q-7 | `RunTarget(engine, None)` (ไม่มี `info`) — header / `list_tables` ทำอย่างไร | คงพฤติกรรมเดิม (อ่านช่องกรอก) เพราะไม่มี snapshot ให้เทียบ และกรณีนี้ไม่เกิดใน flow จริง; รักษา test เดิม `test_bugfix_h1` / `test_run_engine_batch` (R11-AC-8, R11-AC-17) |
+| R11-Q-8 | จุดอื่นที่อ่านช่องกรอกขณะ Connect — Save Job บันทึก `"database": self.db_name.get()` (`:9726`) และ `"db_type": self.db_type.get()` ซึ่งอาจไม่ตรงกับ connection ที่ใช้รัน — รวมใน Round นี้หรือไม่ | ไม่รวม — เป็น metadata ของ Job ไม่ได้เปลี่ยนปลายทางที่รัน และไม่อยู่ในรายงาน B4; ถ้าผู้ใช้ต้องการให้เปิด Round แยก |
+| R11-Q-9 | R11-AC-22 (full suite สองแบบ encoding) จะรันใน Round นี้หรือเลื่อนแบบ Round 8-10 | ให้ผู้ใช้ตัดสิน — ถ้าเลื่อน ให้รัน focused ตามที่ระบุใน R11-AC-22 แทน |
+| R11-Q-10 | Blocker R11-R1 (ดู Round 11 ใน `docs/design.md` / `docs/tasks.md`): `test_info_db_type_wins_over_screen_at_start` ใน `tests/test_run_engine_batch.py` ตั้ง `info` แต่ไม่มี password ที่เก็บไว้ จึงชนกับ R11-Q-6 (block) และขัดกับ R11-AC-21 (ห้ามแก้ test) | **ผู้ใช้ตัดสินแล้ว: ตัวเลือก (a)** — อนุญาตให้ปรับ harness เฉพาะ test นี้ โดยเพิ่ม setup 1 บรรทัด `stub._connected_password = (engine_a, "pw")` ก่อน `self._start(stub)`; ห้ามแก้ assertion ใด ตามแนวทางเดียวกับ R10-Q-5; R11-AC-21 ปรับให้ระบุข้อยกเว้นนี้แล้ว |
