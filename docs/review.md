@@ -665,3 +665,86 @@ Test ไม่ได้ผ่านแบบไม่ได้ตรวจอะ
 3. [database_connect_gui.py:7660, :7786-7794] กรณีขอบ: ถ้าช่อง Port เป็น `"5432 :x"` ตอน Connect, `info.port` จะเป็น `"5432 "` (strip ก่อน split จึงเหลือช่องว่างท้าย) ขณะที่ `_details_differ_from` ได้ `"5432"` จากช่อง → header เตือนค้างทั้งที่ไม่ได้แก้อะไร; ไม่กระทบปลายทางที่รัน (เตือนเกิน ตามแนว Q-4) — ถ้าจะแก้ให้ `.strip()` ฝั่ง `info.port` ใน `_details_differ_from` (ไม่ต้องแตะ `connect_database`)
 4. [database_connect_gui.py:7737-7742, :2708] type hint ยังไม่ครบ: parameter `engine` ของ `_replace_engine` ไม่มี annotation (ควรเป็น `engine: Any` ให้สอดคล้องกับ `_connected_password_for(self, engine: Any)`) และ closure `_refresh_target_summary()` ไม่มี `-> None` — ทั้งสองเป็นของเดิม แก้ได้ในบรรทัดที่ Round นี้แตะอยู่แล้ว
 5. [tests/test_r11_connection_target_snapshot.py:194-202, tests/test_run_engine_batch.py:424] test ตั้ง `stub._connected_password = (engine, password)` ตรง ๆ จึงผูกกับรูปแบบภายใน (tuple) — ถ้าอนาคตเปลี่ยนวิธีเก็บ test ต้องแก้หลายจุด; ทางเลือกคือตั้งผ่าน `stub._replace_engine(engine, info, password=...)` ใน helper `set_snapshot` — ไม่กระทบความถูกต้องของผลปัจจุบัน
+
+---
+
+# Code Review — Round 12 (Follow-up: ข้อเสนอแนะ 🟢 จาก review Round 8–11) — 2026-11-23
+
+ขอบเขต: R12-1 ถึง R12-8 และ R12-T เท่านั้น ไม่ตรวจซ้ำส่วนที่เป็น Round 8–11 ใน commit `1a573b2`
+ไฟล์ที่ตรวจ: `database_connect_gui.py` — `write_json_atomic` (`:73-91`), `_SECRET_PATTERNS` / `redact_secrets` (`:94-119`), `_create_export_temp_file` (`:194-215`), `EXPORT_REPLACE_RETRY_DELAYS` / `_replace_export_with_retry` (`:228-244`) และจุดที่ worker ของ Export เรียกใช้ (`:11028-11041`), `load_selected` (`:5668-5672`), `_details_differ_from` (`:7856-7872`), `_replace_engine` (`:7809-7830`), closure `_refresh_target_summary` (`:2778`), `list_tables` (`:9336-9358`, print / traceback ใน worker `:9438-9441`, `:9546-9551`, `:9564-9567`), `on_list_tables_error` (`:9724-9740`), `load_jobs` (`:9776-9787`); tests: `tests/test_r8_load_jobs_writeback.py` (AC-6 / AC-7), `tests/test_r9_load_preset_validation.py:411-466`, `tests/test_r10_export_atomic_write.py` (harness `:175-178`, `assert_kept_temp` `:815-830`, retry `:859-906`, `TempHandleAndCreationTests` `:1045-1124`), `tests/test_r11_connection_target_snapshot.py:194-202`, `:364-372`, `:923-1006`, `tests/test_run_engine_batch.py:424`
+
+สิ่งที่ reviewer รันจริง:
+- `python -X utf8 -m unittest tests.test_r8_load_jobs_writeback tests.test_r9_load_preset_validation tests.test_r10_export_atomic_write tests.test_r11_connection_target_snapshot tests.test_run_engine_batch tests.test_bugfix_h3 tests.test_r6_import_save_failure tests.test_database_connect_gui_core` → **Ran 282, OK**
+- probe ใน scratchpad (ไม่อยู่ใน repo): `write_json_atomic` ทุกทางออก และ `redact_secrets` กับ password 10 แบบ × 6 รูปแบบข้อความ (ODBC ดิบ, `odbc_connect=` encoded, `str(URL)` / `render_as_string` ของ SQLAlchemy 2.1.4, URL pg แบบ encoded / ไม่ encoded) + ข้อความ error ปกติ 7 แบบ
+- `git status` หลังรัน: สะอาด
+- ไม่รันทั้งชุดซ้ำ — ใช้ผลของหัวหน้า (`Ran 1147 ... OK` ทั้ง utf-8 และ cp874)
+
+## สรุป
+**ผ่าน** — 🔴 0, 🟡 1, 🟢 9
+
+ประเด็นที่หัวหน้าขอให้ตรวจเป็นพิเศษ:
+
+**1. `redact_secrets`**
+- ผล probe: ข้อความที่แอปสร้างได้จริงทุกแบบ **ไม่มีรั่ว** — ODBC ดิบ `PWD={...}` (รวม `}`→`}}`, `;`, `=`, `{`, `PWD=` ซ้อนในรหัส), `odbc_connect=` แบบ `quote_plus` (pattern 2 ข้าม `%7D%7D` ได้ถูก และ `%` ในรหัสถูก encode เป็น `%25` จึงไม่ชน `%7D`), `str(URL)` / `render_as_string(hide_password=False)` ของ SQLAlchemy, URL pg/MySQL/Oracle ที่แอป `quote_plus` รหัสไว้ (`@`→`%40`, `:`→`%3A`) — แม้ไม่ส่ง known secret
+- รั่วได้เฉพาะ URL ที่ใส่รหัส **ไม่ encode** และรหัสมีช่องว่าง / `'` / `"` / `@` (pattern 3 หยุดที่ตัวนั้น) — แอปไม่สร้าง URL แบบนี้ และถ้ารหัสยาว ≥ 4 ตัว known secret ปิดให้อยู่แล้ว (ดู 🟢 ข้อ 2)
+- mask เกิน: ข้อความ error ทั่วไปของ PostgreSQL / MySQL / SQL Server / ลิงก์ `sqlalche.me` ไม่ถูกแตะ; กรณีขอบที่ mask แปลก ๆ บันทึกใน 🟢 ข้อ 2 — ไม่มีกรณีที่ทำให้ข้อความอ่านไม่รู้เรื่อง
+- เส้นทางใน Tables: print / traceback ทั้ง 3 จุดใน worker และ `results_text` + `showerror` ใน `on_list_tables_error` ผ่าน `redact_secrets` แล้ว; ที่เหลือเป็น print ข้อความคงที่ / ชื่อ database / schema, `except: pass` (กลืน) และ `on_list_tables_success` (`str(e)` ของการแสดงผล ไม่เกี่ยว connection) — **ไม่พบเส้นทางดิบเหลือใน Tables**; นอก Tables ยังมี `connect_database` (🟢 ข้อ 3)
+
+**2. `write_json_atomic`** (probe ยืนยันทุกแถว)
+
+| ทางออก | `.tmp` | exception | ไฟล์เดิม |
+|---|---|---|---|
+| `open` ล้ม | ไม่แตะ (ไม่เข้า `try`) | เดิม | ไม่เปลี่ยน |
+| `json.dump` ล้ม (`TypeError`) | ลบ (`with` ปิดก่อน) | เดิม | ไม่เปลี่ยน |
+| `fsync` ล้ม | ลบ | เดิม | ไม่เปลี่ยน |
+| `os.replace` ล้ม | ลบ | เดิม | ไม่เปลี่ยน |
+| `KeyboardInterrupt` | ลบ | เดิม (bare `raise`) | ไม่เปลี่ยน |
+| replace ล้ม + `os.remove` ล้ม | ค้าง | `PermissionError` เดิม ไม่ถูกบังด้วย error ของ remove | ไม่เปลี่ยน |
+
+- ผู้เรียกอื่น (`save_jobs` `:9826`, script groups `:4560`, `:5529`, config `:11207`, `:11225`) ได้ exception เดิมทุกกรณี — ต่างจากเดิมเพียง `.tmp` ไม่ค้างหลังล้ม; ค้นทั้งไฟล์ไม่มีโค้ดที่อ่านหรืออาศัย `.tmp` ที่ค้าง จึงไม่กระทบ
+- `load_jobs` (`:9776-9787`) ไม่เรียก `os.remove` แล้ว; comment เป็นภาษาไทย
+
+**3. `_replace_export_with_retry`**
+- retry เฉพาะ `PermissionError` (`except PermissionError`); `OSError` อื่นหลุดทันทีจาก attempt แรก → worker `except OSError` เก็บ temp + แจ้ง path (test `test_errors_other_than_permission_are_not_retried`: replace 1 ครั้ง, temp เก็บไว้)
+- จำนวนครั้ง: 3 รอบใน loop + 1 ครั้งท้าย = 4 ครั้ง, รอรวม 0.2 + 0.5 + 1.0 = 1.7 วินาที (รอก่อนครั้งสุดท้ายด้วย ถูกต้อง); ครั้งสุดท้ายล้ม → exception จริงหลุดไป `except OSError` เดิม → `keep_temp = True`, ไฟล์เดิมไม่ถูกแตะ (replace ที่ล้มไม่แก้ปลายทาง), ข้อความมี `file_path` + temp path + `strerror` — R10-AC-15 ยังรักษาข้อมูลได้ครบ (`assert_kept_temp` ตรวจไฟล์เดิม, temp 1 ไฟล์ครบ 2 sheet, ทุก attempt ใช้ temp เดียวกัน, ข้อความ)
+- `time.sleep` อยู่ใน worker thread (`threading.Thread(target=worker)` `:11048`) → UI ไม่ค้าง; `temp_handle.close()` เกิดก่อน retry ทั้งหมด
+- Stop ระหว่าง retry: ไม่มีการเช็ก stop event ใน retry — รอสูงสุด 1.7 วินาทีแล้วจบตามปกติ (Stop เกิดหลัง body จบแล้ว งานที่เหลือมีแค่ rename ผลที่ได้ จึงไม่ควรยกเลิกอยู่แล้ว) ยอมรับได้
+
+**4. Test**
+- test ใหม่ส่วนใหญ่ assert ผลจริง (bytes ไฟล์, listing, call count, ค่า sleep, `handle.closed` ณ ตอน replace / remove, ข้อความ dialog ไม่มี `.tmp.xlsx`, `threads[0].args`, print ที่จับจริง) — ยกเว้น `RedactSecretsTests.test_patterns_and_known_secret` (🟡 ข้อ 1)
+- test เดิมที่ถูกแก้ไม่ทำให้ความคุ้มครองหาย:
+  - R8-AC-6: `test_ac6_remove_tmp_uses_jobs_file_tmp_path` ยังยืนยันว่าลบ `<jobs_file>.tmp` (ตอนนี้ผ่าน `write_json_atomic`); `test_ac6_remove_raises_...` แยก mode ถูก (replace → ลบ 1 ครั้ง + `.tmp` ค้าง; atomic → ไม่ลบ); `test_ac6_tmp_not_created_by_this_call_is_left_alone` ตรวจทั้ง `write_json_atomic` raise และ `open` ล้มจริง โดย bytes ของ `.tmp` คนอื่นคงเดิม
+  - R10 `assert_kept_temp`: เพิ่ม check (ทุก attempt ใช้ temp เดียวกัน, จำนวน = 1 + retry) ไม่ได้ลด check เดิม
+  - harness patch `EXPORT_REPLACE_RETRY_DELAYS` เป็น `0.0` × จำนวนเดิม — จำนวน retry เท่าของจริง ตัดแค่เวลารอ; ค่า sleep จริงตรวจแยกใน `test_retry_waits_the_configured_delays`
+  - `tests/test_run_engine_batch.py:424` เปลี่ยนจากตั้ง tuple ตรงเป็น `_replace_engine(engine_a, ci, password="pw")` — engine เดียวกันจึงไม่ `dispose`, assertion ไม่เปลี่ยน
+
+## Verdict ราย R12 item
+
+| Item | ผล | หลักฐาน |
+|---|---|---|
+| R12-1 | ✅ ผ่าน | `:76-91` `open` อยู่นอก `try`; `load_jobs` `:9779-9787` ไม่มี `os.remove`; probe 6 ทางออกข้างบน; `test_ac6_*` 5 test |
+| R12-2 | ✅ ผ่าน | `test_ac7_stdout_none` ใช้ `mock.patch("sys.stdout", None)` จริงทั้งสอง mode; type hints ครบใน helper (`_ClosedPipe`, `failure_patch`, `_run_failing_load`, `_assert_ac1_to_5`); comment `load_jobs` เป็นไทย (comment ใน test ไม่ตรง — 🟢 ข้อ 8) |
+| R12-3 | ✅ ผ่าน | `:5668-5672` `isinstance(job, dict)`; `test_exception_while_filtering_jobs_is_rolled_back` (ยืนยันว่าถึงขั้น filter จริงด้วย counter, identity + ค่า rollback, `showerror` มี `filter broke`), `test_non_dict_in_current_jobs_does_not_escape_before_confirm` (นับ 3 ไม่นับ `None`) |
+| R12-4 | ✅ ผ่าน | `:199-209`; `test_mkstemp_failure_names_the_chosen_file_not_a_temp_path` (ข้อความมี `file_path` + `strerror`, ไม่มี `.tmp.xlsx`, query ไม่รัน), `test_temp_path_uses_the_separators_of_the_chosen_path` (ทั้ง `/` และ `\`), `test_handle_is_closed_before_os_replace` / `..._temp_is_removed` ใช้ spy `handle.closed` ไม่ขึ้นกับ OS |
+| R12-5 | ✅ ผ่าน | `:228-244`, `:11029-11041`; ดูข้อ 3 ข้างบน; test lock สั้น 2 ครั้งแล้วสำเร็จ (3 attempt, temp เดียวกัน, ไม่มี temp ค้าง), ค่า delay, `OSError` อื่นไม่ retry; spec ยังไม่อัปเดต (🟢 ข้อ 5) |
+| R12-6 | ✅ ผ่าน | `:9350-9358` `needs_password`; `test_password_not_passed_to_thread_when_worker_does_not_use_it` 3 กรณี (database ปัจจุบัน / Oracle → `""`, MySQL list-all → รหัสจริง); ทาง R11-AC-16 block ยังใช้เงื่อนไขเดียวกัน |
+| R12-7 | ✅ ผ่าน (test อ่อน — 🟡 ข้อ 1) | `:94-119`, `:9438-9441`, `:9546-9551`, `:9564-9567`, `:9736-9737`; probe ข้อ 1; `test_worker_error_output_is_redacted` (ยัง assert ว่า `login failed` / `RuntimeError` อยู่ จึงไม่ mask เกิน), `test_on_list_tables_error_is_redacted` (มี / ไม่มี password เก็บไว้ — กรณีหลังพึ่ง pattern ล้วน) |
+| R12-8 | ✅ ผ่าน | `:7867` `info.port.strip()`; subTest `"5432 :x"` / `"5432"` / `" 5432 "` กับ `info.port = "5432 "` ไม่เตือน (`:364-372`); type hints `:7811`, `:2778`; `set_snapshot` (`:194-202`) ตั้งผ่าน `_replace_engine` |
+| R12-T | ✅ ผ่าน (ผลหัวหน้า) | `Ran 1147 ... OK` สอง mode; reviewer รัน focused 282 OK |
+
+## 🔴 Critical (ต้องแก้ก่อน merge)
+- ไม่มี
+
+## 🟡 Warning (ควรแก้)
+1. [tests/test_r11_connection_target_snapshot.py:983-1000] `test_patterns_and_known_secret` ตรวจ "ไม่รั่ว" ด้วย `assertNotIn(pw)` / `assertNotIn(quote_plus(pw))` โดย `pw = "p@ss;w}rd"` — แต่ใน ODBC string รหัสถูกเขียนเป็น `{p@ss;w}}rd}` (`}` ถูกเบิ้ล) และในรูป encoded เป็น `p%40ss%3Bw%7D%7Drd` จึง**ไม่มี `pw` หรือ `quote_plus(pw)` อยู่ในข้อความตั้งแต่แรก** (reviewer ยืนยันด้วย probe: `pw in odbc` = `False`, `quote_plus(pw) in encoded` = `False`) — สองตัวอย่างแรกซึ่งเป็นกรณีหลักของ R12-7 (SQL Server) จึงผ่านแม้ pattern 1 / 2 จะ mask ได้แค่ครึ่งเดียว (เช่น regex จบที่ `}` ตัวแรกแล้วปล่อย `}rd}` / `%7Drd%7D` หลุด) — assert ที่เหลือคือ `"***" in plain` ซึ่งผ่านได้จากการ mask ส่วนใดส่วนหนึ่ง — ผลกระทบ: regression ของการจัดการ `}}` / `%7D%7D` ไม่ถูกจับ (โค้ดปัจจุบันถูกต้องตาม probe) — แนวทางแก้: assert ส่วนท้ายของรหัส เช่น `assertNotIn("rd", plain)` และ `assertNotIn("w}}rd", plain)` / `assertNotIn("%7D%7Drd", plain)` หรือ assert ข้อความผลลัพธ์ทั้งบรรทัด (`PWD=***` ตามด้วย `;Encrypt=...` / `%3BEncrypt...` หรือจบสตริง)
+
+## 🟢 Suggestion (ทางเลือก)
+1. [database_connect_gui.py:9736-9737] `on_list_tables_error` ใช้ password จาก `self._connected_password` ณ เวลาที่ error ถูกแสดง ไม่ใช่ `credentials[1]` ที่ worker ใช้ — ทาง "engine ไม่มี info" (R11-AC-17) ที่ worker ใช้รหัสจากช่องกรอก จะไม่มี known-secret masking (เหลือ pattern อย่างเดียว); ทางที่มี info ใช้ได้ถูกเพราะ dialog ของ Tables grab input จน Connect ใหม่ไม่ได้ — ถ้าจะให้ตรงที่สุด ส่ง `credentials[1]` ไปกับ `on_list_tables_error` (ผ่าน lambda ท้าย worker)
+2. [database_connect_gui.py:94-101, :112-114] กรณีขอบของ pattern (ไม่เกิดกับข้อความที่แอปสร้าง): (ก) URL ที่รหัส**ไม่ถูก encode** และมีช่องว่าง / `'` / `"` / `@` → pattern 3 mask แค่ส่วนแรก เช่น `://u:p@ss@h` เหลือ `ss@h` (known secret ≥ 4 ตัวปิดให้); (ข) `password = 'x'` → `password = ***'x'` (แทรก `***` แต่ไม่ปิดค่าในเครื่องหมายคำพูด); (ค) `DB_PASSWORD=abc` ไม่ถูก mask เพราะไม่มี `\b` ระหว่าง `_` กับ `P`; (ง) `http://host:8080/a@b` → `http://host:***@b` (mask เกิน); (จ) known secret ที่เป็นคำทั่วไป เช่น `test` ทำให้ `testing table test_x` เป็น `***ing table ***_x` — ทั้งหมดเป็นทางที่ปลอดภัยกว่า หรือไม่เกิดในเส้นทาง Tables ปัจจุบัน บันทึกไว้ถ้าจะนำ `redact_secrets` ไปใช้ที่อื่น
+3. [database_connect_gui.py:7776] (นอก scope R12) `connect_database` ยังแสดง `❌ Connection Error: {error}` ดิบใน Execution Logs — ความเสี่ยงชนิดเดียวกับที่ R12-7 ปิดใน Tables (SQL Server `odbc_connect=...PWD=...` ถ้า driver / SQLAlchemy ใส่ URL ไว้ใน error); ถ้าต้องการปิดให้ครบ ควรเปิด Round แยกเพื่อใช้ `redact_secrets(str(error), password)` ที่นี่ (และจุดแสดง error อื่นที่ผูกกับ connection)
+4. [database_connect_gui.py:9438, :9441, :9547, :9551, :9564, :9567] บรรทัดที่ห่อ `redact_secrets` ยาว 113-138 ตัวอักษร (เกินแนว ≤ 95 ที่ใช้ทั้งไฟล์ / PEP 8) — แยก `message = redact_secrets(...)` ก่อน `print` จะอ่านง่ายขึ้น; `from urllib.parse import quote_plus` ใน `redact_secrets` (`:109`) ย้ายไป import ระดับ module ได้
+5. [docs/spec.md:1174, :1223] R10-AC-15 ยังเขียนว่า replace ล้มแล้วเก็บ temp และ R10-Q-3 ยังเขียนว่า "ไม่ retry อัตโนมัติ" — ขัดกับ R12-5 ที่ผู้ใช้สั่ง (บันทึกไว้แค่ใน `docs/tasks.md:874`); ควรเพิ่มหมายเหตุใน spec / design ว่า R10-Q-3 ถูกแทนที่ (2026-11-23) เพื่อไม่ให้ Round ถัดไป "แก้กลับ"
+6. [tests/test_r10_export_atomic_write.py:175-178, :880-888] ไม่มี test ที่ pin ค่าจริง `EXPORT_REPLACE_RETRY_DELAYS == (0.2, 0.5, 1.0)` (test ใช้ค่า patch ทั้งหมด) — ถ้ามีคนแก้เป็นค่ายาว ๆ จน worker รอนาน test ไม่จับ; เพิ่ม assert ค่าคงที่ หรือ `sum(...) <= 2.0` หนึ่งบรรทัด
+7. [tests/test_database_connect_gui_core.py:488] ไม่มี unit test ตรงของ `write_json_atomic` สำหรับทาง `json.dump` ล้ม / `fsync` ล้ม / `BaseException` (ไฟล์เดิมคงอยู่, `.tmp` ถูกลบ, exception เดิม) — ปัจจุบันครอบคลุมผ่าน `os.replace` ล้มใน R8 / R6 เท่านั้น; reviewer ยืนยันพฤติกรรมด้วย probe แล้ว ถ้าต้องการ lock ไว้ให้เพิ่ม test เล็ก ๆ 3 กรณี
+8. [tests/test_r8_load_jobs_writeback.py:305] comment `print raises AttributeError, swallowed` ไม่ตรงความจริง — CPython `print()` คืนค่าเงียบ ๆ เมื่อ `sys.stdout is None` (ไม่ raise); test ยังถูกต้อง (ยืนยันว่าโหลดสำเร็จเมื่อไม่มี console) แก้ comment ให้ตรงพอ
+9. [database_connect_gui.py:5692-5694] หลัง R12-3 ตัวนับใน `askyesno` ข้าม element ที่ไม่ใช่ dict แต่ filter ใน `try` ยังเรียก `job.get` → ถ้า `saved_jobs` มี element เสียและผู้ใช้กด Yes จะได้ rollback + `Load Preset Failed: AttributeError` (ไม่มีข้อมูลหาย) — กรณีนี้เกิดไม่ได้จริงเพราะ `load_jobs` reject list ที่มี non-dict ตั้งแต่ตอนโหลด; ถ้าต้องการให้สม่ำเสมอ ใส่ `isinstance(job, dict)` ใน filter ด้วย (ต้องตัดสินว่าจะเก็บหรือทิ้ง element เสีย)

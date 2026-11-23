@@ -983,21 +983,28 @@ class RedactSecretsTests(unittest.TestCase):
     def test_patterns_and_known_secret(self):
         from urllib.parse import quote_plus
 
+        # รหัสมี ; และ } -> ODBC เขียนเป็น {p@ss;w}}rd} (encoded: %7Bp%40ss%3Bw%7D%7Drd%7D)
+        # จึงต้องเทียบผลทั้งบรรทัด: ถ้า regex จัดการ }} / %7D%7D ไม่ได้ จะ mask แค่ครึ่งเดียว
         pw = "p@ss;w}rd"
         odbc = app.build_sqlserver_odbc_connect("D", "h", "1", "db", "u", pw)
-        samples = [
-            odbc,
-            "mssql+pyodbc:///?odbc_connect=" + quote_plus(odbc),
-            "postgresql://user:hunter22@host/db",
-            "PWD=abc123;UID=x",
-            "password=hunter22 next",
+        self.assertIn("PWD={p@ss;w}}rd}", odbc)  # ยืนยันรูปที่ใช้ทดสอบ
+        odbc += ";Encrypt=yes"  # มีข้อความต่อท้าย: mask ต้องหยุดตรงปีกกาปิดของรหัส
+        prefix = "DRIVER={D};SERVER=h,1;DATABASE={db};UID={u};"
+        url = "mssql+pyodbc:///?odbc_connect="
+        cases = [
+            (odbc, prefix + "PWD=***;Encrypt=yes"),
+            (url + quote_plus(odbc),
+             url + quote_plus(prefix + "PWD=") + "***" + quote_plus(";Encrypt=yes")),
+            ("postgresql://user:hunter22@host/db", "postgresql://user:***@host/db"),
+            ("PWD=abc123;UID=x", "PWD=***;UID=x"),
+            ("password=hunter22 next", "password=*** next"),
         ]
-        for text in samples:
+        for text, expected in cases:
             with self.subTest(text=text):
                 plain = app.redact_secrets(text)
-                for leak in (pw, quote_plus(pw), "hunter22", "abc123"):
+                self.assertEqual(plain, expected)
+                for leak in ("p@ss", "p%40ss", "w}}rd", "rd}", "%7D%7Drd", "hunter22", "abc123"):
                     self.assertNotIn(leak, plain)
-                self.assertIn("***", plain)
 
     def test_known_secret_verbatim_and_short_secret_ignored(self):
         self.assertEqual(app.redact_secrets("error near S3cr3t-UAT", UAT_PW), "error near ***")

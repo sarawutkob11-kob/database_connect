@@ -875,4 +875,6 @@
 - [x] R12-6 (R11 🟢1): ไม่ส่ง password เข้า thread ของ Tables เมื่อ worker ไม่ใช้ (database ปัจจุบัน / Oracle)
 - [x] R12-7 (R11 🟢2): `redact_secrets()` ปิด `PWD=` / `password=` (ทั้งแบบปกติและ URL-encoded), userinfo ใน URL และรหัสผ่านที่รู้ค่า — ใช้กับ print / traceback ใน worker ของ Tables และ `on_list_tables_error`
 - [x] R12-8 (R11 🟢3–5): `_details_differ_from` strip port ทั้งสองฝั่งหลัง split (`"5432 :x"` ไม่เตือนค้าง); type hints `_replace_engine(engine: Any)` / `_refresh_target_summary() -> None`; test ตั้ง password ผ่าน `_replace_engine` แทน tuple ภายใน
+- [x] R12-9 (R12 review 🟡1): `RedactSecretsTests.test_patterns_and_known_secret` เทียบผล `redact_secrets` ทั้งบรรทัด (ODBC / URL-encoded มี `;Encrypt=yes` ต่อท้าย) + ตรวจว่าชิ้นส่วนรหัสในรูปที่ปรากฏจริง (`p@ss`, `p%40ss`, `w}}rd`, `rd}`, `%7D%7Drd`) ไม่หลุด — ยืนยันแล้วว่า test ล้มเมื่อ regex ไม่รองรับ `}}` / `%7D%7D` (mask ได้ครึ่งเดียว)
+  - QA: mutation เพิ่ม (patch `app._SECRET_PATTERNS` ใน process): ODBC แบบไม่หยุดที่ `;` (`[^&\s'\"]*` / ต่อท้ายปีกกาปิด) และ URL-encoded แบบไม่หยุดที่ `%3B` → test ล้มทุกแบบ (mask กิน `;Encrypt=yes`); pattern เดิม → ผ่าน. Regression 2 mode (utf-8 / cp874 redirect) → `Ran 1147 tests ... OK` ทั้งคู่
 - [x] R12-T: Regression ทั้งชุด สอง mode encoding → `Ran 1147 tests ... OK` ทั้งคู่
