@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 import threading
 import unittest
 from collections import defaultdict
@@ -93,6 +94,10 @@ class _FakeWriter:
 
     def __exit__(self, *_args):
         return False
+
+    def close(self):
+        # R10-Q-5 harness: the export now saves through writer.close()
+        pass
 
     def add_sheet(self, sheet_name, max_row=1):
         worksheet = _FakeWorksheet()
@@ -221,9 +226,14 @@ def run_export(test_case, jobs, row_counts):
     def dataframe_factory(values):
         return _FakeFailureFrame(values, writer)
 
+    # R10-Q-5 harness: export into a temporary folder, never the repo's cwd
+    export_dir = tempfile.TemporaryDirectory()
+    test_case.addCleanup(export_dir.cleanup)
+    export_path = os.path.join(export_dir.name, "export.xlsx")
+
     with mock.patch.object(app.pd, "ExcelWriter", return_value=writer), \
             mock.patch.object(app.pd, "DataFrame", side_effect=dataframe_factory), \
-            mock.patch.object(app.filedialog, "asksaveasfilename", return_value="export.xlsx"), \
+            mock.patch.object(app.filedialog, "asksaveasfilename", return_value=export_path), \
             mock.patch.object(app.threading, "Thread", side_effect=lambda **kwargs: _ImmediateThread(**kwargs)), \
             mock.patch.object(app, "messagebox") as messagebox:
         with mock.patch.object(

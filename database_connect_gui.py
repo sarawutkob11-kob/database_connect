@@ -1,5 +1,6 @@
 # --- Standard library ---
 import base64
+import contextlib
 import copy
 import ctypes
 import datetime as _dt
@@ -8,11 +9,12 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
 import traceback
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Iterator, Optional, Tuple
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -72,11 +74,51 @@ def write_json_atomic(path, data, indent=2):
     """Write JSON to a temp file, then swap it in: a crash or a locked file
     never leaves `path` half-written or empty."""
     tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+    # open() failing means this call created nothing: leave any existing
+    # .tmp alone. Once opened, the .tmp is ours and is removed on failure.
+    f = open(tmp_path, "w", encoding="utf-8")
+    try:
+        with f:
+            json.dump(data, f, indent=indent, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass  # best-effort cleanup; the original error is what matters
+        raise
+
+
+_SECRET_PATTERNS = (
+    # ODBC connection string: PWD={...} (with }} escapes) or PWD=value
+    re.compile(r"(?i)(\b(?:PWD|PASSWORD)\s*=\s*)(\{(?:[^}]|\}\})*\}|[^;&\s'\"]*)"),
+    # The same, URL-encoded inside odbc_connect=... (= %3D, ; %3B, { %7B, } %7D)
+    re.compile(r"(?i)((?:PWD|PASSWORD)%3D)(%7B(?:(?!%7D).|%7D%7D)*%7D|.*?(?=%3B|&|\s|['\"]|$))"),
+    # URL userinfo: scheme://user:password@host
+    re.compile(r"(://[^:/@\s'\"]*:)([^@\s'\"]+)(@)"),
+)
+
+
+def redact_secrets(text: str, *secrets: Optional[str]) -> str:
+    """`text` with passwords masked as ***: known `secrets` verbatim (and their
+    URL-encoded form), plus PWD= / password= values and URL userinfo.
+    Secrets shorter than 4 characters are only masked by the patterns (a
+    verbatim replace would mangle ordinary words)."""
+    from urllib.parse import quote_plus
+
+    result = str(text)
+    for secret in secrets:
+        if secret and len(secret) >= 4:
+            for form in {secret, quote_plus(secret)}:
+                result = result.replace(form, "***")
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups == 3:
+            result = pattern.sub(lambda m: f"{m.group(1)}***{m.group(3)}", result)
+        else:
+            result = pattern.sub(lambda m: f"{m.group(1)}***", result)
+    return result
 
 
 def preserve_unreadable_file(path):
@@ -132,6 +174,85 @@ def _excel_text_too_long(value: object) -> bool:
     if len(value) > EXCEL_MAX_CELL_CHARS:  # every code point is at least 1 unit
         return True
     return len(value.encode("utf-16-le", "surrogatepass")) // 2 > EXCEL_MAX_CELL_CHARS
+
+
+def _ensure_export_target_writable(file_path: str) -> None:
+    """Fail now (before any query runs) when an existing export target cannot be
+    written, e.g. it is open in Excel. Never creates, truncates or changes the file."""
+    if not os.path.exists(file_path):
+        return
+    try:
+        fd = os.open(file_path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+    except OSError as exc:
+        raise type(exc)(
+            f"Cannot write to {file_path}. The file may be read-only or open in "
+            f"Excel or another program. ({exc.strerror or exc})"
+        ) from exc
+    os.close(fd)
+
+
+def _create_export_temp_file(file_path: str) -> Tuple[BinaryIO, str]:
+    """Create `<stem>.<random>.tmp.xlsx` next to `file_path` (exclusive) and
+    return (open binary handle, temp path)."""
+    folder = os.path.dirname(os.path.abspath(file_path))
+    stem = os.path.splitext(os.path.basename(file_path))[0] or "export"
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=f"{stem}.", suffix=".tmp.xlsx", dir=folder)
+    except OSError as exc:
+        # Name the file the user chose, not a temp path they never saw
+        raise type(exc)(
+            f"Cannot create a temporary file next to {file_path}. The folder may be "
+            "read-only, or the path may be too long. "
+            f"({exc.strerror or exc})"
+        ) from exc
+    if os.altsep and os.altsep in file_path and os.sep not in file_path:
+        # Messages show both paths: keep the separators the user's path uses
+        temp_path = temp_path.replace(os.sep, os.altsep)
+    try:
+        return os.fdopen(fd, "wb"), temp_path
+    except BaseException:
+        os.close(fd)
+        _discard_export_temp(temp_path)
+        raise
+
+
+@contextlib.contextmanager
+def _excel_writer_saved_on_success(handle: BinaryIO) -> Iterator[Any]:
+    """`pd.ExcelWriter` on `handle` that saves the workbook only when the
+    `with` body finishes without an exception."""
+    writer = pd.ExcelWriter(handle, engine="openpyxl")
+    yield writer
+    writer.close()
+
+
+# Waits (seconds) before each retry of the final rename. Antivirus / OneDrive
+# often hold a just-closed file for a moment: PermissionError only, then give up.
+EXPORT_REPLACE_RETRY_DELAYS: Tuple[float, ...] = (0.2, 0.5, 1.0)
+
+
+def _replace_export_with_retry(temp_path: str, file_path: str) -> None:
+    """os.replace(temp_path, file_path), retried on PermissionError (a short
+    lock by another program). Other errors, or the last failure, are raised."""
+    import time
+
+    for delay in EXPORT_REPLACE_RETRY_DELAYS:
+        try:
+            os.replace(temp_path, file_path)
+            return
+        except PermissionError:
+            time.sleep(delay)
+    os.replace(temp_path, file_path)
+
+
+def _discard_export_temp(temp_path: str) -> Optional[str]:
+    """Best-effort delete; returns "<Type>: <message>" when it failed, else None."""
+    try:
+        os.remove(temp_path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc.strerror or exc}"
+    return None
 
 
 def excel_db_value(value):
@@ -359,6 +480,19 @@ class RunTarget:
 
     engine: Any
     info: Optional[ConnectionInfo]  # None only for engines set without connect_database
+
+
+_TARGET_MISMATCH_NOTE = "  ·  ⚠ ช่อง Details ไม่ตรงกับ connection — กด Connect เพื่อใช้ค่าใหม่"
+
+
+def _target_summary_text(
+    db_type: str, user: str, host: str, port: str, database: str
+) -> Tuple[str, str]:
+    """(main, sub) text of the header target box. Callers pass already-stripped
+    user / host / port / database (db_type as given)."""
+    main_text = f"{db_type} · {user}@{host}" + (f":{port}" if port else "")
+    sub_text = f"Database / Service: {database}" if database else "Database: (default)"
+    return main_text, sub_text
 
 
 _SQL_WORD_RE = re.compile(r"[^\W\d][\w$#@]*|[#@][\w$#@]*")
@@ -2366,6 +2500,7 @@ class DatabaseConnectorGUI:
         self.style.map("Fluent.Treeview.Heading", background=[("active", UI["hover"])])
 
         self.engine = None
+        self._connected_password: Optional[Tuple[Any, str]] = None
         self.config_file = os.path.join(
             APP_DIR, "db_profiles.json"
         )
@@ -2640,22 +2775,10 @@ class DatabaseConnectorGUI:
         for _ew in (self.db_user, self.db_password, self.db_host, self.db_port, self.db_name):
             _ew.bind("<Control-KeyPress>", _entry_ctrl_key)
 
-        def _refresh_target_summary():
+        def _refresh_target_summary() -> None:
             """Read-only: show the connection target under the profile picker."""
-            try:
-                host = self.db_host.get().strip()
-                port = self.db_port.get().strip()
-                user = self.db_user.get().strip()
-                dbn = self.db_name.get().strip()
-                main_text = f"{self.db_type.get()} · {user}@{host}" + (f":{port}" if port else "")
-                sub_text = f"Database / Service: {dbn}" if dbn else "Database: (default)"
-                if target_main.cget("text") != main_text:
-                    target_main.config(text=main_text)
-                if target_sub.cget("text") != sub_text:
-                    target_sub.config(text=sub_text)
-            except tk.TclError:
-                return
-            self.root.after(500, _refresh_target_summary)
+            if self._update_target_summary(target_main, target_sub):
+                self.root.after(500, _refresh_target_summary)
 
         def _toggle_creds():
             self.creds_expanded = not self.creds_expanded
@@ -5521,10 +5644,31 @@ class DatabaseConnectorGUI:
             preset_name, preset_path, data = preset_data[selection[0]]
             jobs = data.get("jobs", [])
 
+            # ตรวจทุก Job ใน preset ก่อนแตะข้อมูลใด ๆ (R9: ปฏิเสธทั้งไฟล์)
+            for position, job in enumerate(jobs, start=1):
+                if not isinstance(job, dict):
+                    problem = "is not a job object"
+                elif not isinstance(job.get("name"), str) or not job["name"].strip():
+                    problem = "has no valid 'name' (must be non-empty text)"
+                elif not isinstance(job.get("query"), str) or not job["query"].strip():
+                    problem = "has no valid 'query' (must be non-empty text)"
+                else:
+                    continue
+                messagebox.showerror(
+                    "Invalid Preset",
+                    f"Preset '{preset_name}' cannot be loaded.\n\n"
+                    f"Job #{position} {problem}.\n\n"
+                    "Your current jobs were not changed.",
+                    parent=dialog,
+                )
+                return
+
             current_profile = self.profile_combo.get()
 
             current_profile_jobs = [
-                job for job in self.saved_jobs if job.get("profile") == current_profile
+                job
+                for job in self.saved_jobs
+                if isinstance(job, dict) and job.get("profile") == current_profile
             ]
 
             result = messagebox.askyesno(
@@ -5543,19 +5687,34 @@ class DatabaseConnectorGUI:
                 original_jobs = list(saved_jobs_before)
                 jobs_snapshot = copy.deepcopy(original_jobs)
 
-                # ลบเฉพาะ Job ของ Profile ปัจจุบัน
-                self.saved_jobs = [
-                    job for job in self.saved_jobs if job.get("profile") != current_profile
-                ]
+                try:
+                    # ลบเฉพาะ Job ของ Profile ปัจจุบัน
+                    self.saved_jobs = [
+                        job for job in self.saved_jobs if job.get("profile") != current_profile
+                    ]
 
-                # เพิ่ม Profile ให้ Job เก่า
-                for job in jobs:
+                    # เพิ่ม Profile ให้ Job เก่า
+                    for job in jobs:
 
-                    job["profile"] = current_profile
+                        job["profile"] = current_profile
 
-                    self.saved_jobs.append(job)
+                        self.saved_jobs.append(job)
 
-                if not self.save_jobs():
+                    saved = self.save_jobs()
+                except Exception as e:
+                    self._restore_jobs_snapshot(
+                        saved_jobs_before, original_jobs, jobs_snapshot
+                    )
+                    messagebox.showerror(
+                        "Load Preset Failed",
+                        f"Preset '{preset_name}' was not loaded. "
+                        "Your current jobs were not changed.\n\n"
+                        f"{type(e).__name__}: {e}",
+                        parent=dialog,
+                    )
+                    return
+
+                if not saved:
                     self._restore_jobs_snapshot(
                         saved_jobs_before, original_jobs, jobs_snapshot
                     )
@@ -7627,7 +7786,7 @@ class DatabaseConnectorGUI:
             port=port,
             database=database.strip(),
         )
-        self._replace_engine(engine, info)
+        self._replace_engine(engine, info, password=password)
         try:
             self.status_label.config(text=f"✅ Connected ({db_type})", foreground="#27ae60")
             self.execute_btn.config(state="normal")
@@ -7647,15 +7806,24 @@ class DatabaseConnectorGUI:
         except tk.TclError:
             pass
 
-    def _replace_engine(self, engine, info: Optional[ConnectionInfo] = None) -> None:
+    def _replace_engine(
+        self,
+        engine: Any,
+        info: Optional[ConnectionInfo] = None,
+        password: Optional[str] = None,
+    ) -> None:
         """Make `engine` the current one (with its ConnectionInfo) and close the
         pool of the previous one. engine None -> no run target.
+        `password` is bound to `engine` and cleared whenever the engine is replaced.
 
         dispose() only closes idle pooled connections; a query still running
         on the old engine keeps its connection until it finishes.
         """
         old, self.engine = self.engine, engine
         self._run_target = RunTarget(engine, info) if engine is not None else None
+        self._connected_password = (
+            (engine, password) if engine is not None and password is not None else None
+        )
         if old is not None and old is not engine:
             try:
                 old.dispose()
@@ -7675,6 +7843,70 @@ class DatabaseConnectorGUI:
         if target is not None and target.engine is engine:
             return target
         return RunTarget(engine, None)
+
+    def _connected_password_for(self, engine: Any) -> Optional[str]:
+        """Password used to create `engine` at Connect; None when `engine` was not
+        created by connect_database (or the connection was replaced / cleared).
+        Kept in memory only - never logged, printed or saved."""
+        stored = getattr(self, "_connected_password", None)
+        if stored is None or engine is None or stored[0] is not engine:
+            return None
+        return stored[1]
+
+    def _details_differ_from(self, info: ConnectionInfo) -> bool:
+        """True when the Details fields no longer match the connected target
+        (R11-Q-4: db_type, user, host, port, database; password / profile ignored)."""
+        screen = (
+            self.db_type.get().strip(),
+            self.db_user.get().strip(),
+            self.db_host.get().strip(),
+            self.db_port.get().split(":")[0].strip(),
+            self.db_name.get().strip(),
+        )
+        connected = (
+            info.db_type.strip(),
+            info.user,
+            info.host,
+            info.port.strip(),  # "5432 :x" at Connect is stored as "5432 "
+            info.database,
+        )
+        return screen != connected
+
+    def _update_target_summary(self, target_main: Any, target_sub: Any) -> bool:
+        """Show where Run goes under the profile picker.
+
+        Connected with a snapshot: the snapshot, plus a warning when the
+        Details fields differ. Otherwise: the Details fields (old behaviour).
+        Returns False when the labels are gone (window closed)."""
+        try:
+            target = self._capture_run_target()
+            info = target.info if target is not None else None
+            warn = False
+            if info is not None:
+                main_text, sub_text = _target_summary_text(
+                    info.db_type, info.user, info.host, info.port, info.database
+                )
+                warn = self._details_differ_from(info)
+                if warn:
+                    sub_text += _TARGET_MISMATCH_NOTE
+            else:
+                main_text, sub_text = _target_summary_text(
+                    self.db_type.get(),
+                    self.db_user.get().strip(),
+                    self.db_host.get().strip(),
+                    self.db_port.get().strip(),
+                    self.db_name.get().strip(),
+                )
+            sub_fg = UI["warn"] if warn else UI["muted"]
+            if target_main.cget("text") != main_text:
+                target_main.config(text=main_text)
+            if target_sub.cget("text") != sub_text:
+                target_sub.config(text=sub_text)
+            if str(target_sub.cget("fg")) != sub_fg:
+                target_sub.config(fg=sub_fg)
+        except tk.TclError:
+            return False
+        return True
 
     def _show_connection_error(self, error):
         """Connection failed: show the database message and what to check."""
@@ -9097,21 +9329,46 @@ class DatabaseConnectorGUI:
             messagebox.showerror("Error", "Please connect to database first")
             return
 
-        # The engine + database type of this run, taken once on the main thread;
-        # the worker below never reads self.engine or the screen db_type
+        # The engine + target of this run, taken once on the main thread;
+        # the worker below never reads self.engine or the Details fields
         engine = target.engine
-        db_type = target.info.db_type if target.info is not None else self.db_type.get()
+        info = target.info
+        if info is not None:
+            # Connected through connect_database: everything comes from the
+            # snapshot + the password of this engine (never the Details fields)
+            db_type = info.db_type
+            current_db_name = info.database
+            password = self._connected_password_for(engine)
+            if password is None and not current_db_name and db_type != "Oracle":
+                self.results_text.insert(
+                    tk.END,
+                    "⛔ Tables ไม่ได้เริ่มงาน: ไม่มีรหัสผ่านของ connection ปัจจุบัน "
+                    "— กด Connect ใหม่แล้วลองอีกครั้ง\n",
+                )
+                self.results_text.see(tk.END)
+                return
+            # The password is only needed to open one engine per database
+            # (list-all mode, not Oracle): keep it out of the thread otherwise.
+            needs_password = not current_db_name and db_type != "Oracle"
+            connection_credentials = (
+                info.user,
+                (password or "") if needs_password else "",
+                info.host,
+                info.port,
+            )
+        else:
+            db_type = self.db_type.get()
 
-        # Check if user wants to list all databases or just current connection
-        current_db_name = self.db_name.get().strip()
-        connection_credentials = (
-            getattr(self, "db_user", None).get() if getattr(self, "db_user", None) else "",
-            getattr(self, "db_password", None).get()
-            if getattr(self, "db_password", None)
-            else "",
-            getattr(self, "db_host", None).get() if getattr(self, "db_host", None) else "",
-            getattr(self, "db_port", None).get() if getattr(self, "db_port", None) else "",
-        )
+            # Check if user wants to list all databases or just current connection
+            current_db_name = self.db_name.get().strip()
+            connection_credentials = (
+                getattr(self, "db_user", None).get() if getattr(self, "db_user", None) else "",
+                getattr(self, "db_password", None).get()
+                if getattr(self, "db_password", None)
+                else "",
+                getattr(self, "db_host", None).get() if getattr(self, "db_host", None) else "",
+                getattr(self, "db_port", None).get() if getattr(self, "db_port", None) else "",
+            )
 
         self.results_text.insert(tk.END, "Fetching database schema information...\n\n")
         self.results_text.see(tk.END)
@@ -9178,10 +9435,10 @@ class DatabaseConnectorGUI:
                                 )
                                 databases_to_check = [row[0] for row in result]
                     except Exception as e:
-                        print(f"\n❌ ERROR getting database list for {db_type}: {e}")
+                        print(redact_secrets(f"\n❌ ERROR getting database list for {db_type}: {e}", credentials[1]))
                         import traceback
 
-                        traceback.print_exc()
+                        print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
                         databases_to_check = []
 
                     # For each database, connect and get tables
@@ -9287,11 +9544,11 @@ class DatabaseConnectorGUI:
                                                 )
                                         except Exception as schema_err:
                                             print(
-                                                f"      ❌ Error reading schema '{schema}': {schema_err}"
+                                                redact_secrets(f"      ❌ Error reading schema '{schema}': {schema_err}", credentials[1])
                                             )
                                             import traceback
 
-                                            traceback.print_exc()
+                                            print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
                                             # Skip this schema and continue with others
                                             continue
                                 finally:
@@ -9304,10 +9561,10 @@ class DatabaseConnectorGUI:
                                     f"   📊 Completed {database}: {schema_count} schemas, {total_tables} tables total"
                                 )
                         except Exception as e:
-                            print(f"   ❌ ERROR accessing database {database}: {e}")
+                            print(redact_secrets(f"   ❌ ERROR accessing database {database}: {e}", credentials[1]))
                             import traceback
 
-                            traceback.print_exc()
+                            print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
                             pass
                 else:
                     # List tables from currently connected database only
@@ -9475,9 +9732,12 @@ class DatabaseConnectorGUI:
         # Re-enable button
         self.inspect_btn.config(state="normal", text="▦  Tables")
 
-        self.results_text.insert(tk.END, f"❌ Error: {str(error)}\n\n")
+        # A driver error can echo the connection string (SQL Server: PWD=...)
+        stored = getattr(self, "_connected_password", None)
+        message = redact_secrets(str(error), stored[1] if stored else None)
+        self.results_text.insert(tk.END, f"❌ Error: {message}\n\n")
         self.results_text.see(tk.END)
-        messagebox.showerror("Error", f"Failed to list tables:\n{str(error)}")
+        messagebox.showerror("Error", f"Failed to list tables:\n{message}")
 
     def load_jobs(self):
         """Load saved jobs from file"""
@@ -9509,16 +9769,25 @@ class DatabaseConnectorGUI:
                     job["profile"] = first_profile
                     modified = True
 
-            # บันทึกกลับเฉพาะกรณีพบข้อมูลเก่า
-            if modified:
-                write_json_atomic(self.jobs_file, jobs, indent=4)
-
-            return jobs
-
         except Exception as e:
             print(f"Error loading jobs: {e}")
             self._jobs_save_blocked = self._handle_unreadable_file(self.jobs_file, "Saved Jobs", e)
             return []
+
+        # บันทึกกลับเฉพาะกรณีพบข้อมูลเก่า
+        if modified:
+            try:
+                write_json_atomic(self.jobs_file, jobs, indent=4)
+            except Exception as e:
+                # อ่านไฟล์ได้แล้ว: เก็บ Job ไว้ (migrate ใน memory แล้ว)
+                # save_jobs() ครั้งถัดไปที่สำเร็จจะเขียนลงดิสก์เอง
+                # ไฟล์ .tmp ที่ call นี้สร้าง write_json_atomic ลบให้เองแล้ว
+                try:
+                    print(f"Cannot write migrated jobs back to {self.jobs_file}: {e}")
+                except Exception:
+                    pass  # console ที่ encode ไม่ได้ / ถูกปิด ต้องไม่ทำให้การโหลดล้ม
+
+        return jobs
 
     def _handle_unreadable_file(self, path, label, error):
         """A settings file exists but cannot be read: keep a copy of it.
@@ -10452,8 +10721,13 @@ class DatabaseConnectorGUI:
                     write_literal_cell(ws, row=start_row + line_no, column=1, value=line)
                 return blanked
 
+            temp_handle: Optional[BinaryIO] = None
+            temp_path: Optional[str] = None
+            keep_temp = False
             try:
-                with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+                _ensure_export_target_writable(file_path)
+                temp_handle, temp_path = _create_export_temp_file(file_path)
+                with _excel_writer_saved_on_success(temp_handle) as writer:
                     for idx, job in enumerate(jobs, 1):
                         if self._stop_event.is_set():
                             log(f"⏹ Stopped — {len(jobs) - idx + 1} job(s) not exported\n")
@@ -10751,8 +11025,33 @@ class DatabaseConnectorGUI:
                             {"Status": ["Stopped"], "Message": ["Export was stopped before any job ran"]}
                         ).to_excel(writer, sheet_name="Export", index=False)
 
+                temp_handle.close()  # flush fully before replace (Windows: close before rename)
+                try:
+                    _replace_export_with_retry(temp_path, file_path)
+                except OSError as replace_err:
+                    keep_temp = True
+                    fatal_error = (
+                        f"{type(replace_err).__name__}: Could not replace {file_path} "
+                        f"({replace_err.strerror or replace_err}). The file may be open in "
+                        "Excel or another program.\n"
+                        f"The completed export was kept at: {temp_path}\n"
+                        "Close the file, then rename the kept file to replace it."
+                    )
+                else:
+                    temp_path = None  # nothing left to delete
+
             except Exception as e:
                 fatal_error = f"{type(e).__name__}: {str(e)}"
+            finally:
+                if temp_handle is not None and not temp_handle.closed:
+                    try:
+                        temp_handle.close()
+                    except OSError:
+                        pass
+                if temp_path is not None and not keep_temp:
+                    remove_error = _discard_export_temp(temp_path)
+                    if remove_error:
+                        log(f"⚠️ Could not delete temporary file: {temp_path} ({remove_error})\n")
 
             elapsed = time_module.time() - start_all
             self.root.after(
@@ -11009,6 +11308,7 @@ class DatabaseConnectorGUI:
 
         engine, self.engine = self.engine, None
         self._run_target = None
+        self._connected_password = None
         if engine is not None:
             try:
                 engine.dispose()

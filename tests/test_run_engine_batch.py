@@ -421,6 +421,7 @@ class ListTablesEngineTests(unittest.TestCase):
         ci = app.ConnectionInfo("P1", "PostgreSQL", "u", "h", "5432", "")
         stub = make_stub(engine_a, ci)
         stub.db_type.set("MySQL")  # screen already differs when Tables is clicked
+        stub._replace_engine(engine_a, ci, password="pw")  # same engine: no dispose
         threads = self._start(stub)
         self._finish(stub, threads)
         self.assertIn("pg_database", str(conn.execute.call_args.args[0]))
