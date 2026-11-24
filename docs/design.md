@@ -2521,3 +2521,310 @@ R14-AC-17 (stdout / logs) และ R14-AC-18 = R14-T regression
 | R14-AC-10 | R14-T2, R14-T3 | R14-AC-11 | R14-T2, R14-T3 | R14-AC-12 | R14-T2, R14-T3 |
 | R14-AC-13 | R14-T1, R14-T2, R14-T3 | R14-AC-14 | R14-T1, R14-T2, R14-T3 | R14-AC-15 | R14-T1, R14-T3 |
 | R14-AC-16 | R14-T1, R14-T2, R14-T3 | R14-AC-17 | R14-T3, R14-T | R14-AC-18 | R14-T3, R14-T |
+
+---
+
+# Round 15 — Bugfix จาก bug-hunter (BH-1..BH-13)
+
+> spec: `docs/spec.md` Round 15 (R15-AC-1..38); คำตอบผู้ใช้ R15-Q-1..9 (2026-11-24) ตามค่าแนะนำทุกข้อ — รวม R15-Q-9 = **ไม่แก้** datetime / Timestamp ของ `format_sql_value`; เลขบรรทัด `database_connect_gui.py` ณ commit `802fd4c` (คลาดได้เล็กน้อย); ห้าม commit; test เดิมห้ามแก้; test ใหม่ `tests/test_r15_*.py`
+
+## R15-D1. แนวทางรวม
+
+- แก้เฉพาะจุดที่ BH อ้าง (minimal diff) ไฟล์เดียว `database_connect_gui.py`; ไม่มีไฟล์ / key JSON / dependency ใหม่
+- helper ใหม่ทุกตัวเป็น **pure function ระดับ module** หรือ method เล็กที่ทดสอบด้วย stub `GUI.__new__` ได้ — ไม่ต้องใช้ Tk / DB จริง (ยกเว้น BH-3 ที่ spec ให้ใช้ Tk จริงแบบ withdraw)
+- **ข้อควรระวังร่วม — nested function ที่ test เดิม extract ด้วย AST** (`compile_nested` / `_compile_dialog_functions` / `_build_refresh_target_summary`): `build_pending_values` (`load_excel_template_dialog`), `reset_selected` / `build_reset_values` / ฯลฯ (`show_reset_parameter_dialog`), `_refresh_target_summary` (`__init__`) ถูกดึงออกมารันด้วย env ที่กำหนดตัวแปรไว้ตายตัว → **ห้ามให้ nested function เหล่านี้อ้างตัวแปร local ใหม่ของ enclosing scope**; ถ้าต้องใช้ค่าใหม่ ให้เรียกผ่าน `self.<method>()` แทน
+- stub เดิมหลายชุดไม่มี attribute ใหม่ → โค้ดใหม่อ่าน attribute ที่อาจไม่มีด้วย `getattr(self, name, default)`
+
+## R15-D2. BH-1 — Reset template ในหน้าหลัก sync ก่อนตัดสินโหมด (R15-AC-1..4)
+
+method ใหม่ (วางถัดจาก `_capture_sql_template` `:11870`):
+
+```python
+def _sync_parameter_state_with_editor(self) -> None:
+    """Before Reset: if the SQL text no longer equals the last rendered SQL, the
+    current text becomes the template and tracked Excel values are dropped
+    (same rule as sync_edit_parameter_state of Edit Job / Edit Script)."""
+    if not self._excel_parameter_values:
+        return  # detected mode anyway - leave sql_template / rendered untouched
+    current_sql = self.sql_context.get("1.0", tk.END).rstrip("\n")
+    if current_sql == getattr(self, "_excel_parameterized_sql", None):
+        return
+    if current_sql != getattr(self, "sql_template", None):
+        self.sql_template = current_sql
+        self._excel_parameter_values.clear()
+        self._excel_parameterized_sql = None
+```
+
+- เรียกเป็น**บรรทัดแรก**ของ `show_reset_parameter_dialog` (`:13212`, ก่อน `detected_mode = not self._excel_parameter_values`) — ทุกผู้เรียก (ปุ่มหน้าหลัก `:3052`, Edit Job `:4443`, Edit Script `:4905`)
+- **ทำไมไม่กระทบ Edit Job / Edit Script (R15-AC-4)**: ผู้เรียกทั้งสองรัน `sync_edit_parameter_state()` / `sync_parameter_state()` (`:4384`, `:4859`) ซึ่งเป็นกฎเดียวกันทุกตัวอักษร แล้วใส่ผลลง `self.*` ก่อนเรียก dialog — กฎนี้ idempotent (หลังรันครั้งแรก: `rendered == current` หรือ `template == current` → รอบสองไม่ทำอะไร) จึงไม่เปลี่ยน state / `query_text` ของ Edit
+- guard `if not self._excel_parameter_values: return` ทำให้ (ก) ไม่เคย Load Excel → ผลเดิม 100% (`sql_template` คง `None`, R15-AC-4) (ข) stub เดิมใน `tests/test_r2_reset_nested_whitelist.py:1105`, `tests/test_r2_reset_t2t_plsql.py:339` ที่ไม่มี `sql_template` ไม่พัง
+- ไม่แก้ `reset_selected`, `reset_all_parameters`, `_capture_sql_template`, `reset_single_parameter` (นอก scope)
+- ผล: R15-AC-1 (แก้ข้อความ → detected mode, ไม่มีปุ่ม Reset All, เงื่อนไขที่เติมยังอยู่), R15-AC-2 (ถูกแทนด้วย SELECT ไม่มี IN → warning เดิม, editor ไม่เปลี่ยน — state ถูก sync แล้วแต่ไม่กระทบ editor), R15-AC-3 (`editor == R` ต่างแค่ `\n` ท้าย → tracked mode เดิม)
+
+## R15-D3. BH-2 — Export อ้างคอลัมน์ตามตำแหน่ง (R15-AC-5, AC-6)
+
+ใน `export_jobs_to_excel.worker` ลูป `clean_value` (`:10894-10901`) และลูป tz (`:10906-10914`): ห่อทั้งสองลูปด้วยการเปลี่ยนชื่อคอลัมน์เป็นเลขตำแหน่งชั่วคราว (ใช้ได้ทุกเวอร์ชัน pandas, `df` เป็นสำเนา `preloaded_df.copy()` หรือผลอ่านใหม่อยู่แล้ว จึงแก้ in-place ได้)
+
+```python
+original_columns = list(df.columns)
+df.columns = range(len(original_columns))  # BH-2: duplicate names -> unique positions
+for col in df.columns:            # ลูป clean_value เดิม (body ไม่เปลี่ยน)
+    ...
+for col in df.columns:            # ลูป tz / illegal_chars เดิม (body ไม่เปลี่ยน)
+    ...
+df.columns = original_columns
+```
+
+- ส่วนหลังจากนั้น ("Clean column names" `:10931`, ตรวจ 32,767 ที่ใช้ `iloc` อยู่แล้ว, `to_excel`) ไม่แก้ — หัวคอลัมน์ในไฟล์ยังเป็น `ID`, `NAME`, `ID`
+- ถ้า exception หลุดระหว่างสองลูป → เข้า `except job_err` เดิม (ชีต Failed) และ `df` ถูกทิ้ง ไม่ต้องคืนชื่อ
+- ไม่แตะกรณี `df.empty` (`:10845`) — ไม่ผ่านลูปเหล่านี้
+
+## R15-D4. BH-3 — Treeview ใช้ column id ที่ไม่ซ้ำ (R15-AC-7..9)
+
+helper ระดับ module ใหม่ (ใกล้ `format_db_value`):
+
+```python
+def _treeview_column_ids(columns: Sequence[Any]) -> List[str]:
+    """Treeview column ids: the names (as str) when they are unique, otherwise
+    positional ids "c0", "c1", ... (headings still show the real names)."""
+    names = [str(column) for column in columns]
+    if len(set(names)) == len(names):
+        return names
+    return [f"c{index}" for index in range(len(names))]
+```
+
+(เพิ่ม `List`, `Sequence` ใน `from typing import ...` `:17`)
+
+- **คงชื่อเป็น id เมื่อไม่ซ้ำ** → พฤติกรรมเดิม 100% (รวม Tables popup ที่หัว `Database`/`Schema`/`Table`, และ keyword robot `robot_tests/DBConnectorLibrary.py:667` ที่เรียก `tree.set(item, <ชื่อคอลัมน์>)`)
+- `show_table_popup` (`:9146-9166`): `column_ids = _treeview_column_ids(df.columns)`; `ttk.Treeview(..., columns=column_ids, ...)`; ลูป `for col_id, col in zip(column_ids, df.columns): tree.heading(col_id, text=col, command=lambda c=col_id: self.sort_treeview(tree, c, False)); tree.column(col_id, width=150, minwidth=100, anchor=tk.W)` — ข้อความหัว / ความกว้าง / `values` ที่ insert เดิม
+- `_render_results_grid_page` (`:8960-8968`): `names = [str(c) for c in df.columns]`; `column_ids = _treeview_column_ids(names)`; `tree["columns"] = column_ids`; ลูป `for pos, (col_id, col) in enumerate(zip(column_ids, names))` ใช้ `col` คำนวณความกว้าง / `text=col` และ `col_id` ใน `heading` / `column`
+- `copy_selected_rows` (`:9313-9319`): หัว = `[str(tree.heading(col, "text")) for col in columns]`; ค่า = `[str(tree.set(item, col)) for col in columns]` (ยังอ่านด้วย `tree.set` ตาม id — **ไม่ใช้** `tree.item(...)["values"]` เพราะ Tk แปลง `"0012"` → `12`)
+- `sort_treeview` (`:9286`) ไม่ต้องแก้ — `col` ที่ได้รับเป็น id ที่ไม่ซ้ำแล้ว; Ctrl+C ของ Results Grid (`:8868-8871`) ไม่แก้ (เรียก `copy_selected_rows`)
+- `on_tree_double_click` ไม่แก้ (อ่าน `values` ตามตำแหน่งอยู่แล้ว — R15-AC-9 ส่วน Tables)
+
+## R15-D5. BH-4 — วันที่ก่อน 1900 เป็นข้อความ (R15-AC-10, AC-11)
+
+แก้ `excel_db_value` (`:296-301`) — เก็บค่าเดิมไว้ส่ง `format_db_value`:
+
+```python
+EXCEL_MIN_DATE = _dt.date(1900, 1, 1)  # Excel cannot show dates before this
+
+    original = value
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, _dt.datetime):
+        naive = value.replace(tzinfo=None)
+        if naive.date() < EXCEL_MIN_DATE:
+            return format_db_value(original)
+        return naive
+    if isinstance(value, _dt.date):
+        return format_db_value(original) if value < EXCEL_MIN_DATE else value
+    if isinstance(value, _dt.time):
+        return value
+    return format_db_value(value)
+```
+
+- เทียบด้วยเวลาท้องถิ่นที่จะเขียนจริง (ตัด tz แล้ว) — `datetime(1899,12,31,23,59,59,tzinfo=utc)` → ข้อความ; ≥ 1900-01-01 ผลเดิม
+- ผู้เรียก `clean_value` (`:10883`) รับ `str` → ผ่าน `illegal_chars` เดิม → cell ข้อความ (`data_type == "s"`, R15-AC-11)
+
+## R15-D6. BH-5 — Tables double-click (R15-AC-12..16)
+
+helper ระดับ module ใหม่ (ใกล้ `_target_summary_text` `:504`):
+
+```python
+def _quote_identifier_if_needed(name: Any, db_type: str) -> str:
+    """Oracle / PostgreSQL (and other non-MySQL / non-SQL Server types): quote with
+    "..." only when the dialect requires it (upper case, special chars, leading
+    digit, reserved word) - SQLAlchemy identifier_preparer.quote."""
+
+def _tables_select_sql(db_type: str, database: Any, schema: Any, table: Any) -> str:
+    """SELECT * for a row (Database, Schema, Table) of the Tables window."""
+```
+
+- ทุกชื่อแปลง `str(...)` ก่อน (Tk คืนชื่อที่เป็นตัวเลขเป็น `int`)
+- `Microsoft SQL Server` → `SELECT * FROM [db].[schema].[table]` แต่ละส่วน `]` → `]]`
+- `MySQL` → ``SELECT * FROM `schema`.`table` `` (ใช้ **Schema** ของแถว) backtick ในชื่อ → สองตัว
+- `Oracle` → preparer ของ `sqlalchemy.dialects.oracle.base.OracleDialect()`; อื่น ๆ (PostgreSQL / ค่าที่ไม่รู้จัก — เดิมตกไป branch PostgreSQL) → preparer ของ `sqlalchemy.dialects.postgresql.base.PGDialect()`; ผล `SELECT * FROM {q(schema)}.{q(table)}` — import base dialect **ภายในฟังก์ชัน** (ไม่ต้องมี driver `oracledb` / `psycopg2`)
+- `on_list_tables_success(self, table_list, loading_dialog, has_database=True, db_type: Optional[str] = None)`: `on_table_double_click` ใช้ `query = _tables_select_sql(run_db_type, database, schema, table)` โดย `run_db_type = db_type if db_type is not None else self.db_type.get()` (อ่านใน callback เฉพาะผู้เรียกเก่าที่ไม่ส่ง `db_type`); ส่วนอื่นของ callback (insert, `📝 Inserted query: ...`) เดิม
+- `list_tables` (`:9630-9635`): ส่ง `db_type=db_type` เป็น **keyword** — `db_type` คือ local ที่จับตอนเริ่ม (`:9371` snapshot / `:9392` ช่องกรอก) → R15-AC-16 ทั้งสองกรณี; test เดิมอ่าน `call_args.args[0..2]` ไม่กระทบ
+- ไม่แก้ worker / การสร้าง `table_list` (`:9624` คงเดิม — Oracle ใช้ Schema แล้วจึงไม่ใช้ `current_db_name` ใน SQL)
+
+## R15-D7. BH-6 — ลบ Job แล้วบันทึกไม่สำเร็จ (R15-AC-17, AC-18)
+
+ใช้รูปแบบเดียวกับ `save_job_dialog` (`:9942-9947`):
+
+- `delete_job` (`:4522-4525`): ก่อน `pop` — `jobs_before = self.saved_jobs; original_jobs = list(jobs_before); snapshot = copy.deepcopy(original_jobs)`; ถ้า `not self.save_jobs()` → `self._restore_jobs_snapshot(jobs_before, original_jobs, snapshot)` แล้ว `return` (ไม่ `update_jobs_list`, ไม่เขียน `🗑️ Deleted`; `save_jobs` แสดง error เองแล้ว)
+- `delete_selected_jobs` (`:4279-4283`): เหมือนกัน + `checked_before = set(self._checked_job_ids)`; เมื่อล้ม: restore jobs และ `self._checked_job_ids.clear(); self._checked_job_ids.update(checked_before)` แล้ว `return`
+- ทางสำเร็จไม่เปลี่ยน
+
+## R15-D8. BH-7 — Run all หยุดหลัง DML ล้ม (R15-AC-19, AC-20)
+
+`run_selected_job.run_all_jobs` (`:10328-10330`): ก่อน `break`
+
+```python
+not_run = len(profile_jobs) - idx
+if not_run:
+    self.root.after(
+        0,
+        lambda n=not_run: self.results_text.insert(
+            tk.END, f"⛔ Stopped — a data-modification job failed — {n} job(s) not run\n"
+        ),
+    )
+```
+
+- ใช้ทางเดียวกับบรรทัด Stop (`:10214-10218`) → เข้า Execution Logs / run log; ถูก schedule หลัง `update_job_status("error")` และก่อน `show_batch_summary` จึงอยู่ก่อนบล็อก `Total`
+- ทาง Stop ไม่เปลี่ยน; ตัวนับ / `show_batch_summary` ไม่เปลี่ยน; N = 0 (DML ล้มเป็น Job สุดท้าย) ไม่แสดง
+
+## R15-D9. BH-8 — Save Profile (R15-AC-21..23)
+
+ใน `save_profile_dialog.save` (`:11462`) หลังเช็คชื่อว่าง:
+
+```python
+if profile_name == "last_used_profile":
+    messagebox.showwarning("Warning", "ชื่อนี้สงวนไว้ กรุณาใช้ชื่ออื่น", parent=dialog)
+    return
+if profile_name in self.saved_profiles and profile_name != current_profile:
+    if not messagebox.askyesno(
+        "Overwrite Profile",
+        f"มี Profile '{profile_name}' อยู่แล้ว\nต้องการบันทึกทับหรือไม่?",
+        parent=dialog,
+    ):
+        return  # dialog stays open to change the name
+```
+
+- `current_profile` = ตัวแปรเดิม `:11450` (`self.profile_combo.get()` ตอนเปิด dialog = ชื่อที่ใส่ไว้ให้ในช่อง)
+- ข้อความ "(Existing profiles will be overwritten)" คงไว้ (R15-Q-4); ส่วนที่เหลือ (`PROFILE_STORED_PASSWORD_KEY`, rollback) เดิม
+- ⚠ **ขัดกับ test เดิม** ดู R15-D15 ข้อ R15-R1
+
+## R15-D10. BH-9 — load_profile_data ล้างช่องที่ไม่มี key (R15-AC-24, AC-25)
+
+`load_profile_data` (`:11377-11395`): ช่อง `db_user`, `db_password`, `db_host`, `db_name` → ลบ `if "<key>" in config:` แล้ว `delete(0, tk.END)` + `insert(0, config.get(key, ""))` เสมอ; `db_port` → `port_value = str(config.get("db_port", "")).strip()` + ตัด `:` เดิม แล้ว delete / insert เสมอ; `db_type` และ `sql_query` **คง** `if ... in config` เดิม (R15-Q-5)
+
+## R15-D11. BH-10 — ลบ Profile พร้อม Job / Script Groups (R15-AC-26..29)
+
+`delete_profile` (`:11821-11835`) หลังเช็คชื่อ:
+
+1. นับ: `profile_jobs = [j for j in getattr(self, "saved_jobs", []) if isinstance(j, dict) and j.get("profile") == profile_name]`; `profile_groups = [g for g in self._ensure_script_groups_loaded() if isinstance(g, dict) and g.get("profile") == profile_name]` (Job ไม่มี key `profile` ไม่นับ)
+2. ถ้าทั้งคู่ว่าง → `askyesno` เดิม (ข้อความเดิม) — R15-AC-28; ไม่งั้น `answer = messagebox.askyesnocancel("Confirm Delete", f"ต้องการลบ Profile '{profile_name}' หรือไม่?\n\nProfile นี้มี {len(profile_jobs)} Job และ {len(profile_groups)} Script Group\nYes = ลบ Job และ Script Group ของ Profile นี้ด้วย\nNo = ลบเฉพาะ Profile\nCancel = ยกเลิก")`; `None` → `return`
+3. ลบ Profile + `save_profiles()` + rollback เดิม (ล้ม → return, ไม่เรียก save อื่น — AC-29 ก)
+4. ถ้าตอบ Yes → `notes = self._delete_profile_jobs_and_groups(profile_name)`:
+
+```python
+def _delete_profile_jobs_and_groups(self, profile_name: str) -> List[str]:
+    """After the profile itself was saved as deleted: remove its jobs, then its
+    Script Groups. A failed save rolls back that step and skips the next.
+    Returns warning lines for the user (empty = all removed)."""
+```
+
+   - Job: `jobs_before = list(self.saved_jobs)`; `self.saved_jobs[:] = [เฉพาะที่ไม่ใช่ของ profile]` (in-place — ที่อื่นถือ reference); `save_jobs()` ล้ม → `self.saved_jobs[:] = jobs_before`, คืน `["⚠️ ลบ Profile แล้ว แต่ลบ Job / Script Group ของ Profile นี้ไม่สำเร็จ — ยังอยู่ครบ"]` (ไม่แตะกลุ่ม — AC-29 ข); สำเร็จ → `self._checked_job_ids -= {id(job) ที่ลบ}` (ถ้ามี attribute)
+   - กลุ่ม: `groups_before = list(self.script_groups)`; `self.script_groups[:] = [...]`; `save_script_groups()` ล้ม → `self.script_groups[:] = groups_before`, คืน `["⚠️ ลบ Profile และ Job แล้ว แต่ลบ Script Group ไม่สำเร็จ — Script Group ยังอยู่"]` (AC-29 ค); สำเร็จ → `self._refresh_script_groups_window(None)`
+   - ไม่มี Job / กลุ่มของขั้นใด → ข้าม save ของขั้นนั้น
+5. ต่อด้วยทางเดิม: `update_profile_list()`, `🗑️ Deleted profile: ...`; ถ้า `notes` ไม่ว่าง → insert แต่ละบรรทัดลง `results_text` และใช้ `messagebox.showwarning("Delete Profile", "\n".join(notes))` แทน `showinfo` Success
+
+ลำดับ Profile → Job → Script Groups ตาม R15-Q-6 / R15-5
+
+## R15-D12. BH-11 — quote ชื่อคอลัมน์ตาม db_type (R15-AC-30, AC-31)
+
+- `_sql_column_identifier(column_name, db_type: Optional[str] = None) -> str` (ยัง `@staticmethod`, `:11936`): ชื่อธรรมดา (regex เดิม) ไม่ quote; `db_type == "MySQL"` → `` "`" + name.replace("`", "``") + "`" ``; อื่น ๆ / `None` → `"..."` เดิม
+- method ใหม่:
+
+```python
+def _sql_identifier_db_type(self) -> str:
+    """db_type used to quote Excel column names (R15-Q-7): the connected
+    snapshot's when connected, otherwise the Details field."""
+    target = self._capture_run_target()
+    if target is not None and target.info is not None:
+        return target.info.db_type
+    field = getattr(self, "db_type", None)
+    return field.get() if field is not None else ""
+```
+
+- ผู้เรียก `build_pending_values` (`:14007`): `sql_column = self._sql_column_identifier(column, self._sql_identifier_db_type())` — เรียกผ่าน `self` (ไม่สร้าง local ใหม่ใน enclosing scope, ดู R15-D1)
+- key `WHERE <column>` ที่บันทึกใน Job เดิมไม่ migrate (นอก scope)
+
+## R15-D13. BH-12 — SQL literal (R15-AC-32..35)
+
+- `excel_value_text` (`:157-165`):
+
+```python
+def excel_value_text(value: Any) -> str:
+    if isinstance(value, float) and value.is_integer():  # any size: no 1.23e+16
+        return str(int(value))
+    if (isinstance(value, _dt.datetime) and value.tzinfo is None
+            and value.time() == _dt.time(0) and getattr(value, "nanosecond", 0) == 0):
+        return value.date().isoformat()  # midnight -> date only
+    return str(value)
+```
+
+  (`pd.Timestamp` เป็น subclass ของ `datetime`; ค่าที่มี tz / มีเวลา คืน `str(value)` เดิม)
+- `_format_excel_sql_values` (`:11899`): `cleaned_value = excel_value_text(value).strip()` แทน `str(value).strip()` — branch ตัวเลข / escape เดิม (`float` จำนวนเต็มได้ `str(int(value))` อยู่แล้ว)
+- `format_sql_value` (`:932-938`) ลำดับใหม่: `None`/NaN → `NULL`; `str` → quote เดิม; `pd.api.types.is_bool(value)` (ครอบ `bool` และ `numpy.bool_`) → `"1"` / `"0"`; `isinstance(value, float) and value.is_integer()` (ครอบ `numpy.float64`) → `str(int(value))`; อื่น ๆ → `str(value)` (Decimal `1.10`, int, float ไม่เต็ม, **datetime ไม่แตะ — R15-Q-9**)
+
+## R15-D14. BH-13 — poll reschedule บน root หลัก (R15-AC-36, AC-37)
+
+- `__init__` (`:2271`): หลัง `self.root = root` เพิ่ม `self._main_root = root`
+- method ใหม่:
+
+```python
+def _poll_root(self) -> Any:
+    """Main window for self-rescheduling polls: self.root may be swapped to an
+    Edit Job / Edit Script dialog for a while."""
+    root = getattr(self, "_main_root", None)
+    return self.root if root is None else root
+```
+
+- `_refresh_stop_buttons` (`:8424`, `:8444`): `self._poll_root().after(300, self._refresh_stop_buttons)`
+- nested `_refresh_target_summary` (`:2797`): `self._poll_root().after(500, _refresh_target_summary)` — ยังเป็น nested function เดิม (test `tests/test_r11_connection_target_snapshot.py:495` ดึงออกมาด้วย AST และ assert `stub.root.after(500, refresh)` — stub ไม่มี `_main_root` จึงได้ `self.root` เดิม); test ใหม่ใช้วิธี AST เดียวกันโดยตั้ง `stub._main_root`
+- `self.root.after` ครั้งเดียวที่อื่นไม่แก้
+
+## R15-D15. ความเสี่ยงและผลกระทบ
+
+| # | ความเสี่ยง | การควบคุม |
+|---|---|---|
+| R15-R1 | **BH-8 ขัดกับ test เดิม** `tests/test_profile_password.py::UndecryptableProfileNeverConnectsTests::test_save_profile_dialog_new_password_drops_ciphertext` (`:367-389`): stub เป็น `MagicMock` → `profile_combo.get()` คืน MagicMock ≠ `"P"` (ซึ่งมีอยู่) → ต้องถาม `askyesno` แต่ test patch แค่ `showinfo` / `showwarning` → `askyesno` จริงคืนค่าไม่ใช่ `yes` (parent เป็น MagicMock) หรือเปิดกล่องจริง → ไม่บันทึก → assert `db_password == "typed"` ล้ม | **ต้องให้ผู้ใช้ตัดสินก่อนทำ R15-T7** (AC-38): (ก) อนุญาตแก้ test เดิม 1 บรรทัด `stub.profile_combo.get.return_value = "P"` (เหมือน test คู่กัน `:345`) — แนะนำ; หรือ (ข) นิยาม "Profile ปัจจุบัน" เป็นค่าในช่องชื่อที่อ่านกลับทันทีหลัง insert ตอนเปิด dialog (ผลจริงเท่ากัน แต่เป็นการออกแบบตาม stub) |
+| R15-R2 | BH-10 เรียก `_ensure_script_groups_loaded()` → stub เดิมที่ไม่มี `script_groups` (`tests/test_bugfix_h3.py:291`, `test_profile_connect_block.py:410`, `test_r7_console_print.py:221`) จะ**อ่าน** `script_groups.json` จริงใน APP_DIR (อ่านอย่างเดียว; ถ้าไฟล์เสียจะสร้างสำเนา `_unreadable_`) | test ใหม่ตั้ง `stub.script_groups` เสมอ; QA ตรวจ `git status` หลัง full suite ว่าไม่มีไฟล์ใหม่ / เปลี่ยนใน APP_DIR; ผลของ test เดิมไม่เปลี่ยน (ถ้าไฟล์จริงมีกลุ่มของชื่อ `P1` จะได้ `askyesnocancel` → MagicMock truthy = Yes → `save_profiles` ล้ม → rollback เหมือนเดิม) |
+| R15-R3 | BH-1 sync ทำให้ test / ผู้เรียกที่อยู่ใน tracked mode แต่ editor ≠ rendered กลายเป็น detected mode | ตั้งใจตาม R15-Q-1; ตรวจแล้ว test เดิมที่เรียก `show_reset_parameter_dialog()` ทั้งฟังก์ชันอยู่ใน detected mode (values `{}`); Edit path idempotent (R15-D2) |
+| R15-R4 | nested function ที่ test extract ด้วย AST พังเพราะอ้าง local ใหม่ | R15-D1: ใช้ `self.<method>()` เท่านั้น (`build_pending_values`, `_refresh_target_summary`) |
+| R15-R5 | BH-3 เปลี่ยน id คอลัมน์ทำให้โค้ด / robot ที่อ้างชื่อพัง | id = ชื่อเมื่อไม่ซ้ำ (เดิม 100%); id ตำแหน่งเฉพาะกรณีชื่อซ้ำ ซึ่งเดิมก็ใช้งานไม่ได้อยู่แล้ว |
+| R15-R6 | BH-5 Oracle quote เสมอ → หา `"hr"."employees"` ไม่เจอ | quote เฉพาะเมื่อ preparer บอกว่าจำเป็น (R15-5); Oracle list-all ได้ชื่อตัวใหญ่ (`HR`) → `"HR"` ซึ่ง Oracle หาเจอ |
+| R15-R7 | BH-12 `excel_value_text` เปลี่ยนค่าที่**แสดง**ใน dialog Load Excel (`2024-01-15` แทน `... 00:00:00`, ไม่มี `e+16`) และค่าที่ติ๊กไว้ใน Job เดิมไม่ถูก migrate | ยอมรับตาม R15-5; test เดิม `ExcelValueTests` (`1234.0`, `12.5`, `"0012"`, `7`) ยังผ่าน |
+| R15-R8 | BH-11 SQL ที่มี backtick แล้วไป Reset แบบ detected mode | `_scan_sql` รู้จัก `` ` `` เป็น quoted identifier แล้ว (`:566`); QA ลองหนึ่งกรณีใน R15-T9 |
+| R15-R9 | BH-2 ใช้ฟีเจอร์ pandas เฉพาะเวอร์ชัน | ใช้การ rename `df.columns` (ทุกเวอร์ชัน) ไม่ใช้ `isetitem` / `DataFrame.map` |
+| R15-R10 | BH-13 stub ที่ไม่มี `_main_root` | `_poll_root` fallback เป็น `self.root` (test เดิม `test_run_lock`, `test_running_banner`, `test_list_tables_stop` ผลเดิม) |
+
+## R15-D16. แผน test (`tests/test_r15_*.py`)
+
+ร่วม: stub `GUI.__new__` + `_FakeEntry` / `_FakeText` (ดูแบบใน `tests/test_profile_connect_block.py`, `tests/test_r2_reset_parameter_qa.py`), patch `app.messagebox` ทุก test, patch `print`, ไม่ต่อ DB จริง, ไฟล์เขียนเฉพาะ temp dir; Tk จริงเฉพาะ BH-3 (`tk.Tk()` + `withdraw()`, skip เมื่อ `TclError` แบบ `tests/test_r7_script_groups_dialog_rollback.py`)
+
+| ไฟล์ | AC | วิธีหลัก |
+|---|---|---|
+| `test_r15_reset_template_sync.py` | 1-4 | `show_reset_parameter_dialog()` จริงโดย patch `app.tk` / `ui_button` / `ui_round_frame` (แบบ `test_r2_reset_nested_whitelist.py:1091`) เพื่อดู detected/tracked mode + ปุ่ม `Reset All Parameters`; `reset_selected` ผ่าน `compile_nested`; Edit path: เรียก `reset_parameter_for_edit` ด้วย harness Edit Job หรือ oracle = รันกฎ `sync_edit_parameter_state` + `_sync_parameter_state_with_editor` ซ้ำแล้ว state ไม่เปลี่ยน + state หน้าหลักคืนครบ |
+| `test_r15_export_duplicate_columns.py` | 5, 6 | harness `tests/test_r7_excel_cell_limit.py` / `test_r10_export_atomic_write.py`; อ่านด้วย `openpyxl` |
+| `test_r15_treeview_duplicate_columns.py` | 7-9 | Tk จริง withdraw; `show_table_popup` (stub `canvas`, `root` = Tk), เรียก `command` ของ heading ที่ 3 / 1; Results Grid ผ่าน `_build_results_grid`-แบบ minimal หรือสร้าง `ttk.Treeview` แล้วตั้ง `stub._rg_tree` + `_results_grid_state` แล้วเรียก `_render_results_grid_page(0)`; clipboard อ่านด้วย `root.clipboard_get()` |
+| `test_r15_excel_pre1900.py` | 10, 11 | unit `excel_db_value`; export จริงแบบไฟล์ temp |
+| `test_r15_tables_select_sql.py` | 12-16 | unit `_tables_select_sql` + `on_list_tables_success` จริง (`show_table_popup` Mock จับ `on_double_click`); AC-16 ผ่าน `list_tables` + worker stub (แบบ `tests/test_list_tables_stop.py:145`) แล้วเปลี่ยน `stub.db_type` ก่อนเรียก callback |
+| `test_r15_delete_jobs_rollback.py` | 17, 18 | `save_jobs` Mock คืน False / True |
+| `test_r15_profile_save_load.py` | 21-25 | `save_profile_dialog` ด้วย fake widgets แบบ `tests/test_bugfix_c1.py:65`; `load_profile_data` จริง |
+| `test_r15_delete_profile.py` | 26-29 | `stub.saved_jobs`, `stub.script_groups` ตามนิยาม; `save_*` Mock |
+| `test_r15_sql_literals.py` | 30-35 | unit + `build_pending_values` / `apply_parameters` ผ่าน `compile_nested` (แบบ `test_r2_reset_parameter_qa.py:507`) โดย `stub._capture_run_target` คืน `RunTarget(E, ConnectionInfo(db_type="MySQL", ...))`; end-to-end AC-33 สร้าง Excel ใน temp dir แล้วอ่านด้วย `pd.read_excel` → `excel_value_text` → `_format_excel_sql_values` |
+| `test_r15_run_all_and_polls.py` | 19, 20, 36, 37 | `run_selected_job(jobs_override=...)` แบบ `tests/test_run_engine_batch.py` / `test_r14_jobs_redaction.py` (`root.after` เก็บแล้วเรียกตามลำดับ); poll: `stub.root` = dialog Mock, `stub._main_root` = main Mock |
+
+R15-AC-38 = R15-T11 (regression สอง encoding)
+
+## R15-D17. AC → Task
+
+| AC | Task | AC | Task | AC | Task |
+|---|---|---|---|---|---|
+| R15-AC-1 | R15-T1 | R15-AC-2 | R15-T1 | R15-AC-3 | R15-T1 |
+| R15-AC-4 | R15-T1 | R15-AC-5 | R15-T2 | R15-AC-6 | R15-T2 |
+| R15-AC-7 | R15-T3 | R15-AC-8 | R15-T3 | R15-AC-9 | R15-T3 |
+| R15-AC-10 | R15-T5 | R15-AC-11 | R15-T5 | R15-AC-12 | R15-T4 |
+| R15-AC-13 | R15-T4 | R15-AC-14 | R15-T4 | R15-AC-15 | R15-T4 |
+| R15-AC-16 | R15-T4 | R15-AC-17 | R15-T6 | R15-AC-18 | R15-T6 |
+| R15-AC-19 | R15-T10 | R15-AC-20 | R15-T10 | R15-AC-21 | R15-T7 |
+| R15-AC-22 | R15-T7 | R15-AC-23 | R15-T7 | R15-AC-24 | R15-T7 |
+| R15-AC-25 | R15-T7 | R15-AC-26 | R15-T8 | R15-AC-27 | R15-T8 |
+| R15-AC-28 | R15-T8 | R15-AC-29 | R15-T8 | R15-AC-30 | R15-T9 |
+| R15-AC-31 | R15-T9 | R15-AC-32 | R15-T9 | R15-AC-33 | R15-T9 |
+| R15-AC-34 | R15-T9 | R15-AC-35 | R15-T9 | R15-AC-36 | R15-T10 |
+| R15-AC-37 | R15-T10 | R15-AC-38 | R15-T1..T10 (test ใหม่), R15-T11 | | |

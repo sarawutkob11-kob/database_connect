@@ -369,6 +369,7 @@ class UndecryptableProfileNeverConnectsTests(_TempDirCase):
         stub._block_if_busy.return_value = False
         stub.db_password = _FakeEntry("typed")
         stub.db_port = _FakeEntry("5432")
+        stub.profile_combo.get.return_value = "P"
         commands = {}
 
         def button(*_args, **kwargs):

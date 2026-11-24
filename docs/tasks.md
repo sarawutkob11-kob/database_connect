@@ -968,3 +968,85 @@
 | R14-AC-10 | R14-T2, R14-T3 | R14-AC-11 | R14-T2, R14-T3 | R14-AC-12 | R14-T2, R14-T3 |
 | R14-AC-13 | R14-T1, R14-T2, R14-T3 | R14-AC-14 | R14-T1, R14-T2, R14-T3 | R14-AC-15 | R14-T1, R14-T3 |
 | R14-AC-16 | R14-T1, R14-T2, R14-T3 | R14-AC-17 | R14-T3, R14-T | R14-AC-18 | R14-T3, R14-T |
+
+---
+
+# Round 15 — Bugfix จาก bug-hunter (BH-1..BH-13)
+
+> design: `docs/design.md` หัวข้อ Round 15 (R15-D1..D17); คำตอบผู้ใช้ R15-Q-1..9 (2026-11-24) ตามค่าแนะนำทุกข้อ (R15-Q-9: ไม่แก้ datetime ของ `format_sql_value`); ห้าม commit; test เดิมห้ามแก้ (ถ้าขัดกับ AC ให้หยุดแล้วแจ้งหัวหน้า — R15-AC-38); test ใหม่ `tests/test_r15_*.py`; ทุก task: developer แก้โค้ด → qa-tester เขียน test ของ task + รัน test ที่ระบุ + full suite ต้องผ่าน
+> ลำดับ: BH-1 → BH-2/BH-3 → BH-5 → BH-4 → BH-6/8/9/10 → BH-7/11/12/13
+
+- [x] R15-T1: BH-1 — Reset template ในหน้าหลัก sync ก่อนตัดสินโหมด
+  - ไฟล์: `database_connect_gui.py` — method ใหม่ `_sync_parameter_state_with_editor` (ถัด `_capture_sql_template` `:11870`), บรรทัดแรกของ `show_reset_parameter_dialog` (`:13212`); test `tests/test_r15_reset_template_sync.py`
+  - ทำอะไร: ตาม R15-D2 — guard values ว่าง → return; เทียบ editor (`rstrip("\n")`) กับ `_excel_parameterized_sql` / `sql_template` ด้วย `getattr`; ไม่แตะ `reset_selected`, `reset_all_parameters`, Edit Job / Edit Script; รัน `python -m unittest tests.test_r2_reset_parameter tests.test_r2_reset_parameter_qa tests.test_r2_reset_parameter_qa2 tests.test_r2_reset_nested_whitelist tests.test_r2_reset_t2t_plsql` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-1, R15-AC-2, R15-AC-3, R15-AC-4
+  - ขึ้นกับ: -
+- [x] R15-T2: BH-2 — Export Excel อ้างคอลัมน์ตามตำแหน่ง
+  - ไฟล์: `database_connect_gui.py` — `export_jobs_to_excel.worker` ลูป `clean_value` (`:10894-10901`) และลูป tz (`:10906-10914`); test `tests/test_r15_export_duplicate_columns.py`
+  - ทำอะไร: ตาม R15-D3 — rename `df.columns = range(n)` ก่อนสองลูป แล้วคืนชื่อเดิมหลังลูป (body ลูปไม่เปลี่ยน); ไม่ใช้ `isetitem`; รัน `python -m unittest tests.test_r7_excel_cell_limit tests.test_r10_export_atomic_write tests.test_r14_export_redaction` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-5, R15-AC-6
+  - ขึ้นกับ: -
+- [x] R15-T3: BH-3 — Treeview (popup + Results Grid) ใช้ column id ที่ไม่ซ้ำ
+  - ไฟล์: `database_connect_gui.py` — helper ใหม่ `_treeview_column_ids` (+ `List`, `Sequence` ใน import typing `:17`), `show_table_popup` (`:9146-9166`), `_render_results_grid_page` (`:8960-8968`), `copy_selected_rows` (`:9313-9319`); test `tests/test_r15_treeview_duplicate_columns.py` (Tk จริง withdraw, skip เมื่อไม่มี display)
+  - ทำอะไร: ตาม R15-D4 — id = ชื่อเมื่อไม่ซ้ำ, `c0..` เมื่อซ้ำ; heading text = ชื่อเดิม; copy อ่านหัวจาก `tree.heading(col, "text")` และค่าจาก `tree.set(item, col)`; `sort_treeview` / Ctrl+C / `on_tree_double_click` ไม่แก้
+  - AC ที่ครอบคลุม: R15-AC-7, R15-AC-8, R15-AC-9
+  - ขึ้นกับ: -
+- [x] R15-T4: BH-5 — Tables double-click ใช้ Schema ของแถว + db_type ตอนเริ่ม + quote
+  - ไฟล์: `database_connect_gui.py` — helper ใหม่ `_quote_identifier_if_needed`, `_tables_select_sql` (ใกล้ `_target_summary_text` `:504`), `on_list_tables_success` (`:9683`, callback `:9713-9740`), `list_tables` (`:9630-9635`); test `tests/test_r15_tables_select_sql.py`
+  - ทำอะไร: ตาม R15-D6 — SQL Server `[..]` (`]`→`]]`), MySQL backtick, Oracle / PostgreSQL (และค่าอื่น) quote เฉพาะเมื่อจำเป็นด้วย `identifier_preparer.quote` ของ `OracleDialect()` / `PGDialect()` (import ใน function); `str()` ทุกชื่อ; เพิ่ม keyword `db_type: Optional[str] = None` แล้ว `list_tables` ส่ง `db_type=db_type`; รัน `python -m unittest tests.test_list_tables_stop tests.test_r11_connection_target_snapshot tests.test_r13_tables_and_patterns tests.test_run_engine_batch` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-12, R15-AC-13, R15-AC-14, R15-AC-15, R15-AC-16
+  - ขึ้นกับ: -
+- [x] R15-T5: BH-4 — `excel_db_value` วันที่ก่อน 1900-01-01 เป็นข้อความ
+  - ไฟล์: `database_connect_gui.py` — ค่าคงที่ `EXCEL_MIN_DATE`, `excel_db_value` (`:296-301`); test `tests/test_r15_excel_pre1900.py`
+  - ทำอะไร: ตาม R15-D5 — เก็บ `original`; datetime เทียบหลังตัด tz; date เทียบตรง; คืน `format_db_value(original)`; time / ค่า ≥ 1900 ผลเดิม; export จริงใน temp dir ตรวจ `data_type == "s"` และ `is_date`; รัน `python -m unittest tests.test_r7_excel_cell_limit tests.test_r10_export_atomic_write` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-10, R15-AC-11
+  - ขึ้นกับ: R15-T2 (ไฟล์เดียวกันช่วง export — ทำต่อกันเพื่อลด conflict)
+- [x] R15-T6: BH-6 — `delete_job` / `delete_selected_jobs` rollback เมื่อ `save_jobs()` ล้ม
+  - ไฟล์: `database_connect_gui.py` — `delete_job` (`:4522-4525`), `delete_selected_jobs` (`:4279-4283`); test `tests/test_r15_delete_jobs_rollback.py`
+  - ทำอะไร: ตาม R15-D7 — snapshot แบบ `save_job_dialog` (`:9942-9947`) + `_restore_jobs_snapshot`; `delete_selected_jobs` คืน `_checked_job_ids` in-place; ล้ม → return ก่อน `update_jobs_list` / ข้อความ `🗑️ Deleted`
+  - AC ที่ครอบคลุม: R15-AC-17, R15-AC-18
+  - ขึ้นกับ: -
+- [x] R15-T7: BH-8 + BH-9 — Save Profile ถามก่อนเขียนทับ / กันชื่อสงวน; `load_profile_data` ล้างช่องที่ไม่มี key
+  - ไฟล์: `database_connect_gui.py` — `save_profile_dialog.save` (`:11462-11493`), `load_profile_data` (`:11377-11395`); test `tests/test_r15_profile_save_load.py`
+  - ทำอะไร: ตาม R15-D9 / R15-D10; **ก่อนเริ่ม: หัวหน้าต้องได้คำตอบผู้ใช้เรื่อง R15-R1** (test เดิม `tests/test_profile_password.py:367` ขัดกับ R15-AC-21 — ทางเลือก (ก) อนุญาตแก้ test เดิม 1 บรรทัด / (ข) ใช้นิยาม "Profile ปัจจุบัน" แบบอ่านกลับจากช่องชื่อ); รัน `python -m unittest tests.test_profile_password tests.test_bugfix_c1 tests.test_bugfix_h3 tests.test_profile_connect_block tests.test_bugfix_m6 tests.test_r7_console_print` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-21, R15-AC-22, R15-AC-23, R15-AC-24, R15-AC-25
+  - ขึ้นกับ: คำตอบ R15-R1
+  - R15-R1 (ผู้ใช้ตอบ 2026-11-24): เลือก (ก) — อนุญาตแก้ test เดิม 1 บรรทัดเท่านั้น คือเพิ่ม `stub.profile_combo.get.return_value = "P"` ใน `tests/test_profile_password.py::UndecryptableProfileNeverConnectsTests::test_save_profile_dialog_new_password_drops_ciphertext` ให้เหมือน test คู่กัน (`test_save_profile_dialog_keeps_ciphertext_when_password_empty`); ห้ามแก้ test เดิมอื่น; R15-Q-4 / R15-Q-5 ใช้ค่าแนะนำ
+- [x] R15-T8: BH-10 — ลบ Profile ถามว่าจะลบ Job / Script Groups ด้วยหรือไม่
+  - ไฟล์: `database_connect_gui.py` — `delete_profile` (`:11808-11835`), method ใหม่ `_delete_profile_jobs_and_groups`; test `tests/test_r15_delete_profile.py`
+  - ทำอะไร: ตาม R15-D11 — นับเฉพาะ `profile == ชื่อ` (Job ไม่มี key ไม่นับ); ไม่มีอะไร → `askyesno` เดิม; มี → `askyesnocancel`; save ลำดับ Profile → Job → Script Groups, ล้มที่ขั้นใด rollback ขั้นนั้น (in-place `[:]`) และข้ามขั้นถัดไป + แจ้งผู้ใช้; test ใหม่ต้องตั้ง `stub.script_groups` เสมอ; หลัง full suite ตรวจ `git status` ว่าไม่มีไฟล์ใหม่ / เปลี่ยนใน APP_DIR (R15-R2); รัน `python -m unittest tests.test_bugfix_h3 tests.test_profile_connect_block tests.test_r7_console_print` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-26, R15-AC-27, R15-AC-28, R15-AC-29
+  - ขึ้นกับ: R15-T7 (ช่วง Profile เดียวกัน — ทำต่อกันเพื่อลด conflict)
+- [x] R15-T9: BH-11 + BH-12 — quote ชื่อคอลัมน์ตาม db_type และ SQL literal
+  - ไฟล์: `database_connect_gui.py` — `_sql_column_identifier` (`:11936-11942`), method ใหม่ `_sql_identifier_db_type`, ผู้เรียก `build_pending_values` (`:14007`), `excel_value_text` (`:157-165`), `_format_excel_sql_values` (`:11899`), `format_sql_value` (`:932-938`); test `tests/test_r15_sql_literals.py`
+  - ทำอะไร: ตาม R15-D12 / R15-D13 — `build_pending_values` เรียก `self._sql_identifier_db_type()` ตรง ๆ (ไม่สร้าง local ใหม่ใน enclosing scope — R15-D1); bool ด้วย `pd.api.types.is_bool`; ไม่แตะ datetime ใน `format_sql_value` (R15-Q-9); QA ลอง Reset detected mode กับ SQL ที่มี `` `Order Date` IN (...) `` หนึ่งกรณี (R15-R8, บันทึกผล ไม่ใช่ AC); รัน `python -m unittest tests.test_database_connect_gui_core tests.test_r2_reset_parameter_qa tests.test_r2_auto_where` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-30, R15-AC-31, R15-AC-32, R15-AC-33, R15-AC-34, R15-AC-35
+  - ขึ้นกับ: -
+- [x] R15-T10: BH-7 + BH-13 — ข้อความ Job ที่ไม่ได้รันหลัง DML ล้ม; poll reschedule บน root หลัก
+  - ไฟล์: `database_connect_gui.py` — `run_selected_job.run_all_jobs` (`:10328-10330`), `__init__` (`:2271`), method ใหม่ `_poll_root`, `_refresh_stop_buttons` (`:8424`, `:8444`), nested `_refresh_target_summary` (`:2797`); test `tests/test_r15_run_all_and_polls.py`
+  - ทำอะไร: ตาม R15-D8 / R15-D14 — บรรทัด `⛔ Stopped — a data-modification job failed — {N} job(s) not run` ผ่าน `root.after` ก่อน `break` เมื่อ N > 0; `self._main_root = root`; poll ทั้งสามจุดใช้ `self._poll_root().after(...)`; `_refresh_target_summary` ยังเป็น nested ใน `__init__`; รัน `python -m unittest tests.test_run_engine_batch tests.test_r14_jobs_redaction tests.test_run_lock tests.test_running_banner tests.test_list_tables_stop tests.test_r11_connection_target_snapshot` ต้องผ่าน
+  - AC ที่ครอบคลุม: R15-AC-19, R15-AC-20, R15-AC-36, R15-AC-37
+  - ขึ้นกับ: -
+- [x] R15-T11: Regression ทั้งชุด สอง mode encoding
+  - ไฟล์: - (รันเท่านั้น)
+  - ทำอะไร: `python -m unittest discover -s tests -p "test_*.py"` (ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง (cp874) + redirect stdout/stderr ไปไฟล์ → `OK` ทั้งคู่ จำนวนเท่ากัน ≥ 1220 + test ใหม่ใน `tests/test_r15_*.py`; `git diff tests/` ต้องไม่มี test เดิมถูกแก้ (ยกเว้นที่ผู้ใช้อนุมัติใน R15-R1); `git status` ไม่มีไฟล์ใหม่ / เปลี่ยนใน APP_DIR (`script_groups.json`, `saved_jobs.json`, `db_profiles.json`, `*_unreadable_*`) และ `logs/`
+  - AC ที่ครอบคลุม: R15-AC-38
+  - ขึ้นกับ: R15-T1..R15-T10
+
+## ตาราง R15-AC → Task
+
+| AC | Task | AC | Task | AC | Task |
+|---|---|---|---|---|---|
+| R15-AC-1 | R15-T1 | R15-AC-2 | R15-T1 | R15-AC-3 | R15-T1 |
+| R15-AC-4 | R15-T1 | R15-AC-5 | R15-T2 | R15-AC-6 | R15-T2 |
+| R15-AC-7 | R15-T3 | R15-AC-8 | R15-T3 | R15-AC-9 | R15-T3 |
+| R15-AC-10 | R15-T5 | R15-AC-11 | R15-T5 | R15-AC-12 | R15-T4 |
+| R15-AC-13 | R15-T4 | R15-AC-14 | R15-T4 | R15-AC-15 | R15-T4 |
+| R15-AC-16 | R15-T4 | R15-AC-17 | R15-T6 | R15-AC-18 | R15-T6 |
+| R15-AC-19 | R15-T10 | R15-AC-20 | R15-T10 | R15-AC-21 | R15-T7 |
+| R15-AC-22 | R15-T7 | R15-AC-23 | R15-T7 | R15-AC-24 | R15-T7 |
+| R15-AC-25 | R15-T7 | R15-AC-26 | R15-T8 | R15-AC-27 | R15-T8 |
+| R15-AC-28 | R15-T8 | R15-AC-29 | R15-T8 | R15-AC-30 | R15-T9 |
+| R15-AC-31 | R15-T9 | R15-AC-32 | R15-T9 | R15-AC-33 | R15-T9 |
+| R15-AC-34 | R15-T9 | R15-AC-35 | R15-T9 | R15-AC-36 | R15-T10 |
+| R15-AC-37 | R15-T10 | R15-AC-38 | R15-T1..T10 (test ใหม่), R15-T11 | | |
