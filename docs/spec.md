@@ -1486,3 +1486,342 @@ AC ใช้คำตอบที่แนะนำเป็นค่าเร�
 | R13-Q-3 | 🟢9 element ที่ไม่ใช่ dict ใน `saved_jobs` ตอน Load Preset (กด Yes): เก็บไว้ หรือทิ้ง | **เก็บไว้** — ไม่ใช่ Job ของ Profile ปัจจุบัน (สอดคล้องกับตัวนับที่ไม่นับมัน), ไม่ทำลายข้อมูลที่ไม่เข้าใจ; ในทางปฏิบัติไม่เกิดเพราะ `load_jobs` reject ตั้งแต่โหลด (R13-AC-16) |
 
 คำตอบผู้ใช้ (2026-11-23): **R13-Q-1** แก้ (ข) (ค) (ง); ยอมรับ (ก) URL ไม่ encode ที่มี `@` และ (จ) known secret ที่เป็นคำทั่วไป เป็น known limit (R13-AC-12 คงตามเดิม) · **R13-Q-2** ไม่ redact error ตอนรัน (Run / Run Job / Run All / Export / Error & Debug / reconnect) ใน Round นี้ · **R13-Q-3** element ที่ไม่ใช่ dict ใน `saved_jobs` ตอน Load Preset → เก็บไว้ในลำดับเดิม (R13-AC-16 คงตามเดิม)
+
+---
+
+# Round 14 — ซ่อนรหัสผ่านใน error ตอนรัน (ต่อจาก R13-Q-2)
+
+> ใช้เลข `R14-AC-x` / `R14-Q-x` แยกจาก Round ก่อนหน้า ไม่แก้เนื้อหา Round ก่อนหน้า
+> ที่มา: ผู้ใช้สั่งทำข้อที่ R13-Q-2 ตัดออก (ด่วน)
+> เลขบรรทัด `database_connect_gui.py` ณ 2026-11-23 (commit `00ef40b`) อาจคลาดเล็กน้อย
+
+### R14-1. เป้าหมาย / ปัญหา
+
+Round 13 redact เฉพาะ error ของ Connect / Test connection / Tables แต่ error ของ DB driver ตอน**รัน** (Run, Run Job, Run all, Export Excel) ยังออกไปดิบ ๆ ทั้ง `str(e)` และ `traceback.format_exc()` ไปยัง Execution Logs (→ `logs/run_*.log` ผ่าน `_insert_and_log` `:3316-3324`), messagebox, popup, dialog Error Details + clipboard, แท็บ Error & Debug, console (`print`) และ cell `Error` ในไฟล์ Excel. ถ้า driver / SQLAlchemy ใส่ connection string ไว้ใน error (เช่นตอน `pool_pre_ping` reconnect ใน `engine.raw_connection()` / `engine.connect()` ระหว่างรัน) รหัสผ่านจะหลุดไปทุกที่ที่กล่าวมา
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่ส่ง log / ไฟล์ Excel / screenshot ให้คนอื่น, ผู้ดูแลความปลอดภัย
+
+### R14-2. เส้นทางที่พบ (ค้นด้วย `str(e)`, `str(error)`, `format_exc`, `print_exc`, `print(... {e})`)
+
+| # | เส้นทาง | ฟังก์ชัน / บรรทัด | ปลายทาง |
+|---|---|---|---|
+| P1 | Run — worker except | `_execute_query_background.execute_in_background` `:6999-7027` (`message` `:7002`, `traceback` `:7003`, `self.last_error_details` `:7022`) | ต้นทางของ P2-P5 |
+| P2 | Run — debug print | `:7013-7019` (`Error Message`, `Full Traceback`) เมื่อ Debug mode | console |
+| P3 | Run — แสดงผล error | `on_query_error_enhanced` `:7112-7119` (`Error Message`, `Debug Traceback`) | Execution Logs + run log |
+| P4 | Run — Show Details | `_show_error_details_dialog` Label `:7172`, traceback `:7219`, `copy_error` `:7226-7233` | dialog, clipboard |
+| P5 | แท็บ Error & Debug | `_build_error_debug_tab._poll_last_error` `:9052-9060` (อ่าน `last_error_details`) | แท็บ |
+| P6 | Run — dialog ถูกปิดก่อนจบ / ผู้เรียกเดิม | `on_query_error` `:8726`, `:8732` (เรียกจาก `:7041`) | Execution Logs + run log, `messagebox.showerror` |
+| P7 | Run Job | `run_job.run_in_background` except `:10111-10113` → `finish` → `update_job_status(status="error")` `:10386` (`Error       : {error}`), popup `pd.DataFrame({"Error": [str(error)]})` `:10393` | Execution Logs + run log, popup ผลลัพธ์ (ซึ่ง export CSV/Excel ต่อได้) |
+| P8 | Run all — ต่อ Job | `run_selected_job.run_all_jobs` except `:10279-10305` → `update_job_status(..., show_popup=False)` `:10301` | Execution Logs + run log |
+| P9 | Run all — ทั้งชุดล้ม | except `:10321-10322` → `show_batch_error` `:11087` | Execution Logs + run log |
+| P10 | Export — Job ล้ม | `export_jobs_to_excel.worker` except `:11020-11040`: `log("Error : ...")` `:11028`, `log(traceback.format_exc())` `:11029`, cell `Error` `:11035` (ผ่าน `blank_oversized_cells`) | Execution Logs + run log, ไฟล์ Excel |
+| P11 | Export — fatal | `:11063-11064` → `on_done` `:10641`, `:10643` | Execution Logs + run log, `messagebox.showerror` |
+| P12 | Stop — cancel ล้ม | `stop_running_queries` `:8394-8395` `print(f"Stop: cancel failed: {e}")` (error ของ driver) | console |
+
+ตรวจแล้ว**ไม่ใช่เส้นทาง**: `show_batch_summary` (แสดงแค่ชื่อ Job ที่ล้ม), `job_results["_error"]` (ใช้ตรวจ `is None` เท่านั้น), `show_critical_error` `:11098` (ไม่มีผู้เรียก), `run_selected_job` `error_msg` `:10281` (ไม่ถูกใช้), `print("Error in error handler")` + `traceback.print_exc()` `:7124-7125` และ `Failed to append SQL` `:10962` (error ของ Tk / openpyxl ไม่ใช่ DB), debug print `Engine:` `:6965` (แสดงแค่ชื่อ dialect อยู่แล้ว)
+
+### R14-3. ขอบเขต
+
+#### In scope
+- P1-P12: ข้อความ error และ traceback ผ่าน `redact_secrets(<text>, <password ของ engine ที่รัน>)` **ที่ต้นทาง** (ก่อนเก็บลง `last_error_details` / ส่งให้ main thread / `log` / เขียน cell / ตัดความยาว / ตรวจ 32,767) — ปลายทางทั้งหมดจึงได้ข้อความเดียวกันที่ redact แล้ว
+- password = `_connected_password_for(target.engine)` อ่านครั้งเดียวบน main thread ตอนเริ่มรัน (snapshot เดียวกับ engine ของการรันนั้น) แล้วส่งให้ worker — **ไม่อ่านช่อง Password** และไม่อ่าน `_connected_password` ซ้ำใน worker
+- P12 ใช้ `_connected_password_for(self.engine)` + pattern
+- `on_query_error` (P6) redact ซ้ำด้วย pattern + `_connected_password_for(self.engine)` เพื่อคุมผู้เรียกที่ส่ง exception ดิบ (redact ซ้ำบนข้อความที่ redact แล้วไม่เปลี่ยนผล)
+
+#### Out of scope
+- redact ข้อความ SQL ของผู้ใช้เอง (cell `Query`, กล่อง Failed Query, ส่วน `QUERY` ในแท็บ Error & Debug, `print("Query: ...")`, `SQL:` / `SQL         :` ใน Execution Logs / run log) — ตาม R14-Q-1
+- เปลี่ยน `_SECRET_PATTERNS` / เกณฑ์ 4 ตัว / known limit (ก) (จ) ของ R13-Q-1
+- เปลี่ยนรูปแบบข้อความ, layout dialog, ตัวนับ, ลำดับการทำงาน; เส้นทางที่ระบุว่า "ไม่ใช่เส้นทาง" ใน R14-2
+- error ของ Connect / Test connection / Tables (ทำแล้วใน R12 / R13), commit
+
+### R14-4. User stories
+- **R14-US-1**: ในฐานะผู้ใช้ที่รัน query / Job แล้วล้ม ฉันต้องการเห็นสาเหตุจากฐานข้อมูลโดยไม่มีรหัสผ่านบนจอ ใน log ใน console หรือในไฟล์ Excel เพื่อส่งต่อให้ทีมอื่นได้อย่างปลอดภัย
+- **R14-US-2**: ในฐานะผู้ใช้ที่ไม่มี error เกี่ยวกับรหัส ฉันต้องการให้ข้อความ error และผลรันเหมือนเดิมทุกตัวอักษร
+
+### R14-5. Acceptance criteria
+
+วิธีทดสอบ: `unittest` แบบ stub เหมือน Round 13 (`DatabaseConnectorGUI.__new__`, patch `threading.Thread` ให้รัน target ทันที, `root.after` เรียกทันที, patch `messagebox` / `print` / `tk.Label` / `tk.Text` / `tk.Toplevel`, `read_sql_dataframe` / `_execute_modification` raise) ไม่ต่อ DB จริง ไม่เปิด Tk จริง; Export เขียนไฟล์จริงใน temp dir แล้วอ่านด้วย `openpyxl`; ไฟล์ test ใหม่อยู่ใน `tests/test_r14_*.py`
+
+นิยาม:
+- `PW = "S3cr;t}PW-14"`; engine ของการรัน `E` และ `_connected_password = (E, PW)`; ช่อง Password = `"field-pw-x"` (ต่างจาก `PW`)
+- "error ที่มีรหัส" (subTest): (1) ODBC ดิบ `... PWD={S3cr;t}}PW-14};Encrypt=yes ... Login failed for user 'u'.`; (2) `odbc_connect=` + `quote_plus(<ODBC ข้อ 1>)` + ` Login failed for user 'u'.`; (3) `bad password S3cr;t}PW-14 for u` (รหัสตรงตัว ไม่มี `PWD=`)
+- "ไม่รั่ว" = ไม่มี `PW`, `quote_plus(PW)`, `S3cr`, `PW-14`, `}}PW-14`, `%7D%7DPW-14`; "ไม่ mask เกิน" = ยังมี `Login failed for user 'u'` (หรือ `bad password` / `for u`)
+- "traceback" = `traceback.format_exc()` ของ exception ที่มีรหัส (ข้อความ exception อยู่ท้าย traceback)
+
+#### Run (P1-P6)
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-1 | **Given** `execute_query` บน `E`, query raise "error ที่มีรหัส" **When** worker จบ **Then** `last_error_details["message"]` และ `["traceback"]` "ไม่รั่ว"; `message` "ไม่ mask เกิน"; `["type"]` = ชื่อ class เดิม; `["query"]` = SQL เดิม |
+| R14-AC-2 | **Given** R14-AC-1 และ Debug mode เปิด **When** worker จบ **Then** ทุก `print` ที่จับได้ "ไม่รั่ว" (บรรทัด `Error Message:` และ `Full Traceback:`) |
+| R14-AC-3 | **Given** R14-AC-1 (Debug mode เปิดและปิด) **When** `on_query_error_enhanced` **Then** ทุกข้อความที่ `results_text.insert` ได้รับ (รวม `Debug Traceback`) และสิ่งที่ `_write_run_log` ได้รับ "ไม่รั่ว"; บรรทัด `Error Message: ` ยังอยู่ |
+| R14-AC-4 | **Given** `error_details` จาก R14-AC-1 **When** `_show_error_details_dialog` และกด `copy_error` **Then** `text` ของ Label, ข้อความที่ใส่ใน traceback Text และ `clipboard_append` "ไม่รั่ว" |
+| R14-AC-5 | **Given** `last_error_details` จาก R14-AC-1 **When** `_poll_last_error` ของแท็บ Error & Debug ทำงาน **Then** ข้อความที่ insert ลง `debug_text` "ไม่รั่ว" (ส่วน type: message และ TRACEBACK) |
+| R14-AC-6 | **Given** loading dialog ถูกปิดก่อน error มาถึง (`winfo_exists` → False) และกรณีเรียก `on_query_error(<exception ดิบ>, dialog)` ตรง ๆ โดย `self.engine = E` **When** `on_query_error` **Then** `results_text.insert` และ `messagebox.showerror` "ไม่รั่ว" |
+
+#### Run Job / Run all (P7-P9)
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-7 | **Given** `run_job` บน `E`, query raise "error ที่มีรหัส" **When** จบ **Then** บรรทัด `Error       : ...` ใน Execution Logs / run log และ cell `Error` ของ DataFrame ที่ส่งให้ `show_table_popup` "ไม่รั่ว" และ "ไม่ mask เกิน"; `Status      : Fail`, `_finish_job_result_report(1, 0, 1)` เหมือนเดิม |
+| R14-AC-8 | **Given** Run all 3 Job (SELECT ผ่าน, SELECT ล้มด้วย "error ที่มีรหัส", SELECT ผ่าน) **When** จบ **Then** Execution Logs / run log "ไม่รั่ว"; ตัวนับ Total / Success / Fail = 3 / 2 / 1 เหมือนเดิม; และกรณี Job modify ล้มยังหยุด loop ตามเดิม |
+| R14-AC-9 | **Given** Run all ที่ loop ภายนอก raise "error ที่มีรหัส" (เช่น `update_job_status` scheduling ล้ม) **When** `show_batch_error` **Then** Execution Logs / run log "ไม่รั่ว" และปุ่มกลับมา normal เหมือนเดิม |
+
+#### Export Excel (P10-P11)
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-10 | **Given** Export 2 Job บน `E` (Job A ผ่าน, Job B raise "error ที่มีรหัส") **When** export จบ **Then** ใน Excel sheet ของ B: `Status` = `Failed`, cell `Error` "ไม่รั่ว" และ "ไม่ mask เกิน", cell `Query` = SQL เดิมทุกตัวอักษร; บรรทัด `Error : ` และ traceback ใน Execution Logs / run log "ไม่รั่ว"; summary `Success: 1`, `Failed: 1`, `Warning: 0` เหมือนเดิม |
+| R14-AC-11 | **Given** Job ล้มด้วยข้อความ error ที่ (ก) ยาวดิบ > 32,767 แต่หลัง redact ≤ 32,767 (มี `PW` ซ้ำหลายครั้ง) และ (ข) ยาวดิบ ≤ 32,767 แต่หลัง redact > 32,767 (`PWD=` ว่างหลายครั้ง → `PWD=***`) **When** export **Then** (ก) cell `Error` = ข้อความที่ redact แล้ว ไม่มี Warning ของคอลัมน์ `Error`; (ข) cell `Error` ว่าง + log Warning `column 'Error' is over Excel's 32,767-character limit` ตามเดิม — ยืนยันว่า redact **ก่อน** ตรวจความยาว |
+| R14-AC-12 | **Given** worker export raise "error ที่มีรหัส" นอก loop ของ Job (fatal, เช่น patch `_ensure_export_target_writable`) **When** `on_done` **Then** `Error: ...` ใน Execution Logs / run log และ `messagebox.showerror` "ไม่รั่ว"; ข้อความขึ้นต้น `<ชื่อ class>: ` ตามเดิม |
+
+#### แหล่งของรหัส / อื่น ๆ
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-13 | **Given** Run / Run Job / Run all / Export เริ่มบน `E` แล้ว**ระหว่างรัน** `_connected_password` ถูกเปลี่ยนเป็น `(E2, "Other-PW-99")` และ `self.engine = E2` (reconnect) **When** error แบบ (3) ของ `E` มาถึง **Then** ทุกปลายทางของเส้นทางนั้น "ไม่รั่ว" (ใช้รหัส snapshot ตอนเริ่ม); ช่อง Password ไม่ถูกอ่านใน worker (`_FakeEntry.get` ไม่ถูกเรียกหลังเริ่มรัน) |
+| R14-AC-14 | **Given** engine ที่ไม่ได้มาจาก Connect (`_connected_password_for(E) is None`) **When** error แบบ (1) / (2) **Then** "ไม่รั่ว" (ผ่าน pattern); แบบ (3) ไม่ถูกแก้ (known limit — ตาม R14-Q-3) |
+| R14-AC-15 | **Given** `self.engine = E`, connection ปลอมที่ `cancel()` raise "error ที่มีรหัส" **When** `stop_running_queries` **Then** `print` ที่จับได้ "ไม่รั่ว" และยังขึ้นต้น `Stop: cancel failed: ` |
+
+#### ข้อกำหนดเดิมที่ต้องคง
+
+| AC | Given / When / Then |
+|---|---|
+| R14-AC-16 | **Given** error ที่ไม่มีรหัส (`ORA-00942: table or view does not exist`, `could not translate host name "x" to address`, ข้อความ SQLAlchemy ที่มี `[SQL: SELECT 1]` และลิงก์ `https://sqlalche.me/e/20/f405`) **When** ผ่าน P1-P12 **Then** ทุกปลายทาง (Execution Logs, run log, messagebox, popup, dialog, clipboard, Error & Debug, print, cell `Error` ใน Excel) เท่ากับพฤติกรรมเดิมทุกตัวอักษร และตัวนับ Success / Failed / Warning เท่าเดิม |
+| R14-AC-17 | **Given** test ใหม่ทั้งหมด **When** รัน **Then** ไม่มี `PW` / ชิ้นส่วนรหัสใน stdout / stderr, ใน `logs/` หรือไฟล์ใดนอก temp dir; `last_error_details`, `job_results`, `RunTarget`, `ConnectionInfo` ไม่มี field password (`tests/test_run_target.py` ผ่าน); ทุกบรรทัดที่มี `redact_secrets(` ยังยาว ≤ 95 (test R13-AC-9 เดิมผ่าน) |
+| R14-AC-18 | **Given** แก้ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบ ((ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง บน `cp874` + redirect stdout/stderr ไปไฟล์) **Then** ทั้งสองแบบ `OK` จำนวน test เท่ากัน และ ≥ 1182 + จำนวน test ใหม่ใน `tests/test_r14_*.py`; test เดิมไม่ถูกแก้ |
+
+**สรุปจำนวน AC Round 14**: 18 ข้อ (Run 6, Run Job / Run all 3, Export 3, แหล่งรหัส / อื่น ๆ 3, ข้อกำหนดเดิม 3)
+
+### R14-6. ข้อจำกัด / สมมติฐาน
+- ยังไม่มีหลักฐานว่า driver ใส่รหัสใน error ตอนรันจริง — ปิดความเสี่ยงล่วงหน้า ทดสอบด้วยข้อความจำลองเท่านั้น
+- error ของ SQLAlchemy มี `[SQL: ...]` อยู่ในข้อความ error — เมื่อ redact ทั้งข้อความ error ส่วน SQL **ภายในข้อความ error** ที่ตรง pattern (`password='x'`) จะถูก mask ด้วย (ฝั่งปลอดภัย) ขณะที่ช่อง SQL แยก (cell `Query` ฯลฯ) ไม่ถูกแตะตาม R14-Q-1
+- run log ได้ข้อความจาก `results_text.insert` ที่ถูกห่อ → redact ก่อน insert ครอบ run log; `print` / messagebox / Excel / clipboard ได้ข้อความเดียวกันที่ redact ที่ต้นทาง
+- รหัสอยู่ใน memory เท่านั้น ไม่ถูกเก็บใน `error_details` / `job_results` / log (ส่งผ่านเป็น argument / closure ของ worker)
+- Minimal diff: แก้เฉพาะจุด P1-P12 + การส่งรหัสจาก main thread ให้ worker; PEP 8, บรรทัด `redact_secrets(` ≤ 95; ห้าม commit
+
+### R14-7. คำถามที่ยังไม่มีคำตอบ
+
+AC เขียนตามคำตอบที่แนะนำ ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R14-Q-1 | redact ข้อความ SQL ของผู้ใช้เอง (cell `Query` ใน Excel, กล่อง Failed Query, ส่วน QUERY ในแท็บ Error & Debug, `print("Query: ...")`, `SQL:` ใน Execution Logs / run log) ที่อาจมี `password=` หรือไม่ | **ไม่ redact** — เป็นข้อความที่ผู้ใช้เขียนเอง ไม่ใช่รหัสของ connection; การ redact จะทำให้ SQL ใน Excel / log ไม่ตรงกับที่รันจริงและกระทบ SQL ปกติ (เช่น `WHERE password = 'x'` ในตาราง user) — R14-AC-1 / R14-AC-10 ตรวจว่า SQL คงเดิม |
+| R14-Q-2 | traceback เต็ม (แท็บ Error & Debug, Show Details, Copy, `Debug Traceback` ใน Execution Logs, log ของ Export, debug print) redact แค่ไหน | **redact ทั้งข้อความ traceback ด้วย `redact_secrets` (pattern + รหัสที่รู้ค่า) แต่คง traceback ไว้ครบ** ไม่ตัด / ไม่ซ่อนทั้งก้อน — ยังใช้ debug ได้; ข้อเสียคือบรรทัด source ของ library ที่ตรง pattern (เช่น `url.password = x`) อาจถูก mask บางส่วน (ฝั่งปลอดภัย) |
+| R14-Q-3 | engine ที่ไม่มีรหัสเก็บไว้ (`_connected_password_for` → `None`) ควร fallback ใช้ค่าในช่อง Password หรือไม่ | **ไม่ fallback — ใช้ pattern อย่างเดียว** ตามหลัก "รหัสของ engine ที่รันอยู่ ไม่ใช่ช่องกรอก" (ช่องกรอกอาจถูกแก้แล้วไม่ใช่รหัสของ engine); ในการใช้งานจริง engine มาจาก `connect_database` เสมอจึงมีรหัสเก็บไว้ — R14-AC-14 pin ไว้ |
+
+คำตอบผู้ใช้ (2026-11-23): **R14-Q-1** ไม่ redact SQL ที่ผู้ใช้เขียนเอง (cell `Query`, Failed Query, QUERY ในแท็บ Error & Debug, `SQL:` ใน log) · **R14-Q-2** redact ทั้งข้อความด้วย `redact_secrets` แต่คง traceback ไว้ครบ · **R14-Q-3** engine ที่ไม่มีรหัสเก็บไว้ใช้ pattern อย่างเดียว ไม่อ่านช่อง Password (R14-AC-1..18 คงตามเดิม)
+
+---
+
+# Round 15 — Bugfix จาก bug-hunter (BH-1..BH-13)
+
+> ใช้เลข `R15-AC-x` / `R15-Q-x` แยกจาก Round ก่อนหน้า ไม่แก้เนื้อหา Round ก่อนหน้า
+> ที่มา: รายงาน bug-hunter 13 ข้อ (BH-1..BH-13) — ผู้ใช้สั่งแก้ทั้งหมด; ทุก AC อ้าง BH-n
+> เลขบรรทัด `database_connect_gui.py` ณ 2026-11-24 (commit `802fd4c`) อาจคลาดเล็กน้อย
+
+### R15-1. เป้าหมาย / ปัญหา
+
+แก้บัค 13 ข้อที่ bug-hunter พบ เรียงตามความรุนแรง:
+
+| BH | ระดับ | ปัญหา (สรุป) | จุดในโค้ด |
+|---|---|---|---|
+| BH-1 | High | ปุ่ม **Reset template** ในหน้าหลักเขียน template ที่ render ใหม่**ทับข้อความที่ผู้ใช้แก้เองใน editor** หลัง Load Excel (เช่นเติม `AND branch='BKK'`) หรือหลัง Tables double-click — DELETE / UPDATE กลับมากว้างขึ้นโดยไม่มีคำเตือน (หน้า Edit Job / Edit Script ไม่เป็นเพราะเรียก `sync_edit_parameter_state()` ก่อน) | `show_reset_parameter_dialog` `:13215`, `reset_selected` `:13579-13587`, `reset_all_parameters` `:12066-12071`; เทียบ `sync_edit_parameter_state` `:4384-4391`, `:4859` |
+| BH-2 | High | Export Excel ล้ม (`AttributeError`) เมื่อผลลัพธ์มีชื่อคอลัมน์ซ้ำ — `df[col]` คืน DataFrame; Job ได้ชีต Failed | `export_jobs_to_excel.worker` ลูป `clean_value` `:10894-10901` และลูป tz `:10906-10914` |
+| BH-3 | Medium | Copy Selected / Ctrl+C / sort ใน Treeview ใช้ `tree.set(item, col)` ตามชื่อคอลัมน์ — ชื่อซ้ำได้ค่าผิดคอลัมน์ | `sort_treeview` `:9298`, `copy_selected_rows` `:9313-9319`, Ctrl+C ของ Results Grid `:8868-8871`, สร้างคอลัมน์ `:9148`, `:8960` |
+| BH-4 | Medium | `excel_db_value` ส่งวันที่ก่อน 1900-01-01 เข้า Excel ตรง ๆ → แสดง `#######` / `1900-01-00` | `:296-301` |
+| BH-5 | Medium | Tables double-click สร้าง SELECT ชี้ผิด schema / DB (Oracle ได้ `SERVICE_NAME.table`, MySQL ได้ `current_db.table`) และอ่าน `self.db_type.get()` แทน db_type ของ snapshot; ไม่ quote ชื่อ object | `list_tables` `:9371`, `:9392`, `:9624`; `on_table_double_click` `:9713-9740` |
+| BH-6 | Low | `delete_job` / `delete_selected_jobs` ไม่เช็คผล `save_jobs()` — ลบในหน่วยความจำแต่ไฟล์ไม่เปลี่ยน | `:4523-4525`, `:4279-4283` |
+| BH-7 | Low | Run all หยุดหลัง Job แก้ข้อมูล (DML) ล้ม แต่ไม่บอกว่ามีกี่ Job ที่ไม่ได้รัน (ตอนกด Stop บอก) | `:10328-10330`, `show_batch_summary` `:10419-10426`; ข้อความ Stop `:10214-10218` |
+| BH-8 | Low | Save Profile เขียนทับ Profile อื่นที่ชื่อซ้ำโดยไม่ถาม และยอมให้ใช้ชื่อสงวน `last_used_profile` | `save_profile_dialog.save` `:11462-11493`; เทียบ `new_profile_dialog.create` `:11740-11750` |
+| BH-9 | Low | `load_profile_data` แก้เฉพาะช่องที่มี key — รหัสผ่าน / ชื่อ DB ของ Profile ก่อนหน้าค้าง | `:11375-11395` |
+| BH-10 | Low | `delete_profile` ทิ้ง Job / Script Groups ของ Profile ไว้ — สร้าง Profile ชื่อเดิมใหม่แล้ว Job พวกนี้ไปผูกกับ DB ใหม่ | `:11808-11836` |
+| BH-11 | Low | `_sql_column_identifier` ใช้ `"..."` กับ MySQL ซึ่ง (ค่าเริ่มต้น ไม่มี `ANSI_QUOTES`) เป็น string literal → `WHERE "Order Date" IN (...)` เทียบข้อความคงที่ | `:11936-11942`, ผู้เรียก `:14007` |
+| BH-12 | Low | SQL literal ผิดรูป: ค่าจาก Excel วันที่ → `'2024-01-15 00:00:00'`, ตัวเลข ≥ 1e16 → `'1.23e+16'`; table data float / bool → `1001.0` / `True` | `excel_value_text` `:157-165` (ผู้เรียก `:14075`), `_format_excel_sql_values` `:11888-11918`, `format_sql_value` `:932-938` |
+| BH-13 | Low | Edit Job / Edit Script สลับ `self.root` เป็น dialog ชั่วคราว ถ้า poll ที่ reschedule ด้วย `self.root.after` ทำงานช่วงนั้น poll จะผูกกับ dialog และตายเมื่อ dialog ปิด (Stop ไม่ enable / run lock ค้าง / header target ไม่อัปเดต) | `:4403-4404`, `:4437-4438`, `:4876-4877`; poll `_refresh_stop_buttons` `:8424`, `:8444`, `_refresh_target_summary` `:2797` |
+
+ผู้ได้ประโยชน์: ผู้ใช้ที่ใช้ Excel parameter กับ DELETE / UPDATE (BH-1 ป้องกันลบเกิน), ผู้ใช้ Export / ดูผลลัพธ์ที่มี join คอลัมน์ชื่อซ้ำหรือวันที่เก่า, ผู้ใช้ Oracle / MySQL ที่ใช้ Tables, ผู้ใช้ที่จัดการ Profile / Job หลายชุด
+
+### R15-2. ขอบเขต
+
+#### In scope
+- BH-1: ปุ่ม Reset template ในหน้าหลัก — ก่อนตัดสินโหมด ให้ sync state แบบเดียวกับ `sync_edit_parameter_state()` (ข้อความ editor ≠ ที่ render ล่าสุด → ใช้ข้อความปัจจุบันเป็น template, ล้างค่า parameter, เข้า detected mode) ตาม R15-Q-1
+- BH-2: อ้างคอลัมน์ตามตำแหน่งในลูป `clean_value` และลูป tz ของ Export
+- BH-3: popup ผลลัพธ์ (`show_table_popup`) และ Results Grid — Copy Selected / Ctrl+C / sort อ่านค่าตามตำแหน่ง; หัวตารางและหัวข้อความที่ copy ยังเป็นชื่อคอลัมน์เดิม
+- BH-4: `excel_db_value` — วันที่ / เวลาที่ก่อน 1900-01-01 คืน `format_db_value(value)` (ข้อความ)
+- BH-5: Tables double-click — Oracle / MySQL / PostgreSQL ใช้ Schema ของแถวที่คลิก, SQL Server คงรูป `[db].[schema].[table]`, ใช้ db_type ที่จับไว้ตอนเริ่ม Tables, quote ชื่อตาม R15-Q-2
+- BH-6: `delete_job` / `delete_selected_jobs` rollback ด้วย `_restore_jobs_snapshot` เมื่อ `save_jobs()` คืน False
+- BH-7: Run all ที่หยุดเพราะ DML ล้ม แสดง `N job(s) not run` ตาม R15-Q-3
+- BH-8: Save Profile ถามก่อนเขียนทับ Profile อื่น และกันชื่อ `last_used_profile` ตาม R15-Q-4
+- BH-9: `load_profile_data` ล้างช่องที่ Profile ไม่มี key ตาม R15-Q-5
+- BH-10: `delete_profile` ถามว่าจะลบ Job / Script Groups ของ Profile ด้วยหรือไม่ ตาม R15-Q-6
+- BH-11: `_sql_column_identifier` quote ตามชนิด DB ตาม R15-Q-7
+- BH-12: `excel_value_text`, `_format_excel_sql_values`, `format_sql_value` ตาม R15-Q-8
+- BH-13: poll `_refresh_stop_buttons` และ `_refresh_target_summary` reschedule บน root หลักที่เก็บแยกไว้ (ไม่ใช่ `self.root` ที่อาจถูกสลับ)
+
+#### Out of scope
+- ลบโค้ดที่ไม่มีใครเรียกใช้ (เช่น `reset_single_parameter` `:12043`) — ผู้ใช้ระบุว่าอยู่นอก scope
+- เปลี่ยนการสลับ `self.root` / `self.sql_context` ใน Edit Job / Edit Script (แก้เฉพาะ poll)
+- Load Excel ในหน้าหลัก (ใช้ `_capture_sql_template` อยู่แล้ว), หน้า Edit Job / Edit Script Reset (ทำงานถูกอยู่แล้ว — ต้องคงผลเดิม)
+- Tables ของ PostgreSQL โหมด list-all: แถวที่มาจาก database อื่นยังได้ `schema.table` ที่รันกับ database ที่ connect อยู่ (ข้อจำกัดเดิมของ PostgreSQL — cross-database query ไม่ได้)
+- migrate key `WHERE "<column>"` ใน Job ที่บันทึกไว้แล้ว (BH-11 มีผลกับการเลือกค่าใหม่เท่านั้น)
+- `format_sql_value` กับค่า datetime / Timestamp (ดู R15-Q-9) และ float ที่ไม่ใช่จำนวนเต็มรูป exponent เล็ก (เช่น `1e-05`)
+- เปลี่ยนรูปแบบข้อความ / layout อื่นนอกจากที่ระบุ, commit
+
+### R15-3. User stories
+- **R15-US-1** (BH-1): ในฐานะผู้ใช้ที่ Load Excel แล้วแก้ SQL เพิ่มเงื่อนไขเอง ฉันต้องการให้ปุ่ม Reset template ไม่ลบเงื่อนไขที่ฉันเติม เพื่อไม่ให้ DELETE / UPDATE กระทบแถวมากกว่าที่ตั้งใจ
+- **R15-US-2** (BH-2, BH-3, BH-4): ในฐานะผู้ใช้ที่รัน query ที่มีคอลัมน์ชื่อซ้ำหรือวันที่เก่า ฉันต้องการ Export / copy / sort ได้ค่าที่ถูกคอลัมน์และอ่านวันที่ได้ เพื่อใช้ผลลัพธ์ต่อได้โดยไม่ต้องตรวจเอง
+- **R15-US-3** (BH-5): ในฐานะผู้ใช้ Oracle / MySQL ฉันต้องการให้ double-click ตารางใน Tables ได้ SELECT ที่ชี้ schema ที่ฉันคลิก เพื่อรันได้ทันที
+- **R15-US-4** (BH-6, BH-7): ในฐานะผู้ใช้ที่จัดการ / รัน Job ฉันต้องการให้การลบที่บันทึกไม่สำเร็จไม่ทำให้รายการเพี้ยน และรู้ว่ามีกี่ Job ที่ไม่ได้รัน เพื่อไม่เข้าใจผิดว่าทำครบแล้ว
+- **R15-US-5** (BH-8, BH-9, BH-10): ในฐานะผู้ใช้หลาย Profile ฉันต้องการไม่เขียนทับ Profile อื่นโดยไม่ตั้งใจ ไม่เห็นรหัส / ชื่อ DB ของ Profile ก่อนหน้าค้าง และเลือกได้ว่าจะลบ Job ของ Profile ที่ลบ เพื่อไม่ให้ Job ไปรันกับ DB ผิดตัว
+- **R15-US-6** (BH-11, BH-12): ในฐานะผู้ใช้ที่เลือกค่าจาก Excel / table data ฉันต้องการ SQL literal ที่ DB เข้าใจถูก (วันที่, ตัวเลขใหญ่, ชื่อคอลัมน์ MySQL) เพื่อให้เงื่อนไขกรองได้จริง
+- **R15-US-7** (BH-13): ในฐานะผู้ใช้ที่เปิด Edit Job ระหว่างมีงานรัน ฉันต้องการให้ปุ่ม Stop / run lock / header target ยังทำงานหลังปิด dialog
+
+### R15-4. Acceptance criteria
+
+วิธีทดสอบ: `unittest` แบบ stub เหมือน Round 13-14 (`DatabaseConnectorGUI.__new__`, `_FakeEntry` / `_FakeText`, patch `messagebox` / `threading.Thread` ให้รันทันที / `root.after` เรียกทันทีหรือบันทึกการเรียก) ไม่ต่อ DB จริง; ส่วนที่ต้องใช้ Treeview จริง (BH-3) ใช้ `tk.Tk()` ที่ `withdraw()` แล้ว skip เมื่อไม่มี display แบบ `tests/test_r7_script_groups_dialog_rollback.py`; Export เขียนไฟล์จริงใน temp dir แล้วอ่านด้วย `openpyxl`; ไฟล์ test ใหม่อยู่ใน `tests/test_r15_*.py`
+
+#### BH-1 — Reset template ในหน้าหลัก (ตาม R15-Q-1)
+
+นิยาม: template `T = "DELETE FROM t WHERE id IN ({IDS})"` (หรือรูปแบบ parameter ใดที่ระบบรองรับ) ถูก Load Excel ด้วยค่า `1, 2, 3` → `_excel_parameter_values` ไม่ว่าง, `_excel_parameterized_sql = R = "DELETE FROM t WHERE id IN (1, 2, 3)"`, editor = `R`
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-1 (BH-1) | **Given** สถานะตามนิยาม แล้วผู้ใช้แก้ editor เป็น `R + " AND branch='BKK'"` **When** กดปุ่ม Reset template ในหน้าหลัก (`show_reset_parameter_dialog()` ไม่มี argument) **Then** dialog เปิดใน detected mode (ค่ามาจาก IN-list ของข้อความปัจจุบัน `1, 2, 3`), ไม่มีปุ่ม `Reset All Parameters`; ก่อนเปิด dialog `sql_template` = ข้อความปัจจุบัน, `_excel_parameter_values` ว่าง, `_excel_parameterized_sql is None`; เลือกค่า `2` แล้ว `reset_selected` → editor = `DELETE FROM t WHERE id IN (1, 3) AND branch='BKK'` (เงื่อนไขที่ผู้ใช้เติมยังอยู่) |
+| R15-AC-2 (BH-1) | **Given** สถานะตามนิยาม แล้ว editor ถูกแทนด้วย `SELECT * FROM hr.employees` (เช่นจาก Tables double-click) **When** กด Reset template **Then** `messagebox.showwarning("Reset Parameter", "No parameter loaded and no IN (...) list found in the SQL", ...)` ถูกเรียก, ไม่เปิด dialog, ข้อความใน editor ไม่เปลี่ยน (ไม่มี `DELETE` กลับมา) |
+| R15-AC-3 (BH-1) | **Given** สถานะตามนิยาม และ editor = `R` (ต่างกันได้แค่ `\n` ท้าย) **When** กด Reset template **Then** พฤติกรรมเดิม: tracked mode (มีปุ่ม `Reset All Parameters`), `reset_selected` ค่า `2` → editor = render ของ template ด้วยค่าที่เหลือ; `Reset All Parameters` → editor = `T` และ `_excel_parameter_values` ว่าง |
+| R15-AC-4 (BH-1) | **Given** ไม่เคย Load Excel (`_excel_parameter_values` ว่าง, `sql_template` / `_excel_parameterized_sql` เป็น `None`) และ editor มี IN-list **When** กด Reset template **Then** ผลเหมือนเดิม (detected mode); และ Reset ในหน้า Edit Job / Edit Script (`reset_parameter_for_edit`) ทั้งกรณีแก้ข้อความและไม่แก้ ให้ผลใน `query_text` และสถานะ `edit_excel_state` เหมือนก่อนแก้ทุกตัวอักษร (state ของหน้าหลักถูกคืนครบหลังปิด) |
+
+#### BH-2 — Export Excel กับคอลัมน์ชื่อซ้ำ
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-5 (BH-2) | **Given** Export 1 Job ที่ผลลัพธ์มีคอลัมน์ `["ID", "NAME", "ID"]` แถว `(1, "a\x01b", 2)` **When** export จบ **Then** ชีตของ Job มี `Status` = `Success` (ไม่ใช่ `Failed`), หัวคอลัมน์ข้อมูลเรียง `ID`, `NAME`, `ID`, ค่าตามตำแหน่ง `1`, `ab` (illegal char ถูกเอาออกเหมือนคอลัมน์ไม่ซ้ำ), `2`; summary `Success: 1`, `Failed: 0` |
+| R15-AC-6 (BH-2) | **Given** ผลลัพธ์มีคอลัมน์ `["TS", "TS"]` ทั้งสองเป็น datetime แบบมี timezone (`Asia/Bangkok`) และอีกกรณีคอลัมน์ซ้ำที่ชนิดต่างกัน (คอลัมน์แรก object มีข้อความที่มี `\x01`, คอลัมน์ที่สองตัวเลข) **When** export **Then** export สำเร็จ, ทั้งสองคอลัมน์ TS เป็นวันที่ไม่มี timezone ค่าเท่ากับเวลาท้องถิ่นเดิม; ในกรณีชนิดต่างกัน illegal char ถูกเอาออกเฉพาะคอลัมน์ข้อความ คอลัมน์ตัวเลขค่าเดิม |
+
+#### BH-3 — Treeview กับคอลัมน์ชื่อซ้ำ
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-7 (BH-3) | **Given** `show_table_popup` (Tk จริงแบบ withdraw) กับ df คอลัมน์ `["ID", "NAME", "ID"]` แถว `(1, "a", 2)`, `(3, "b", 0)` **When** อ่านหัวตารางและเลือกทั้งสองแถวแล้ว `copy_selected_rows(tree)` **Then** หัวตารางที่แสดงเรียง `ID`, `NAME`, `ID`; clipboard = `"ID\tNAME\tID\n1\ta\t2\n3\tb\t0\n"` (ค่าตามตำแหน่ง ไม่ใช่ค่าคอลัมน์แรกซ้ำ) |
+| R15-AC-8 (BH-3) | **Given** popup จาก R15-AC-7 **When** คลิกหัวคอลัมน์ที่ 3 (คำสั่ง sort ของหัวนั้น) **Then** แถวเรียงตามค่าคอลัมน์ที่ 3 (`3 b 0` ก่อน `1 a 2`); คลิกซ้ำกลับลำดับ; คลิกหัวคอลัมน์ที่ 1 เรียงตามคอลัมน์ที่ 1 |
+| R15-AC-9 (BH-3) | **Given** Results Grid (`_render_results_grid_page`) กับ df คอลัมน์ซ้ำแบบ R15-AC-7 และอีกกรณีชื่อคอลัมน์ไม่ใช่ str (`[0, 1]`) **When** เลือกแถวแล้วกด Ctrl+C (handler ที่ bind ไว้ / `copy_selected_rows(self._rg_tree)`) **Then** clipboard มีหัวเป็นชื่อคอลัมน์เดิมและค่าตามตำแหน่ง; Tables double-click ยังได้ `values` 3 ค่าตามลำดับ (Database, Schema, Table) เหมือนเดิม |
+
+#### BH-4 — วันที่ก่อน 1900 ใน Excel
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-10 (BH-4) | **Given** ค่า `date(1899, 12, 31)`, `datetime(1850, 6, 1, 12, 0)`, `pd.Timestamp("1800-01-01")`, `datetime(1899, 12, 31, 23, 59, 59, tzinfo=timezone.utc)` **When** `excel_db_value(v)` **Then** คืน `str` เท่ากับ `format_db_value(v)`; และ `date(1900, 1, 1)`, `datetime(1900, 1, 1, 0, 0)`, `pd.Timestamp("2024-01-15 10:30")`, `time(8, 0)` คืนผลเหมือนเดิม (date / datetime ไม่มี tz / time) |
+| R15-AC-11 (BH-4) | **Given** Export Job ที่ผลลัพธ์มีคอลัมน์วันที่ `[date(1899, 12, 31), date(1900, 1, 1)]` **When** export **Then** cell แถวแรกเป็นข้อความ (`data_type == "s"`) เท่ากับ `format_db_value(date(1899, 12, 31))`; cell แถวสองยังเป็นวันที่ (`is_date`) |
+
+#### BH-5 — Tables double-click (ตาม R15-Q-2)
+
+นิยาม: เรียก `on_list_tables_success` (หรือ `list_tables` ด้วย worker stub) แล้วเรียก callback `on_double_click` ที่ส่งให้ `show_table_popup` ด้วย `values` 3 ค่า; ตรวจข้อความที่ถูก insert ลง `sql_context` และบรรทัด `📝 Inserted query: ...`
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-12 (BH-5) | **Given** db_type ของ snapshot = `Oracle`, แถว `("ORCLPDB", "hr", "employees")` **When** double-click **Then** SQL = `SELECT * FROM hr.employees` (ไม่ใช่ `ORCLPDB.employees`) |
+| R15-AC-13 (BH-5) | **Given** db_type = `MySQL`, แถว `("appdb", "sales", "orders")` **When** double-click **Then** SQL = ``SELECT * FROM `sales`.`orders` `` (ใช้ Schema ของแถว ไม่ใช่ Database) |
+| R15-AC-14 (BH-5) | **Given** db_type = `PostgreSQL` แถว `("mydb", "public", "orders")` และ db_type = `Microsoft SQL Server` แถว `("db1", "dbo", "Orders")` **When** double-click **Then** ได้ `SELECT * FROM public.orders` และ `SELECT * FROM [db1].[dbo].[Orders]` (SQL Server รูปเดิม) |
+| R15-AC-15 (BH-5) | **Given** ชื่อพิเศษ: Oracle `("X", "hr", "My Table")`; PostgreSQL `("d", "Sales", "Order Items")`, `("d", "public", 'a"b')`, `("d", "public", "order")` (คำสงวน), `("d", "public", 2024)` (Tk แปลงชื่อที่เป็นตัวเลขเป็น int); MySQL ``("d", "s", "a`b")``; SQL Server `("db", "dbo", "t]x")` **When** double-click **Then** ได้ `SELECT * FROM hr."My Table"`, `SELECT * FROM "Sales"."Order Items"`, `SELECT * FROM public."a""b"`, `SELECT * FROM public."order"`, `SELECT * FROM public."2024"`, ``SELECT * FROM `s`.`a``b` ``, `SELECT * FROM [db].[dbo].[t]]x]` ตามลำดับ |
+| R15-AC-16 (BH-5) | **Given** Tables เริ่มด้วย snapshot `info.db_type = "Oracle"` (และอีกกรณี `info is None` โดยช่อง db_type = `Oracle` ตอนเริ่ม) แล้ว**ก่อน double-click** ช่อง `self.db_type` ถูกเปลี่ยนเป็น `MySQL` **When** double-click แถว `("ORCLPDB", "hr", "employees")` **Then** SQL = `SELECT * FROM hr.employees` (ใช้ db_type ตอนเริ่ม ไม่อ่าน `self.db_type.get()` ตอน double-click) |
+
+#### BH-6 — ลบ Job แล้วบันทึกไม่สำเร็จ
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-17 (BH-6) | **Given** `saved_jobs` 3 Job, ยืนยันลบ, `save_jobs` คืน `False` **When** `delete_job(1, name)` **Then** `saved_jobs` กลับเป็น list เดิม (object เดิม, ลำดับเดิม, เนื้อหาเดิม — เทียบกับ deepcopy ก่อนลบ); ไม่มีข้อความ `🗑️ Deleted` ใน `results_text` |
+| R15-AC-18 (BH-6) | **Given** ติ๊ก 2 Job ของ Profile ปัจจุบัน, ยืนยันลบ, `save_jobs` คืน `False` **When** `delete_selected_jobs()` **Then** `saved_jobs` กลับเป็นของเดิมตาม R15-AC-17, `_checked_job_ids` เท่ากับก่อนลบ, ไม่มีข้อความ `🗑️ Deleted`; และกรณี `save_jobs` คืน `True` ทั้งสองฟังก์ชันให้ผลเหมือนเดิม (ลบ, ข้อความ `Deleted` / `Remaining`) |
+
+#### BH-7 — Run all หยุดหลัง DML ล้ม (ตาม R15-Q-3)
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-19 (BH-7) | **Given** Run all 4 Job: SELECT ผ่าน, `DELETE` ล้ม, SELECT, SELECT **When** จบ **Then** Execution Logs (และ run log) มีบรรทัดตาม R15-Q-3 ที่ลงท้าย `2 job(s) not run` อยู่**หนึ่งบรรทัด** ก่อนบล็อก `Total`; ตัวนับ `Total : 2`, `Success : 1`, `Fail : 1` เหมือนเดิม; Job ที่ 3-4 ไม่ถูกรัน |
+| R15-AC-20 (BH-7) | **Given** (ก) DML ล้มเป็น Job สุดท้าย (ข) ทุก Job ผ่าน (ค) SELECT ล้มแล้วรันต่อจนจบ (ง) กด Stop ก่อน Job ที่ 2 จาก 4 **When** จบ **Then** (ก)(ข)(ค) ไม่มีคำว่า `not run`; (ง) มีบรรทัด `⏹ Stopped — 3 job(s) not run` เดิม**บรรทัดเดียว** (ไม่มีบรรทัดของ BH-7 ซ้ำ) |
+
+#### BH-8 — Save Profile (ตาม R15-Q-4)
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-21 (BH-8) | **Given** มี Profile `A` (ปัจจุบัน) และ `B` **When** Save Profile ด้วยชื่อ `B` **Then** `messagebox.askyesno` ถูกเรียก (ข้อความมีชื่อ `B`); ตอบ No → `saved_profiles` ไม่เปลี่ยน, `save_profiles` ไม่ถูกเรียก, dialog ยังไม่ปิด; ตอบ Yes → เขียนทับ `B` แบบเดิม |
+| R15-AC-22 (BH-8) | **Given** Profile ปัจจุบัน `A` **When** Save ด้วยชื่อ `A` (ค่าที่ใส่ไว้ให้ในช่อง) หรือชื่อใหม่ `C` **Then** ไม่ถาม `askyesno`; บันทึกแบบเดิม (รวมการเก็บ `PROFILE_STORED_PASSWORD_KEY` เดิม) |
+| R15-AC-23 (BH-8) | **Given** ชื่อ `last_used_profile` หรือ `"  last_used_profile  "` **When** Save **Then** `messagebox.showwarning("Warning", "ชื่อนี้สงวนไว้ กรุณาใช้ชื่ออื่น", parent=dialog)`; `saved_profiles` ไม่เปลี่ยน, `save_profiles` ไม่ถูกเรียก |
+
+#### BH-9 — load_profile_data (ตาม R15-Q-5)
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-24 (BH-9) | **Given** โหลด Profile `A` ที่มีทุก key (user `ua`, password `pa`, host `ha`, port `1521`, db_name `da`) แล้ว Profile `B` มีแค่ `db_type`, `db_host` **When** `load_profile_data("B")` **Then** ช่อง user / password / port / db_name = `""`, host = ค่าของ `B` |
+| R15-AC-25 (BH-9) | **Given** Profile ที่ไม่มี key `db_type` / `sql_query` **When** โหลด **Then** ช่อง db_type และ SQL editor เป็นไปตาม R15-Q-5 (default: คงค่าเดิม); Profile ที่มีทุก key ให้ผลเหมือนเดิม (รวมการตัด port `3802:3802` → `3802`) |
+
+#### BH-10 — ลบ Profile (ตาม R15-Q-6)
+
+นิยาม: Profile `P` มี Job 2 ตัว (`profile == "P"`), มี Job ของ `Q` 1 ตัว, Job เก่าไม่มี key `profile` 1 ตัว, Script Group ของ `P` 1 กลุ่ม และของ `Q` 1 กลุ่ม
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-26 (BH-10) | **Given** นิยาม **When** `delete_profile()` บน `P` **Then** แสดง `messagebox.askyesnocancel` ข้อความมีจำนวน `2` Job และ `1` Script Group; ตอบ Yes → `P` ถูกลบจาก `saved_profiles`, Job ทั้ง 2 และกลุ่มของ `P` ถูกลบ แล้ว `save_profiles`, `save_jobs`, `save_script_groups` ถูกเรียก; Job ของ `Q`, Job ไม่มี key `profile`, กลุ่มของ `Q` คงอยู่ |
+| R15-AC-27 (BH-10) | **Given** นิยาม **When** ตอบ No **Then** ลบเฉพาะ Profile (Job / กลุ่มคงอยู่ — พฤติกรรมเดิม, `save_jobs` / `save_script_groups` ไม่ถูกเรียก); ตอบ Cancel **Then** ไม่มีอะไรเปลี่ยนและไม่มีการ save ใด ๆ |
+| R15-AC-28 (BH-10) | **Given** Profile ที่ไม่มี Job / กลุ่ม **When** `delete_profile()` **Then** ใช้ `askyesno` ยืนยันแบบเดิม ผลเหมือนเดิมทุกอย่าง |
+| R15-AC-29 (BH-10) | **Given** ตอบ Yes และ (ก) `save_profiles` คืน False (ข) `save_profiles` ผ่านแต่ `save_jobs` คืน False (ค) `save_jobs` ผ่านแต่ `save_script_groups` คืน False **When** ลบ **Then** (ก) ทั้ง `saved_profiles`, `saved_jobs`, `script_groups` เท่าเดิม ไม่เรียก save อื่น; (ข) Profile ถูกลบ, `saved_jobs` และ `script_groups` เท่าเดิม (ตรงกับไฟล์), มีข้อความแจ้งว่า Job / กลุ่มยังไม่ถูกลบ; (ค) Profile และ Job ถูกลบ, `script_groups` เท่าเดิม, มีข้อความแจ้งว่ากลุ่มยังไม่ถูกลบ |
+
+#### BH-11 — quote ชื่อคอลัมน์ตามชนิด DB (ตาม R15-Q-7)
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-30 (BH-11) | **Given** db_type `MySQL` **When** quote `"Order Date"`, ``"a`b"`` **Then** ได้ `` `Order Date` ``, `` `a``b` ``; db_type `Oracle` / `PostgreSQL` / `Microsoft SQL Server` ได้ `"Order Date"` และ `"a""b"` สำหรับ `'a"b'` (เหมือนเดิม); ชื่อธรรมดา `CUST_ID` และ `t.col` ไม่ถูก quote ในทุก DB |
+| R15-AC-31 (BH-11) | **Given** dialog Load Excel โหมด auto WHERE, db_type ตาม R15-Q-7 = `MySQL`, ติ๊กค่า `x` ของคอลัมน์ `Order Date` **When** Confirm **Then** SQL ที่ render มี `` `Order Date` IN ('x') `` และไม่มี `"Order Date"`; เมื่อ db_type = `Oracle` ได้ `"Order Date" IN ('x')` เหมือนเดิม |
+
+#### BH-12 — SQL literal (ตาม R15-Q-8)
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-32 (BH-12) | **Given** `excel_value_text` **When** รับ `pd.Timestamp("2024-01-15")`, `datetime(2024, 1, 15)`, `date(2024, 1, 15)`, `pd.Timestamp("2024-01-15 10:30:00")`, `1.2345678901234568e16`, `1e20`, `-1e16`, `1234.0`, `1.5`, `"abc"` **Then** ได้ `2024-01-15`, `2024-01-15`, `2024-01-15`, `2024-01-15 10:30:00`, `12345678901234568`, `100000000000000000000`, `-10000000000000000`, `1234`, `1.5`, `abc` (ไม่มี `e+` และไม่มี ` 00:00:00`) |
+| R15-AC-33 (BH-12) | **Given** `_format_excel_sql_values` **When** รับ `[pd.Timestamp("2024-01-15"), pd.Timestamp("2024-01-15 10:30")]` และ `[1.2345678901234568e16]` **Then** ได้ `'2024-01-15', '2024-01-15 10:30:00'` และ `12345678901234568`; และ end-to-end: ไฟล์ Excel ที่มีคอลัมน์วันที่ (`2024-01-15`) และคอลัมน์ตัวเลขที่มีช่องว่าง (ค่า `12345678901234567` ถูกอ่านเป็น float) → SQL ที่ render มี `'2024-01-15'` และไม่มี `e+` / ` 00:00:00` |
+| R15-AC-34 (BH-12) | **Given** `format_sql_value` **When** รับ `1001.0`, `numpy.float64(1001.0)`, `1.2345678901234568e16`, `1001.5`, `5`, `Decimal("1.10")`, `"O'Brien"`, `None`, `float("nan")` **Then** ได้ `1001`, `1001`, `12345678901234568`, `1001.5`, `5`, `1.10`, `'O''Brien'`, `NULL`, `NULL`; `render_table_variables` กับคอลัมน์ float `[1001.0, 1002.0]` ได้ `1001, 1002` |
+| R15-AC-35 (BH-12) | **Given** `format_sql_value` **When** รับ `True`, `False`, `numpy.bool_(True)` **Then** ได้ตาม R15-Q-8 (default `1`, `0`, `1`) — ไม่มี `True` / `False` |
+
+#### BH-13 — poll หลังสลับ self.root
+
+นิยาม: root หลัก = `self.root` ตอนสร้าง GUI (เก็บแยกไว้ ชื่อ attribute ให้ architect กำหนด); `self.root` ถูกตั้งเป็น dialog stub ที่บันทึกการเรียก `after`
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-36 (BH-13) | **Given** `self.root` = dialog stub ชั่วคราว **When** `_refresh_stop_buttons()` ทำงานทั้งทางปกติและทาง `_is_busy` raise **Then** `after(300, self._refresh_stop_buttons)` ถูกเรียกบน root หลัก ไม่ใช่บน dialog; เมื่อคืน `self.root` เป็น root หลักผลเหมือนเดิม |
+| R15-AC-37 (BH-13) | **Given** `self.root` = dialog stub ชั่วคราว **When** poll `_refresh_target_summary` ทำงาน (ผ่านการสร้าง UI ที่ stub หรือฟังก์ชันที่ architect แยกออกมาให้ทดสอบได้) **Then** `after(500, ...)` ถูกเรียกบน root หลัก; และกรณี `_update_target_summary` คืน False ไม่ reschedule เหมือนเดิม |
+
+#### ข้อกำหนดเดิมที่ต้องคง
+
+| AC | Given / When / Then |
+|---|---|
+| R15-AC-38 | **Given** แก้ครบ **When** รัน `python -m unittest discover -s tests -p "test_*.py"` สองแบบ ((ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง บน `cp874` + redirect stdout/stderr ไปไฟล์) **Then** ทั้งสองแบบ `OK` จำนวน test เท่ากัน และ ≥ 1220 + จำนวน test ใหม่ใน `tests/test_r15_*.py`; test เดิมไม่ถูกแก้ (ถ้า test เดิมขัดกับ AC ข้อใดของ Round นี้ ให้แจ้งหัวหน้าก่อนแก้) |
+
+**สรุปจำนวน AC Round 15**: 38 ข้อ (BH-1: 4, BH-2: 2, BH-3: 3, BH-4: 2, BH-5: 5, BH-6: 2, BH-7: 2, BH-8: 3, BH-9: 2, BH-10: 4, BH-11: 2, BH-12: 4, BH-13: 2, ข้อกำหนดเดิม: 1)
+
+### R15-5. ข้อจำกัด / สมมติฐาน
+- BH-1: "ข้อความถูกแก้" ตัดสินด้วยการเทียบข้อความ editor (ตัด `\n` ท้าย) กับ `_excel_parameterized_sql` / `sql_template` แบบเดียวกับ `_capture_sql_template` `:11870-11886` และ `sync_edit_parameter_state` — ช่องว่างที่ต่างแม้ตัวเดียวถือว่าแก้ (ฝั่งปลอดภัย: ไม่ทับ)
+- BH-1: หลัง sync ค่า parameter ที่ track ไว้ถูกล้าง (เหมือน Edit Job) — Load Excel ครั้งถัดไปใช้ข้อความปัจจุบันเป็น template
+- BH-3: ทดสอบด้วย Tk จริงแบบ withdraw (skip เมื่อไม่มี display); การเปลี่ยน column id ภายในต้องไม่เปลี่ยนข้อความหัวตาราง ความกว้าง หรือ `values` ที่ส่งให้ callback double-click
+- BH-4: ขอบล่างคือ 1900-01-01 (รวม) — ค่าที่ 1900-01-01 ขึ้นไปยังเป็นวันที่ใน Excel
+- BH-5: SQLAlchemy inspector ของ Oracle คืนชื่อที่ไม่ case-sensitive เป็นตัวเล็ก — ถ้า quote เสมอ (`"hr"."employees"`) Oracle จะหาไม่เจอ จึงต้อง quote เฉพาะเมื่อจำเป็น (R15-Q-2)
+- BH-10: Job เก่าที่ไม่มี key `profile` ไม่ถูกนับ / ลบ (ไม่รู้ว่าเป็นของ Profile ใด); ไฟล์ 3 ไฟล์เขียนแยกกัน จึงไม่ atomic ข้ามไฟล์ — ลำดับ Profile → Job → Script Groups เพื่อไม่ให้ Job หายขณะ Profile ยังอยู่
+- BH-12: การเปลี่ยน `excel_value_text` ทำให้ค่าที่**แสดง**ในรายการเลือกค่าของ dialog Load Excel เปลี่ยนตาม (เช่น `2024-01-15` แทน `2024-01-15 00:00:00`) — ถือว่าถูกต้อง; float ≥ 1e16 แสดงเป็นจำนวนเต็มของค่า float (เลขท้ายอาจไม่ตรงกับที่พิมพ์ใน Excel เพราะ float เก็บได้ ~15-17 หลัก — เป็นข้อจำกัดของการอ่าน Excel ไม่ใช่ของ Round นี้)
+- BH-13: ครอบเฉพาะ poll ที่ reschedule ตัวเอง (`:2797`, `:8424`, `:8444`); `self.root.after` แบบครั้งเดียวอื่น ๆ ไม่เปลี่ยน
+- Minimal diff, PEP 8 + type hints ในโค้ดใหม่; ห้าม commit
+
+### R15-6. คำถามที่ยังไม่มีคำตอบ
+
+AC เขียนตามคำตอบที่แนะนำ ถ้าผู้ใช้ต้องการแบบอื่นให้แจ้งก่อนเริ่ม design
+
+| # | คำถาม | คำตอบที่แนะนำ (default) |
+|---|---|---|
+| R15-Q-1 (BH-1) | ข้อความ editor ถูกแก้หลัง Load Excel: (ก) sync แบบ Edit Job (ใช้ข้อความปัจจุบันเป็น template + detected mode) หรือ (ข) เตือนแล้วไม่ทับ (ไม่เปิด dialog) | **(ก) sync** — พฤติกรรมเดียวกับ Edit Job / Edit Script ที่ผู้ใช้คุ้นแล้ว, ยังใช้ Reset ค่าใน IN-list ได้ และเงื่อนไขที่เติมไม่หาย; ข้อเสียคือการ track ค่าจาก Excel ถูกล้าง (ปุ่ม Reset All Parameters ไม่แสดง) — R15-AC-1..4 |
+| R15-Q-2 (BH-5) | รูปแบบ quote ชื่อ schema / table ใน Tables double-click | **SQL Server**: `[...]` เสมอ (รูปเดิม) + `]` → `]]`; **MySQL**: backtick ครอบเสมอ (`` `...` ``) + backtick ในชื่อเขียนซ้ำสองตัว; **Oracle / PostgreSQL**: quote `"..."` (+ `"` → `""`) **เฉพาะเมื่อจำเป็น** ตามกติกา dialect ของ SQLAlchemy (`identifier_preparer.quote`): มีตัวใหญ่, อักขระพิเศษ / ช่องว่าง, ขึ้นต้นด้วยตัวเลข, หรือเป็นคำสงวน — เพราะ Oracle inspector คืนชื่อตัวเล็กสำหรับชื่อที่ไม่ case-sensitive — R15-AC-12..15 |
+| R15-Q-3 (BH-7) | ข้อความเมื่อ Run all หยุดเพราะ DML ล้ม | `⛔ Stopped — a data-modification job failed — {N} job(s) not run` เขียนลง Execution Logs (→ run log) ก่อนบล็อก `Total`; ไม่แสดงเมื่อ N = 0; `Total` ยังนับเฉพาะ Job ที่รัน — R15-AC-19..20 |
+| R15-Q-4 (BH-8) | ถามยืนยันเมื่อใด และ No แล้วทำอะไร | ถาม `askyesno` เฉพาะเมื่อชื่อมีอยู่แล้ว**และไม่ใช่ Profile ปัจจุบัน** (`profile_combo.get()`) — Save ทับ Profile ปัจจุบันคือการใช้งานปกติ ไม่ถาม; No → ไม่บันทึกและคง dialog ไว้ให้แก้ชื่อ; ชื่อสงวนใช้ข้อความเดียวกับ New Profile; ลบข้อความ "(Existing profiles will be overwritten)" ออก**ไม่ทำ** (นอก scope) — R15-AC-21..23 |
+| R15-Q-5 (BH-9) | key ที่ไม่ใช่ช่องข้อความ (`db_type`, `sql_query`) ถ้าไม่มีใน Profile ให้ทำอย่างไร | ช่องข้อความ user / password / host / port / db_name → `config.get(key, "")`; **`db_type` ไม่มี → คงค่าเดิม** (Combobox readonly ไม่มีค่าว่างที่ถูกต้อง); **`sql_query` ไม่มี → คง editor เดิม** (เป็นงานของผู้ใช้ ไม่ใช่ข้อมูล connection) — R15-AC-24..25 |
+| R15-Q-6 (BH-10) | ลบ Profile ที่มี Job / Script Groups ทำอย่างไร | `askyesnocancel` บอกจำนวน Job / กลุ่ม: **Yes** = ลบ Profile + Job + Script Groups ของ Profile นั้น (เฉพาะที่ `profile` ตรงชื่อ), **No** = ลบเฉพาะ Profile (เดิม), **Cancel** = ไม่ทำอะไร; Profile ที่ไม่มี Job / กลุ่มใช้ยืนยันแบบเดิม; บันทึกตามลำดับ Profile → Job → Script Groups, ล้มที่ขั้นใด rollback หน่วยความจำของขั้นนั้นและที่เหลือ แล้วแจ้งผู้ใช้ — R15-AC-26..29 |
+| R15-Q-7 (BH-11) | quote ชื่อคอลัมน์ตาม db_type จากไหน | **db_type ของ connection snapshot ถ้า connect อยู่ (`_capture_run_target().info.db_type`) ไม่งั้นใช้ช่อง `self.db_type.get()`**; SQL Server / Oracle / PostgreSQL ใช้ `"..."` เหมือนเดิม, MySQL ใช้ backtick — R15-AC-30..31 |
+| R15-Q-8 (BH-12) | `format_sql_value` กับค่า bool (Python `bool` / `numpy.bool_`) ควรเป็นอะไร | **`1` / `0`** — ใช้ได้กับ SQL Server `bit`, Oracle `NUMBER(1)`, MySQL `BOOLEAN` (= `TINYINT`); ข้อเสีย: คอลัมน์ `boolean` ของ PostgreSQL ต้องใช้ `TRUE` / `FALSE` (ทางเลือก: แยกตาม db_type — ต้องส่ง db_type เข้า `format_sql_value` ซึ่งเพิ่ม diff) — R15-AC-35 |
+| R15-Q-9 (BH-12, พบเพิ่ม) | `format_sql_value` กับ datetime / `pd.Timestamp` จาก table data คืน `str(value)` แบบไม่มี quote (`2024-01-15 00:00:00`) ซึ่งเป็น SQL ผิดรูปเช่นกัน แต่ไม่อยู่ในรายการ BH-12 — แก้ใน Round นี้หรือไม่ | **ไม่แก้ใน Round นี้** (ป้องกัน scope creep) — ถ้าผู้ใช้ต้องการ ให้เพิ่ม AC: quote เป็น `'YYYY-MM-DD'` เมื่อเป็นเที่ยงคืน ไม่งั้น `'YYYY-MM-DD HH:MM:SS'` |

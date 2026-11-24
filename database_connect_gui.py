@@ -14,7 +14,7 @@ import threading
 import traceback
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, BinaryIO, Callable, Iterator, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus
 import tkinter as tk
 import tkinter.font as tkfont
@@ -42,6 +42,15 @@ DB_NULL_TEXT = "[NULL]"
 DB_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S.%f"  # shown as yyyy-MM-dd HH:mm:ss.SSS
 DB_DATE_FORMAT = "%Y-%m-%d"
 DB_TIME_FORMAT = "%H:%M:%S"
+
+
+def _treeview_column_ids(columns: Sequence[Any]) -> List[str]:
+    """Treeview column ids: the names (as str) when they are unique, otherwise
+    positional ids "c0", "c1", ... (headings still show the real names)."""
+    names = [str(column) for column in columns]
+    if len(set(names)) == len(names):
+        return names
+    return [f"c{index}" for index in range(len(names))]
 
 
 def format_db_value(value, null_text=DB_NULL_TEXT):
@@ -158,14 +167,20 @@ def excel_value_text(value):
     """Text for a value read from an Excel sheet.
 
     A number column with empty cells is read as float, so 1234 arrives as
-    1234.0 — show and use it as 1234 (what the user typed).
+    1234.0 — show and use it as 1234 (what the user typed). Whole floats of any
+    size avoid exponent form (1.23e+16); a date-only cell (midnight) is shown
+    without " 00:00:00".
     """
-    if isinstance(value, float) and value.is_integer() and abs(value) < 1e16:
+    if isinstance(value, float) and value.is_integer():
         return str(int(value))
+    if (isinstance(value, _dt.datetime) and value.tzinfo is None
+            and value.time() == _dt.time(0) and getattr(value, "nanosecond", 0) == 0):
+        return value.date().isoformat()
     return str(value)
 
 
 EXCEL_MAX_EXACT_DIGITS = 15  # Excel keeps only 15 significant digits
+EXCEL_MIN_DATE = _dt.date(1900, 1, 1)  # Excel cannot show dates before this
 EXCEL_MAX_DATA_ROWS = 1_048_575
 
 
@@ -293,11 +308,17 @@ def excel_db_value(value):
         if len(number.as_tuple().digits) > EXCEL_MAX_EXACT_DIGITS:
             return format_db_value(value)
         return int(number) if number == number.to_integral_value() else float(number)
+    original = value
     if isinstance(value, pd.Timestamp):
         value = value.to_pydatetime()
     if isinstance(value, _dt.datetime):
-        return value.replace(tzinfo=None)
-    if isinstance(value, (_dt.date, _dt.time)):
+        naive = value.replace(tzinfo=None)
+        if naive.date() < EXCEL_MIN_DATE:
+            return format_db_value(original)
+        return naive
+    if isinstance(value, _dt.date):
+        return format_db_value(original) if value < EXCEL_MIN_DATE else value
+    if isinstance(value, _dt.time):
         return value
     return format_db_value(value)
 
@@ -509,6 +530,35 @@ def _target_summary_text(
     main_text = f"{db_type} · {user}@{host}" + (f":{port}" if port else "")
     sub_text = f"Database / Service: {database}" if database else "Database: (default)"
     return main_text, sub_text
+
+
+def _quote_identifier_if_needed(name: Any, db_type: str) -> str:
+    """Oracle / PostgreSQL (and other non-MySQL / non-SQL Server types): quote with
+    "..." only when the dialect requires it (upper case, special chars, leading
+    digit, reserved word) - SQLAlchemy identifier_preparer.quote."""
+    if db_type == "Oracle":
+        from sqlalchemy.dialects.oracle.base import OracleDialect as dialect_cls
+    else:
+        from sqlalchemy.dialects.postgresql.base import PGDialect as dialect_cls
+    return dialect_cls().identifier_preparer.quote(str(name))
+
+
+def _tables_select_sql(db_type: str, database: Any, schema: Any, table: Any) -> str:
+    """SELECT * for a row (Database, Schema, Table) of the Tables window."""
+    if db_type == "Microsoft SQL Server":
+        parts = (str(database), str(schema), str(table))
+        return "SELECT * FROM " + ".".join(
+            "[" + part.replace("]", "]]") + "]" for part in parts
+        )
+    if db_type == "MySQL":
+        parts = (str(schema), str(table))
+        return "SELECT * FROM " + ".".join(
+            "`" + part.replace("`", "``") + "`" for part in parts
+        )
+    return (
+        f"SELECT * FROM {_quote_identifier_if_needed(schema, db_type)}"
+        f".{_quote_identifier_if_needed(table, db_type)}"
+    )
 
 
 _SQL_WORD_RE = re.compile(r"[^\W\d][\w$#@]*|[#@][\w$#@]*")
@@ -935,6 +985,10 @@ def format_sql_value(value):
         return "NULL"
     if isinstance(value, str):
         return "'" + value.replace("'", "''") + "'"
+    if pd.api.types.is_bool(value):  # bool and numpy.bool_ -> 1 / 0
+        return "1" if value else "0"
+    if isinstance(value, float) and value.is_integer():  # 1001.0 -> 1001
+        return str(int(value))
     return str(value)
 
 
@@ -2269,6 +2323,7 @@ class DatabaseConnectorGUI:
 
     def __init__(self, root):
         self.root = root
+        self._main_root = root  # polls reschedule here even while self.root is a dialog
         self.root.title("Database Connector")
         self.root.geometry("1200x900")
         self.root.configure(bg=UI["bg"])
@@ -2794,7 +2849,7 @@ class DatabaseConnectorGUI:
         def _refresh_target_summary() -> None:
             """Read-only: show the connection target under the profile picker."""
             if self._update_target_summary(target_main, target_sub):
-                self.root.after(500, _refresh_target_summary)
+                self._poll_root().after(500, _refresh_target_summary)
 
         def _toggle_creds():
             self.creds_expanded = not self.creds_expanded
@@ -4277,9 +4332,17 @@ class DatabaseConnectorGUI:
             return
 
         selected_ids = {id(job) for job in selected}
+        jobs_before = self.saved_jobs
+        original_jobs = list(jobs_before)
+        snapshot = copy.deepcopy(original_jobs)
+        checked_before = set(self._checked_job_ids)
         self.saved_jobs = [job for job in self.saved_jobs if id(job) not in selected_ids]
         self._checked_job_ids -= selected_ids
-        self.save_jobs()
+        if not self.save_jobs():
+            self._restore_jobs_snapshot(jobs_before, original_jobs, snapshot)
+            self._checked_job_ids.clear()
+            self._checked_job_ids.update(checked_before)
+            return
         self.update_jobs_list()
 
         self.results_text.delete("1.0", tk.END)
@@ -4520,8 +4583,13 @@ class DatabaseConnectorGUI:
             "Confirm Delete", f"Delete job '{job_name}'?\n\nThis cannot be undone."
         )
         if result:
+            jobs_before = self.saved_jobs
+            original_jobs = list(jobs_before)
+            snapshot = copy.deepcopy(original_jobs)
             self.saved_jobs.pop(job_idx)
-            self.save_jobs()
+            if not self.save_jobs():
+                self._restore_jobs_snapshot(jobs_before, original_jobs, snapshot)
+                return
             self.update_jobs_list()
 
             self.results_text.delete("1.0", tk.END)
@@ -6940,15 +7008,20 @@ class DatabaseConnectorGUI:
         return loading_dialog
 
     def _execute_query_background(
-        self, sql_query, loading_dialog, engine: Any = None, debug_mode=None
+        self, sql_query, loading_dialog, engine: Any = None, debug_mode=None,
+        password: Optional[str] = None,
     ) -> None:
         """NEW: Execute query in background with comprehensive error logging.
 
         engine: the run's engine, taken on the main thread (None -> self.engine).
-        The worker never reads self.engine.
+        password: the run's Connect password, used only to mask errors
+        (None -> read here on the main thread for `engine`).
+        The worker never reads self.engine or the stored password.
         """
         if engine is None:
             engine = self.engine
+        if password is None:
+            password = self._connected_password_for(engine)
         if debug_mode is None:
             debug_mode = self.debug_mode.get()
 
@@ -6999,8 +7072,8 @@ class DatabaseConnectorGUI:
             except Exception as e:
                 # Comprehensive error logging
                 error_type = type(e).__name__
-                error_message = str(e)
-                error_traceback = traceback.format_exc()
+                error_message = redact_secrets(str(e), password)
+                error_traceback = redact_secrets(traceback.format_exc(), password)
 
                 # Store error details for retry
                 error_details = {
@@ -8383,6 +8456,8 @@ class DatabaseConnectorGUI:
         self._stop_event.set()
         with self._active_db_lock:
             connections = list(self._active_db_connections.values())
+        # Only to mask cancel errors; Stop may come before any Connect (no engine yet)
+        password = self._connected_password_for(getattr(self, "engine", None))
         cancelled = 0
         for dbapi_connection in connections:
             cancel = getattr(dbapi_connection, "cancel", None)  # Oracle (python-oracledb)
@@ -8392,7 +8467,7 @@ class DatabaseConnectorGUI:
                 cancel()
                 cancelled += 1
             except Exception as e:
-                print(f"Stop: cancel failed: {e}")
+                print(f"Stop: cancel failed: {redact_secrets(str(e), password)}")
         if cancelled:
             msg = f"\n⏹ Stop requested — cancelled {cancelled} running query(ies); remaining jobs are skipped.\n"
         else:
@@ -8407,6 +8482,12 @@ class DatabaseConnectorGUI:
         self._stop_buttons.append(button)
         button.config(state="disabled")
 
+    def _poll_root(self) -> Any:
+        """Main window for self-rescheduling polls: self.root may be swapped to an
+        Edit Job / Edit Script dialog for a while."""
+        root = getattr(self, "_main_root", None)
+        return self.root if root is None else root
+
     def _refresh_stop_buttons(self):
         """Poll: Stop buttons are enabled only while something runs; run/connect/
         profile controls are locked meanwhile."""
@@ -8414,7 +8495,7 @@ class DatabaseConnectorGUI:
             busy = self._is_busy()
         except Exception as e:  # never let a failed check stop this poll
             print(f"Busy check failed: {e}")
-            self.root.after(300, self._refresh_stop_buttons)
+            self._poll_root().after(300, self._refresh_stop_buttons)
             return
         try:
             state = "normal" if busy else "disabled"
@@ -8434,7 +8515,7 @@ class DatabaseConnectorGUI:
             self._apply_run_lock(busy)
         except Exception as e:  # never let the lock step stop this poll
             print(f"Run lock refresh failed: {e}")
-        self.root.after(300, self._refresh_stop_buttons)
+        self._poll_root().after(300, self._refresh_stop_buttons)
 
     def _register_run_lock_button(self, button, idle_state: Callable[[], str]) -> None:
         """Lock `button` while a run is in progress; idle_state() gives its state when idle."""
@@ -8636,8 +8717,10 @@ class DatabaseConnectorGUI:
 
         # Execute query in background thread
         debug_mode = self.debug_mode.get()
+        run_password = self._connected_password_for(target.engine)
         self._execute_query_background(
-            sql_query, loading_dialog, engine=target.engine, debug_mode=debug_mode
+            sql_query, loading_dialog, engine=target.engine, debug_mode=debug_mode,
+            password=run_password,
         )
 
     def on_modification_success(self, rows_affected, sql_query, loading_dialog):
@@ -8713,6 +8796,8 @@ class DatabaseConnectorGUI:
 
     def on_query_error(self, error, loading_dialog):
         """Handle query execution error"""
+        # Safety net: callers may pass a raw exception that holds the password
+        error_text = redact_secrets(str(error), self._connected_password_for(self.engine))
         try:
             # Close loading dialog
             loading_dialog.destroy()
@@ -8723,13 +8808,13 @@ class DatabaseConnectorGUI:
         self.results_text.delete("1.0", tk.END)
         self.results_text.insert(tk.END, "❌ QUERY ERROR\n")
         self.results_text.insert(tk.END, "=" * 150 + "\n\n")
-        self.results_text.insert(tk.END, f"Error: {str(error)}\n\n")
+        self.results_text.insert(tk.END, f"Error: {error_text}\n\n")
         self.results_text.see(tk.END)
 
         # Re-enable execute button
         self.execute_btn.config(state="normal", text="▶  Run")
 
-        messagebox.showerror("Query Error", f"Failed to execute query:\n\n{str(error)}")
+        messagebox.showerror("Query Error", f"Failed to execute query:\n\n{error_text}")
 
     # ------------------------------------------------------------------
     # Results Drawer UI (presentation only — reuses export_to_csv,
@@ -8946,15 +9031,16 @@ class DatabaseConnectorGUI:
 
         tree = self._rg_tree
         tree.delete(*tree.get_children())
-        columns = [str(c) for c in df.columns]
-        tree["columns"] = columns
+        names = [str(c) for c in df.columns]
+        column_ids = _treeview_column_ids(names)
+        tree["columns"] = column_ids
         start = page * size
         sample = df.iloc[start : start + 50]
-        for pos, col in enumerate(columns):
+        for pos, (col_id, col) in enumerate(zip(column_ids, names)):
             longest_value = max([0] + [len(format_db_value(v)) for v in sample.iloc[:, pos]])
             width = max(len(col) * 10, longest_value * 8) + 24
-            tree.heading(col, text=col, anchor="w")
-            tree.column(col, width=min(360, max(90, width)), anchor="w", stretch=False)
+            tree.heading(col_id, text=col, anchor="w")
+            tree.column(col_id, width=min(360, max(90, width)), anchor="w", stretch=False)
 
         for i, row in enumerate(df.iloc[start : start + size].itertuples(index=False, name=None)):
             values = [format_db_value(v) for v in row]
@@ -9132,9 +9218,10 @@ class DatabaseConnectorGUI:
         tree_scroll_y = ttk.Scrollbar(table_frame, orient=tk.VERTICAL)
         tree_scroll_x = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL)
 
+        column_ids = _treeview_column_ids(df.columns)
         tree = ttk.Treeview(
             table_frame,
-            columns=list(df.columns),
+            columns=column_ids,
             show="headings",
             yscrollcommand=tree_scroll_y.set,
             xscrollcommand=tree_scroll_x.set,
@@ -9150,9 +9237,11 @@ class DatabaseConnectorGUI:
         tree_scroll_x.grid(row=1, column=0, sticky=(tk.W, tk.E))
 
         # Configure columns
-        for col in df.columns:
-            tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(tree, c, False))
-            tree.column(col, width=150, minwidth=100, anchor=tk.W)
+        for col_id, col in zip(column_ids, df.columns):
+            tree.heading(
+                col_id, text=col, command=lambda c=col_id: self.sort_treeview(tree, c, False)
+            )
+            tree.column(col_id, width=150, minwidth=100, anchor=tk.W)
 
         # Add double-click event if callback provided
         if on_double_click:
@@ -9300,11 +9389,11 @@ class DatabaseConnectorGUI:
 
             # Get column names
             columns = tree["columns"]
-            text = "\t".join(columns) + "\n"
+            text = "\t".join(str(tree.heading(col, "text")) for col in columns) + "\n"
 
             # Get selected rows
             for item in selected:
-                values = [tree.set(item, col) for col in columns]
+                values = [str(tree.set(item, col)) for col in columns]
                 text += "\t".join(values) + "\n"
 
             # Copy to clipboard
@@ -9619,7 +9708,7 @@ class DatabaseConnectorGUI:
                 self.root.after(
                     0,
                     lambda: self.on_list_tables_success(
-                        table_list, loading_dialog, bool(current_db_name)
+                        table_list, loading_dialog, bool(current_db_name), db_type=db_type
                     ),
                 )
 
@@ -9669,7 +9758,9 @@ class DatabaseConnectorGUI:
         self._register_stop_button(stop_btn)
         return loading_dialog
 
-    def on_list_tables_success(self, table_list, loading_dialog, has_database=True):
+    def on_list_tables_success(
+        self, table_list, loading_dialog, has_database=True, db_type: Optional[str] = None
+    ):
         """Handle successful table listing"""
         try:
             # Close loading dialog
@@ -9708,19 +9799,9 @@ class DatabaseConnectorGUI:
                     schema = values[1]
                     table = values[2]
 
-                    # Generate query based on database type
-                    if self.db_type.get() == "Microsoft SQL Server":
-                        query = f"SELECT * FROM [{database}].[{schema}].[{table}]"
-                    elif self.db_type.get() == "Oracle":
-                        # Oracle uses schema.table format (database is schema in Oracle)
-                        query = f"SELECT * FROM {database}.{table}"
-                    elif self.db_type.get() == "MySQL":
-                        # MySQL: database.table (no schema concept in MySQL like PostgreSQL)
-                        query = f"SELECT * FROM {database}.{table}"
-                    else:
-                        # PostgreSQL: database.schema.table format not directly supported
-                        # Use schema.table for currently connected database
-                        query = f"SELECT * FROM {schema}.{table}"
+                    # db_type of the Tables run (older callers: the field now)
+                    run_db_type = db_type if db_type is not None else self.db_type.get()
+                    query = _tables_select_sql(run_db_type, database, schema, table)
 
                     # Insert into SQL query area
                     self.sql_context.delete(1.0, tk.END)
@@ -10034,6 +10115,8 @@ class DatabaseConnectorGUI:
         self._ui_progress = {"total": 0, "index": 0, "name": job.get("name", ""), "kind": "job"}
         self._start_stoppable_run(target=target)
         engine = target.engine
+        # Read once on the main thread; the worker only masks errors with it
+        run_password = self._connected_password_for(engine)
 
         # หาเลขลำดับของ Job ตาม Saved Jobs
         current_profile = self.profile_combo.get()
@@ -10110,7 +10193,10 @@ class DatabaseConnectorGUI:
 
             except Exception as e:
                 elapsed = time.perf_counter() - start_time
-                self.root.after(0, lambda err=e: finish("error", error=err, query_time=elapsed))
+                err_text = redact_secrets(str(e), run_password)
+                self.root.after(
+                    0, lambda err=err_text: finish("error", error=err, query_time=elapsed)
+                )
 
         threading.Thread(target=run_in_background, daemon=True).start()
 
@@ -10154,6 +10240,8 @@ class DatabaseConnectorGUI:
         # The run's engine + destination, taken once here: every job of this
         # run uses this engine even if self.engine changes meanwhile
         run_engine = target.engine
+        # Read once on the main thread; the worker only masks errors with it
+        run_password = self._connected_password_for(run_engine)
         if not self._confirm_data_change(
             [{"name": job.get("name"), "query": run_sql[id(job)]} for job in profile_jobs],
             target=target,
@@ -10296,9 +10384,10 @@ class DatabaseConnectorGUI:
                             }
                         )
 
+                        err_text = redact_secrets(str(e), run_password)
                         self.root.after(
                             0,
-                            lambda i=idx, j=job, err=e, qt=elapsed_time: self.update_job_status(
+                            lambda i=idx, j=job, err=err_text, qt=elapsed_time: self.update_job_status(
                                 i, j, "error", error=err, query_time=qt, show_popup=False
                             ),
                         )
@@ -10308,6 +10397,16 @@ class DatabaseConnectorGUI:
                         # If so, stop execution immediately
                         if not self.is_select_query(job_sql):
                             # Stop execution - break the loop
+                            not_run = len(profile_jobs) - idx
+                            if not_run:
+                                self.root.after(
+                                    0,
+                                    lambda n=not_run: self.results_text.insert(
+                                        tk.END,
+                                        "⛔ Stopped — a data-modification job failed"
+                                        f" — {n} job(s) not run\n",
+                                    ),
+                                )
                             break
 
                 # Append the run summary after every job result.
@@ -10319,7 +10418,8 @@ class DatabaseConnectorGUI:
                 )
 
             except Exception as e:
-                self.root.after(0, lambda err=e: self.show_batch_error(err))
+                batch_err = redact_secrets(str(e), run_password)
+                self.root.after(0, lambda err=batch_err: self.show_batch_error(err))
 
         # Start background thread
         thread = threading.Thread(target=run_all_jobs, daemon=True)
@@ -10604,6 +10704,8 @@ class DatabaseConnectorGUI:
 
         # The run's engine + destination, taken once here and used by the worker
         export_engine = target.engine
+        # Read once on the main thread; the worker only masks errors with it
+        export_password = self._connected_password_for(export_engine)
         jobs = self._reuse_last_run_results(jobs_to_export)
         if jobs is None:
             return  # User cancelled
@@ -10869,6 +10971,9 @@ class DatabaseConnectorGUI:
                                 # so the data matches the database exactly
                                 return value
 
+                            original_columns = list(df.columns)
+                            # BH-2: duplicate names -> unique positions
+                            df.columns = range(len(original_columns))
                             for col in df.columns:
 
                                 try:
@@ -10890,6 +10995,7 @@ class DatabaseConnectorGUI:
                                             illegal_chars.sub("", v) if isinstance(v, str) else v
                                         )
                                     )
+                            df.columns = original_columns
 
                             from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
@@ -11021,18 +11127,20 @@ class DatabaseConnectorGUI:
                             failed += 1
                             import traceback
 
+                            # Masked once; the log and the Excel cell use the same text
+                            error_text = redact_secrets(str(job_err), export_password)
                             log("\n=================================\n")
                             log(f"Job Failed : {job_name}\n")
                             log(f"Sheet : {sheet}\n")
                             log(f"Error Type : {type(job_err).__name__}\n")
-                            log(f"Error : {str(job_err)}\n")
-                            log(traceback.format_exc())
+                            log(f"Error : {error_text}\n")
+                            log(redact_secrets(traceback.format_exc(), export_password))
                             log("\n=================================\n")
 
                             # ยังสร้าง Sheet ของ Job นี้ไว้ เพื่อให้ 1 Job = 1 Sheet ครบ
                             failed_row = blank_oversized_cells(
                                 job_name,
-                                {"Status": "Failed", "Error": str(job_err), "Query": query},
+                                {"Status": "Failed", "Error": error_text, "Query": query},
                             )
                             pd.DataFrame(
                                 {k: [v] for k, v in failed_row.items()}
@@ -11061,7 +11169,7 @@ class DatabaseConnectorGUI:
                     temp_path = None  # nothing left to delete
 
             except Exception as e:
-                fatal_error = f"{type(e).__name__}: {str(e)}"
+                fatal_error = f"{type(e).__name__}: {redact_secrets(str(e), export_password)}"
             finally:
                 if temp_handle is not None and not temp_handle.closed:
                     try:
@@ -11350,25 +11458,22 @@ class DatabaseConnectorGUI:
             # Update UI fields
             if "db_type" in config:
                 self.db_type.set(config["db_type"])
-            if "db_user" in config:
-                self.db_user.delete(0, tk.END)
-                self.db_user.insert(0, config["db_user"])
-            if "db_password" in config:
-                self.db_password.delete(0, tk.END)
-                self.db_password.insert(0, config["db_password"])
-            if "db_host" in config:
-                self.db_host.delete(0, tk.END)
-                self.db_host.insert(0, config["db_host"])
-            if "db_port" in config:
-                # Clean port value when loading - remove duplicates like '3802:3802'
-                port_value = str(config["db_port"]).strip()
-                if ":" in port_value:
-                    port_value = port_value.split(":")[0]
-                self.db_port.delete(0, tk.END)
-                self.db_port.insert(0, port_value)
-            if "db_name" in config:
-                self.db_name.delete(0, tk.END)
-                self.db_name.insert(0, config["db_name"])
+            # Text fields missing from the profile are cleared, so values of
+            # the previously loaded profile never linger
+            self.db_user.delete(0, tk.END)
+            self.db_user.insert(0, config.get("db_user", ""))
+            self.db_password.delete(0, tk.END)
+            self.db_password.insert(0, config.get("db_password", ""))
+            self.db_host.delete(0, tk.END)
+            self.db_host.insert(0, config.get("db_host", ""))
+            # Clean port value when loading - remove duplicates like '3802:3802'
+            port_value = str(config.get("db_port", "")).strip()
+            if ":" in port_value:
+                port_value = port_value.split(":")[0]
+            self.db_port.delete(0, tk.END)
+            self.db_port.insert(0, port_value)
+            self.db_name.delete(0, tk.END)
+            self.db_name.insert(0, config.get("db_name", ""))
             if "sql_query" in config:
                 self.sql_context.delete(1.0, tk.END)
                 saved_sql = config["sql_query"].strip()
@@ -11440,6 +11545,16 @@ class DatabaseConnectorGUI:
             if not profile_name:
                 messagebox.showwarning("Warning", "กรุณาใส่ชื่อ Profile", parent=dialog)
                 return
+            if profile_name == "last_used_profile":
+                messagebox.showwarning("Warning", "ชื่อนี้สงวนไว้ กรุณาใช้ชื่ออื่น", parent=dialog)
+                return
+            if profile_name in self.saved_profiles and profile_name != current_profile:
+                if not messagebox.askyesno(
+                    "Overwrite Profile",
+                    f"มี Profile '{profile_name}' อยู่แล้ว\nต้องการบันทึกทับหรือไม่?",
+                    parent=dialog,
+                ):
+                    return  # dialog stays open to change the name
 
             # Clean port before saving
             port_value = self.db_port.get().strip()
@@ -11794,9 +11909,33 @@ class DatabaseConnectorGUI:
             messagebox.showwarning("Warning", "ไม่พบ Profile นี้")
             return
 
-        result = messagebox.askyesno(
-            "Confirm Delete", f"ต้องการลบ Profile '{profile_name}' หรือไม่?"
-        )
+        profile_jobs = [
+            job for job in getattr(self, "saved_jobs", [])
+            if isinstance(job, dict) and job.get("profile") == profile_name
+        ]
+        profile_groups = [
+            group for group in self._ensure_script_groups_loaded()
+            if isinstance(group, dict) and group.get("profile") == profile_name
+        ]
+        delete_owned = False
+        if not profile_jobs and not profile_groups:
+            result = messagebox.askyesno(
+                "Confirm Delete", f"ต้องการลบ Profile '{profile_name}' หรือไม่?"
+            )
+        else:
+            answer = messagebox.askyesnocancel(
+                "Confirm Delete",
+                f"ต้องการลบ Profile '{profile_name}' หรือไม่?\n\n"
+                f"Profile นี้มี {len(profile_jobs)} Job และ "
+                f"{len(profile_groups)} Script Group\n"
+                "Yes = ลบ Job และ Script Group ของ Profile นี้ด้วย\n"
+                "No = ลบเฉพาะ Profile\n"
+                "Cancel = ยกเลิก",
+            )
+            if answer is None:
+                return
+            result = True
+            delete_owned = bool(answer)
         if result:
             previous_profiles = dict(self.saved_profiles)
             del self.saved_profiles[profile_name]
@@ -11804,11 +11943,60 @@ class DatabaseConnectorGUI:
                 self.saved_profiles.clear()
                 self.saved_profiles.update(previous_profiles)
                 return
+            notes = (
+                self._delete_profile_jobs_and_groups(profile_name)
+                if delete_owned else []
+            )
             self.update_profile_list()
             self.results_text.insert(tk.END, f"🗑️ Deleted profile: {profile_name}\n\n")
+            for note in notes:
+                self.results_text.insert(tk.END, f"{note}\n")
             self.results_text.see(tk.END)
 
-            messagebox.showinfo("Success", f"ลบ Profile '{profile_name}' เรียบร้อย")
+            if notes:
+                messagebox.showwarning("Delete Profile", "\n".join(notes))
+            else:
+                messagebox.showinfo("Success", f"ลบ Profile '{profile_name}' เรียบร้อย")
+
+    def _delete_profile_jobs_and_groups(self, profile_name: str) -> List[str]:
+        """After the profile itself was saved as deleted: remove its jobs, then its
+        Script Groups. A failed save rolls back that step and skips the next.
+        Returns warning lines for the user (empty = all removed)."""
+        jobs = getattr(self, "saved_jobs", [])
+        removed_jobs = [
+            job for job in jobs
+            if isinstance(job, dict) and job.get("profile") == profile_name
+        ]
+        if removed_jobs:
+            jobs_before = list(jobs)
+            removed_ids = {id(job) for job in removed_jobs}
+            jobs[:] = [job for job in jobs if id(job) not in removed_ids]
+            if not self.save_jobs():
+                jobs[:] = jobs_before
+                return [
+                    "⚠️ ลบ Profile แล้ว แต่ลบ Job / Script Group ของ Profile นี้"
+                    "ไม่สำเร็จ — ยังอยู่ครบ"
+                ]
+            checked = getattr(self, "_checked_job_ids", None)
+            if isinstance(checked, set):
+                checked -= removed_ids
+
+        groups = self._ensure_script_groups_loaded()
+        groups_before = list(groups)
+        groups[:] = [
+            group for group in groups
+            if not (isinstance(group, dict) and group.get("profile") == profile_name)
+        ]
+        if len(groups) == len(groups_before):
+            return []
+        if not self.save_script_groups():
+            groups[:] = groups_before
+            return [
+                "⚠️ ลบ Profile และ Job แล้ว แต่ลบ Script Group ไม่สำเร็จ"
+                " — Script Group ยังอยู่"
+            ]
+        self._refresh_script_groups_window(None)
+        return []
 
     @staticmethod
     def _excel_state_for_job(query, template, values, rendered):
@@ -11861,6 +12049,20 @@ class DatabaseConnectorGUI:
 
         return self.sql_template
 
+    def _sync_parameter_state_with_editor(self) -> None:
+        """Before Reset: if the SQL text no longer equals the last rendered SQL, the
+        current text becomes the template and tracked Excel values are dropped
+        (same rule as sync_edit_parameter_state of Edit Job / Edit Script)."""
+        if not self._excel_parameter_values:
+            return  # detected mode anyway - leave sql_template / rendered untouched
+        current_sql = self.sql_context.get("1.0", tk.END).rstrip("\n")
+        if current_sql == getattr(self, "_excel_parameterized_sql", None):
+            return
+        if current_sql != getattr(self, "sql_template", None):
+            self.sql_template = current_sql
+            self._excel_parameter_values.clear()
+            self._excel_parameterized_sql = None
+
     def _format_excel_sql_values(self, values):
         import numbers
 
@@ -11872,7 +12074,7 @@ class DatabaseConnectorGUI:
                 continue
 
             # Convert to string and clean unwanted quotes
-            cleaned_value = str(value).strip()
+            cleaned_value = excel_value_text(value).strip()
 
             # Remove quotes accidentally coming from Excel (both ends, so
             # 'ABC' does not become the broken literal '''ABC')
@@ -11910,12 +12112,24 @@ class DatabaseConnectorGUI:
         raise ValueError(f"SQL template no longer contains {column} IN (...)")
 
     @staticmethod
-    def _sql_column_identifier(column_name):
-        """Excel header -> SQL column (quoted only if it is not a plain name)."""
+    def _sql_column_identifier(column_name, db_type: Optional[str] = None):
+        """Excel header -> SQL column (quoted only if it is not a plain name;
+        MySQL uses backticks, other databases double quotes)."""
         column_name = str(column_name).strip()
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$#]*(\.[A-Za-z_][A-Za-z0-9_$#]*)*", column_name):
             return column_name
+        if db_type == "MySQL":
+            return "`" + column_name.replace("`", "``") + "`"
         return '"' + column_name.replace('"', '""') + '"'
+
+    def _sql_identifier_db_type(self) -> str:
+        """db_type used to quote Excel column names (R15-Q-7): the connected
+        snapshot's when connected, otherwise the Details field."""
+        target = self._capture_run_target()
+        if target is not None and target.info is not None:
+            return target.info.db_type
+        field = getattr(self, "db_type", None)
+        return field.get() if field is not None else ""
 
     @staticmethod
     def _append_where_conditions(sql, conditions):
@@ -13188,6 +13402,7 @@ class DatabaseConnectorGUI:
     def show_reset_parameter_dialog(self, close_after_selected=False, wait=False):
         # No tracked Excel parameters (e.g. a job saved with values typed into
         # the SQL): fall back to the IN (...) lists found in the SQL itself.
+        self._sync_parameter_state_with_editor()
         detected_mode = not self._excel_parameter_values
         detected = []
         if detected_mode:
@@ -13980,7 +14195,8 @@ class DatabaseConnectorGUI:
                 for column in columns_with_selection():
                     sql_values = self._format_excel_sql_values(selected_of(column))
                     if sql_values:
-                        sql_column = self._sql_column_identifier(column)
+                        sql_column = self._sql_column_identifier(
+                            column, self._sql_identifier_db_type())
                         pending[f"WHERE {sql_column}"] = (self.AUTO_WHERE_PARAMETER, sql_values)
                 return pending
 
