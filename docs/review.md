@@ -748,3 +748,55 @@ Test ไม่ได้ผ่านแบบไม่ได้ตรวจอะ
 7. [tests/test_database_connect_gui_core.py:488] ไม่มี unit test ตรงของ `write_json_atomic` สำหรับทาง `json.dump` ล้ม / `fsync` ล้ม / `BaseException` (ไฟล์เดิมคงอยู่, `.tmp` ถูกลบ, exception เดิม) — ปัจจุบันครอบคลุมผ่าน `os.replace` ล้มใน R8 / R6 เท่านั้น; reviewer ยืนยันพฤติกรรมด้วย probe แล้ว ถ้าต้องการ lock ไว้ให้เพิ่ม test เล็ก ๆ 3 กรณี
 8. [tests/test_r8_load_jobs_writeback.py:305] comment `print raises AttributeError, swallowed` ไม่ตรงความจริง — CPython `print()` คืนค่าเงียบ ๆ เมื่อ `sys.stdout is None` (ไม่ raise); test ยังถูกต้อง (ยืนยันว่าโหลดสำเร็จเมื่อไม่มี console) แก้ comment ให้ตรงพอ
 9. [database_connect_gui.py:5692-5694] หลัง R12-3 ตัวนับใน `askyesno` ข้าม element ที่ไม่ใช่ dict แต่ filter ใน `try` ยังเรียก `job.get` → ถ้า `saved_jobs` มี element เสียและผู้ใช้กด Yes จะได้ rollback + `Load Preset Failed: AttributeError` (ไม่มีข้อมูลหาย) — กรณีนี้เกิดไม่ได้จริงเพราะ `load_jobs` reject list ที่มี non-dict ตั้งแต่ตอนโหลด; ถ้าต้องการให้สม่ำเสมอ ใส่ `isinstance(job, dict)` ใน filter ด้วย (ต้องตัดสินว่าจะเก็บหรือทิ้ง element เสีย)
+
+---
+
+# Code Review — Round 13 (Follow-up 🟢 1-9 ของ Round 12) — 2026-11-23
+
+ขอบเขต: uncommitted diff เทียบ HEAD `d2c4dd5` — `database_connect_gui.py`, `tests/test_r13_connect_redaction.py`, `tests/test_r13_tables_and_patterns.py`, `tests/test_r13_persistence.py`, comment `tests/test_r8_load_jobs_writeback.py:305`, หมายเหตุ R10-AC-15 / R10-Q-3 ใน `docs/spec.md`
+
+## สรุป
+**ผ่าน** — 🔴 0, 🟡 0, 🟢 4
+
+สิ่งที่ reviewer ตรวจและรันเอง:
+- `python -X utf8 -m unittest discover -s tests -p "test_*.py"` → `Ran 1182 tests ... OK`; R13 3 ไฟล์ + `test_r11_connection_target_snapshot` → `Ran 86 ... OK`; ไม่พบ `S3cr` / `PW-13` ใน output
+- probe `redact_secrets` ด้วยมือ: ODBC `PWD={p@ss;w}}rd}` → `PWD=***`, `odbc_connect=...PWD%3D%7B...%7D%7Drd%7D%3B` → `PWD%3D***%3B`, `postgresql://user:hunter22@host/db` → `user:***@` (เท่ากับ R12 ทุกกรณี); ข้อความปกติ (`password authentication failed for user "u"`, `ORA-01017: invalid username/password; logon denied`, ลิงก์ `sqlalche.me`, `NEWPWD=abc`) ไม่เปลี่ยน
+- เวลา ~100k ตัวอักษร: ข้อความทั่วไป / `PWD={` ไม่ปิด 1 จุด / `PWD%3D%7B` / URL / quote ไม่ปิด / `}}` ซ้ำ ใช้ 0.005-0.03 s; มีกรณีเดียวที่เป็น O(n²) (ดู 🟢1) ซึ่งเป็นพฤติกรรมเดิมก่อน R13
+- เส้นทาง error: `connect_database` redact ด้วย `password` จากช่องกรอก **ก่อน** `results_text.insert` (ครอบ run log) และส่งข้อความที่ redact แล้วให้ `_show_connection_error` (Label ตัด 400 / `message=`) → ตัดหลัง redact; `_run_connection_test` redact → เลือกบรรทัดแรก → ตัด 300; Tables: `log_error` (`:9406`) redact ทั้งข้อความและ traceback, `on_list_tables_error` ได้ `credentials[1]` ผ่าน default arg ของ lambda (`:9629`) + `_connected_password`; ไม่พบ `print` / log อื่นในเส้นทาง Connect ที่มีข้อความ error ดิบ
+- `_run_connection_test` (`:11499`) เทียบกับ `work()` เดิมบรรทัดต่อบรรทัด: create_engine + connect_args เดิม, `SELECT 1` / `FROM DUAL`, `dispose()` ใน `finally`, ข้อความสำเร็จเดิม, การตัด 300 ย้ายจาก `show()` มาที่ helper (ผลเท่ากัน); ยังรันใน `threading.Thread(daemon=True)` และ `show()` ผ่าน `root.after` เหมือนเดิม
+- test เดิม: `git diff --stat -- tests/` แก้เฉพาะ `test_r8_load_jobs_writeback.py` 1 บรรทัด (comment); spec R10-AC-15 / R10-Q-3 ข้อความเดิมครบ + ต่อท้ายหมายเหตุเท่านั้น
+
+## Verdict ราย R13-AC
+
+| AC | ผล | หลักฐาน |
+|---|---|---|
+| R13-AC-1 | ✅ | `:7793-7797`; `test_ac1_execution_log_and_prints_have_no_password` (3 แบบ, ตรวจ insert + print + messagebox + "ไม่ mask เกิน") |
+| R13-AC-2 | ✅ | `_show_connection_error` ได้ข้อความที่ redact แล้ว; `test_ac2_*` เรียก `build_body` จริง, กรณีรหัสคร่อมตำแหน่ง 399 ตรวจว่าตัดหลัง redact |
+| R13-AC-3 | ✅ | `test_ac3_create_engine_or_connection_string_raises` ตรวจ engine เดิม dispose / status / ปุ่ม disabled |
+| R13-AC-4 | ✅ | `test_ac4_short_password_masked_by_pattern_only` (`pw1x` คงอยู่) |
+| R13-AC-5 | ✅ | `:11499-11526`; `RunConnectionTestTests` ครอบ connect / create_engine, บรรทัดแรกว่าง, ตัด 300 หลัง redact, สำเร็จ PostgreSQL / Oracle |
+| R13-AC-6 | ✅ | `test_ac6_plain_errors_unchanged` ทั้ง Connect และ Test connection เทียบทุกตัวอักษร |
+| R13-AC-7 | ✅ | `test_ac7_run_target_without_info_uses_worker_password` |
+| R13-AC-8 | ✅ | `test_ac8_stored_password_replaced_before_callback`, `test_ac8_two_argument_call_still_works`; test เดิม `test_on_list_tables_error_is_redacted` ผ่านไม่แก้ |
+| R13-AC-9 | ✅ | `test_ac9_redact_lines_short_and_module_import` (≥ 6 บรรทัด, ≤ 95, ไม่มี import ใน `redact_secrets`, `app.quote_plus is urllib.parse.quote_plus`) |
+| R13-AC-10 | ✅ | `:95-114`; `test_ac10_exact_results` / `_more_edges` เทียบตรงตัว; `RedactSecretsTests` เดิมผ่าน |
+| R13-AC-11 | ✅ | `docs/spec.md:1174`, `:1223` ข้อความเดิมครบ + หมายเหตุ R12-5 (ตรวจ diff) |
+| R13-AC-12 | ✅ | `test_ac12_known_limits_pinned` |
+| R13-AC-13 | ✅ | `test_ac13_export_replace_retry_delays_pinned` |
+| R13-AC-14 | ✅ | `test_ac14_*` 3 ทาง, `assertIs` instance เดียวกัน, bytes เดิม / ไม่มี `.tmp` / `os.replace` ไม่ถูกเรียก |
+| R13-AC-15 | ✅ | diff 1 บรรทัด comment `tests/test_r8_load_jobs_writeback.py:305` |
+| R13-AC-16 | ✅ | `:5709-5711`; `test_ac16_non_dict_elements_kept_in_order` ตรวจลำดับ + ไฟล์ที่เขียน |
+| R13-AC-17 | ✅ | utf-8 รันเองได้ 1182 OK (= 1147 + 35); cp874 + redirect ตามผล QA |
+| R13-AC-18 | ✅ | ไม่พบรหัสทดสอบใน output ที่รัน; `ConnectionInfo` / `RunTarget` ไม่เปลี่ยน |
+
+## 🔴 Critical (ต้องแก้ก่อน merge)
+- ไม่มี
+
+## 🟡 Warning (ควรแก้)
+- ไม่มี
+
+## 🟢 Suggestion (ทางเลือก)
+1. [database_connect_gui.py:105] branch `\{(?:[^}]|\}\})*\}` เป็น O(n²) เมื่อข้อความมี `PWD={` ที่ไม่ปิดจำนวนมาก (`"PWD={a " * 15000` ≈ 105k ตัวอักษร ใช้ ~198 s, 8k ตัวอักษร ~0.7 s) เพราะทุกจุดสแกนถึงท้ายข้อความ (`[^}]` ข้ามบรรทัดได้) — **ไม่ใช่ regression** (pattern R12 ใช้เวลาใกล้เคียง: 0.40 s ที่ 8k) และ error จริงจาก driver ไม่มีรูปแบบนี้ (ข้อความ 98k ตัวอักษรทั่วไป 0.005 s) — ถ้าต้องการปิด: ตัดความยาวข้อความ (เช่น 20k) ก่อน redact ไม่ได้ เพราะจะตัดก่อน redact; ทางที่ปลอดภัยกว่าคือ `[^}\n]` แทน `[^}]` (ODBC string ไม่ข้ามบรรทัด)
+2. [database_connect_gui.py:114] userinfo pattern ไม่ mask รหัสที่มี `/` ดิบอีกต่อไป (`mysql://u:pa/ss@h` คงเดิม ขณะที่ R12 mask ได้) — เป็นการแลกตาม R13-Q-1 (ง) ที่ผู้ใช้ยอมรับ และแอป `quote_plus` รหัสเสมอ + known secret ≥ 4 ตัวปิดให้; เสนอ pin กรณีนี้ใน `test_ac12_known_limits_pinned` ให้เห็นเป็น known limit เหมือน (ก) / (จ)
+3. [database_connect_gui.py:99-100] pattern quote หยุดที่ quote ตัวแรก: `PWD='ab'cd;` → `PWD='***'cd;`, `PASSWORD='it''s'` → `'***''s'` (ส่วนหลังรหัสยังเห็น) — เกิดเฉพาะเมื่อไม่มี known secret (รหัส < 4 ตัว หรือมาจากที่อื่น) และ `build_sqlserver_odbc_connect` ครอบทุกค่าด้วย `{}` อยู่แล้ว จึงไม่ใช่ข้อความที่แอปสร้าง — บันทึกเป็น known limit ได้
+4. [database_connect_gui.py:9628-9631, :11504] สไตล์: lambda ที่ตัดบรรทัดกลาง call (`on_list_tables_error(\n err, loading_dialog, pw)`) อ่านยาก — แยกเป็น `def _report(err=e, pw=credentials[1]): ...` ได้; `import time as _time` ใน `_run_connection_test` ยกมาจากโค้ดเดิม ย้ายไประดับ module ได้ถ้าจะ refactor ต่อ (ไม่บังคับ)

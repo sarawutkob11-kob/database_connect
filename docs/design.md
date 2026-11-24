@@ -1704,6 +1704,7 @@ _SQL_COLON_PLACEHOLDER_RE = re.compile(r":[A-Za-z_][A-Za-z0-9_]*")  # module lev
 > อ้างอิง: `docs/spec.md` หัวข้อ Round 10 (R10-AC-1 ถึง R10-AC-21)
 > คำตอบ R10-Q ที่ผู้ใช้อนุมัติ (ทุกข้อตามค่าแนะนำ): **Q-1** temp ชื่อไม่ซ้ำ `<stem>.<สุ่ม>.tmp.xlsx` สร้างแบบ exclusive (`tempfile.mkstemp`) ในโฟลเดอร์ปลายทาง; **Q-2** Stop = พฤติกรรมเดิม (workbook บางส่วนแทนที่ปลายทาง แต่ผ่าน temp + `os.replace`); **Q-3** ไฟล์ปลายทางล็อก: ตรวจตอนเริ่มแล้ว fail เร็ว / `os.replace` ล้ม → เก็บ temp ที่สมบูรณ์ไว้ แจ้งทั้งสอง path ไม่ retry; **Q-4** fatal หลังมี sheet → คงไฟล์เดิม ลบ temp; **Q-5** ปรับเฉพาะ harness ของ `tests/test_r4_excel_row_limit.py` ไม่แตะ assertion; **Q-6** ไม่ล้าง temp ค้างอัตโนมัติ; **Q-7** Job ไม่มี `"query"` ยัง fatal แต่แสดงสาเหตุจริง; **Q-8** ไม่รวมจุดเขียนไฟล์อื่น; **Q-9** ลบ temp ไม่ได้ → log 1 บรรทัด; **Q-10** รันเฉพาะ focused (R10-AC-21 เลื่อน)
 > ขอบเขต: `database_connect_gui.py` — import ส่วนหัว, helper ระดับ module ใหม่ 4 ตัว (วางต่อจาก `_excel_text_too_long` ~126-134) และ `worker()` ใน `export_jobs_to_excel` (~10430-10806) เท่านั้น; **ไม่แตะ** ส่วนก่อนเริ่ม worker (~10318-10429), `on_done` (~10392-10416), เนื้อ loop ราย Job (~10503-10798), `write_json_atomic`, `load_jobs` / `load_preset_dialog` (Round 8-9 ยังไม่ commit) และ B4-B16; เลขบรรทัดอ้างอิง ณ 2026-11-20
+> **หมายเหตุ (2026-11-23, Round 13)**: "ไม่ retry" ใน Q-3 ข้างบน **ถูกแทนที่โดย R12-5** — `os.replace` ที่ล้มด้วย `PermissionError` ถูก retry ตาม `EXPORT_REPLACE_RETRY_DELAYS = (0.2, 0.5, 1.0)` (`_replace_export_with_retry`) ก่อนเข้าทางเก็บ temp + แจ้ง path; error อื่นไม่ retry (pin ด้วย R13-AC-13)
 
 ## R10-D1. แนวทาง
 
@@ -2189,3 +2190,210 @@ Closure ใน `__init__` (~2694-2709) หลังแก้ — ชื่อ / 
 | R11-AC-16 | R11-T1, R11-T2 | R11-AC-17 | R11-T1, R11-T2 | R11-AC-18 | R11-T1, R11-T2 |
 | R11-AC-19 | R11-T1, R11-T2 | R11-AC-20 | R11-T1, R11-T2 | R11-AC-21 | R11-T2 |
 | R11-AC-22 | R11-T3 | | | | |
+
+---
+
+# Round 13 — Follow-up: ข้อเสนอแนะ 🟢 1-9 จาก Code Review Round 12
+
+> อ้างอิง: `docs/spec.md` หัวข้อ Round 13 (R13-AC-1 ถึง R13-AC-18); คำตอบผู้ใช้ 2026-11-23: **Q-1** แก้ (ข) (ค) (ง), (ก) (จ) known limit; **Q-2** ไม่แตะ error ตอนรัน; **Q-3** element ไม่ใช่ dict เก็บไว้ในลำดับเดิม
+> ขอบเขตโค้ด: `database_connect_gui.py` เท่านั้น (เลขบรรทัด ณ 2026-11-23); test ใหม่ `tests/test_r13_*.py`; test เดิมแก้ได้เฉพาะ comment `tests/test_r8_load_jobs_writeback.py:305`
+
+## R13-D1. แนวทาง
+
+- **redact ที่ต้นทางข้อความ ครั้งเดียว** แล้วส่งสตริงที่ redact แล้วต่อ (Execution Logs → run log, dialog) — ไม่ต้องแก้ `_show_connection_error` เป็น signature ใหม่ (test เดิมแค่ `assert_called_once`)
+- **pattern ใช้ named group `secret` + ฟังก์ชันแทนที่ตัวเดียว** แทนการนับ `pattern.groups` (2 / 3) — เพิ่ม pattern แบบมี quote ได้โดยไม่ต้องมีเงื่อนไขพิเศษ
+- **known secret ของ Tables = รหัสที่ worker ถืออยู่ + รหัสที่เก็บไว้** (ส่งทั้งคู่เข้า `redact_secrets(*secrets)`) — รองรับ R13-AC-7 / R13-AC-8 และ test เดิมที่เรียก `on_list_tables_error(stub, error, dialog)` แบบ 2 argument
+- **แยก logic "ทดสอบการเชื่อมต่อ" เป็น method** ที่คืน `(ok, text)` ทดสอบได้โดยไม่เปิด dialog / thread
+
+## R13-D2. `redact_secrets` / `_SECRET_PATTERNS` (`:94-121`) — R13-AC-9, 10, 12
+
+Import ระดับ module (กลุ่ม stdlib ต่อจาก `from typing import ...` บรรทัด 17): `from urllib.parse import quote_plus`; ลบ `from urllib.parse import quote_plus` ใน `redact_secrets` (บรรทัด 109). import ภายใน `get_connection_string` (`:7670`) ไม่ต้องแตะ
+
+ใช้ตามนี้ได้ตรง ๆ:
+
+```python
+_SECRET_PATTERNS = (
+    # PWD / password with a quoted value: keep the quotes, mask what is inside
+    # (an unclosed quote masks to the end of the line). DB_PASSWORD= / MY_PWD= count.
+    re.compile(
+        r"(?i)(?<![a-z0-9])(?:PWD|PASSWORD)\s*=\s*(?P<q>['\"])"
+        r"(?P<secret>(?:(?!(?P=q)).)*)"
+    ),
+    # ODBC connection string: PWD={...} (with }} escapes) or PWD=value
+    re.compile(
+        r"(?i)(?<![a-z0-9])(?:PWD|PASSWORD)\s*=(?!\s*['\"])\s*"
+        r"(?P<secret>\{(?:[^}]|\}\})*\}|[^;&\s'\"]*)"
+    ),
+    # The same, URL-encoded inside odbc_connect=... (= %3D, ; %3B, { %7B, } %7D)
+    re.compile(
+        r"(?i)(?:PWD|PASSWORD)%3D"
+        r"(?P<secret>%7B(?:(?!%7D).|%7D%7D)*%7D|.*?(?=%3B|&|\s|['\"]|$))"
+    ),
+    # URL userinfo: scheme://user:password@host (no "/" in the password:
+    # the app quote_plus-es it, and http://host:8080/a@b is not userinfo)
+    re.compile(r"://[^:/@\s'\"]*:(?P<secret>[^@/\s'\"]+)(?=@)"),
+)
+
+
+def _mask_secret(match: "re.Match[str]") -> str:
+    """The whole match with only its `secret` group replaced by ***."""
+    base = match.start()
+    whole = match.group(0)
+    return whole[: match.start("secret") - base] + "***" + whole[match.end("secret") - base:]
+
+
+def redact_secrets(text: str, *secrets: Optional[str]) -> str:
+    """(docstring เดิม)"""
+    result = str(text)
+    for secret in secrets:
+        if secret and len(secret) >= 4:
+            for form in {secret, quote_plus(secret)}:
+                result = result.replace(form, "***")
+    for pattern in _SECRET_PATTERNS:
+        result = pattern.sub(_mask_secret, result)
+    return result
+```
+
+เหตุผลของแต่ละจุด:
+
+| จุด | ของเดิม | ใหม่ | ผล |
+|---|---|---|---|
+| (ข) quote | `[^;&\s'\"]*` match ว่างหน้า `'` → `password = ***'x'` | pattern quote แยก (ข้อ 1); pattern ปกติมี `=(?!\s*['\"])` ไม่ทับ (`(?!...)` วางหลัง `=` ก่อน `\s*` — ถ้าวางหลัง `\s*` regex จะ backtrack `\s*` แล้ว match ว่างได้) | `password = '***'`, `PWD="***"`, `password='***` |
+| (ค) prefix | `\b` ไม่ match หลัง `_` | `(?<![a-z0-9])` (กับ `(?i)`) — `_`, `;`, `{`, ต้นบรรทัด ผ่าน; ตัวอักษร / ตัวเลข ไม่ผ่าน | `DB_PASSWORD=***`, `MY_PWD=***`; `NEWPWD=` ยังไม่ match (เหมือนเดิม) |
+| (ง) URL | `[^@\s'\"]+` กิน `8080/a` | ตัด `/` ออก + `(?=@)` | `http://host:8080/a@b` ไม่เปลี่ยน; `postgresql://u:p%40ss@h/db` → `u:***@h/db` |
+| (ก) known limit | — | ไม่แก้ | `postgresql://u:p@ss@h/db` → `postgresql://u:***@ss@h/db` (R13-AC-12) |
+
+ตรวจกับ `RedactSecretsTests` เดิม (`tests/test_r11_connection_target_snapshot.py:982-1012`) ด้วยมือแล้ว — ทุก case ให้ผลเท่าเดิม: ODBC `PWD={p@ss;w}}rd};Encrypt=yes` → pattern 2 (ไม่มี quote, `{` ไม่ใช่ quote), URL-encoded → pattern 3 (ไม่เปลี่ยน), `postgresql://user:hunter22@host/db`, `PWD=abc123;UID=x`, `password=hunter22 next`, known secret / secret สั้น / `None` — developer **ต้องรัน** `python -m unittest tests.test_r11_connection_target_snapshot` ยืนยันหลังแก้ (ห้ามแก้ test นั้น)
+
+## R13-D3. Connect — `connect_database` except (`:7764-7779`) — R13-AC-1..4, 6
+
+```python
+        except Exception as error:
+            ...  # dispose / _replace_engine(None) / ปิดปุ่ม / status เหมือนเดิม
+            # A driver error can echo the connection string (SQL Server: PWD=...)
+            message = redact_secrets(str(error), password)
+            self.results_text.insert(tk.END, f"❌ Connection Error: {message}\n\n")
+            self.results_text.see(tk.END)
+            self._show_connection_error(message)
+            return
+```
+
+- `password` = ตัวแปรเดิมที่อ่านจากช่อง Password ตอนกด (`:7730`)
+- `_show_connection_error(self, error)` (`:7911`) **ไม่เปลี่ยน signature / logic** — ได้สตริงที่ redact แล้ว จึง `str(error)` ทั้งใน Label (ตัด 400 หลัง redact โดยอัตโนมัติ) และ `ui_dialog(message=...)` ปลอดภัย; แก้แค่ docstring: `error` = ข้อความที่ผู้เรียก redact แล้ว (หรือ exception ที่ไม่มีรหัส)
+- `subtitle` มีแค่ profile / db_type — ไม่ต้องแก้
+
+## R13-D4. ทดสอบการเชื่อมต่อ (New Profile, `:11632-11674`) — R13-AC-5, 6
+
+Method ใหม่บน `DatabaseConnectorGUI` (วางก่อน `new_profile_dialog`):
+
+```python
+    def _run_connection_test(
+        self, db_type: str, user: str, password: str, host: str, port: str, database: str
+    ) -> Tuple[bool, str]:
+        """Try the details with a throw-away engine (main one untouched).
+        Returns (ok, label text): redacted, first non-blank line, cut to 300."""
+```
+
+- เนื้อ = ย้ายจาก `work()` (`:11643-11658`) ทั้งก้อน: `import time as _time`, `create_engine(self.get_connection_string(...), connect_args=self.get_connect_args(db_type))`, `engine.connect()` + `SELECT 1` (`FROM DUAL` ถ้า Oracle), `finally: engine.dispose()`
+- except: `detail = redact_secrets(str(error), password)` **ก่อน** `splitlines()` → `first = next((ln for ln in detail.splitlines() if ln.strip()), detail)` → `msg = f"✕  เชื่อมต่อไม่สำเร็จ: {first.strip()}"`
+- ตัด 300 ใน method (ทั้งสองทาง): `msg if len(msg) <= 300 else msg[:299] + "…"` — ข้อความสำเร็จเหมือนเดิมทุกตัวอักษร
+- `work()` เหลือ `outcome = self._run_connection_test(*args)` + `show()` เดิม โดย `result_label.config(text=msg, ...)` (ไม่ตัดซ้ำ)
+
+## R13-D5. Tables — `list_tables` worker + `on_list_tables_error` — R13-AC-7, 8, 9
+
+1. **🟢4 บรรทัดยาว**: ใน `fetch_tables_in_background` (`:9384`) เพิ่ม closure ที่บรรทัดต้นฟังก์ชัน แล้วแทน 3 คู่ "print ข้อความ + print traceback" (`:9438-9441`, `:9546-9551`, `:9564-9567`) ด้วย `log_error(f"...")` ข้อความเดิมทุกตัวอักษร; ลบ `import traceback` ภายในทั้ง 3 จุด (มีระดับ module แล้ว `:14`)
+
+```python
+            def log_error(message: str) -> None:
+                """print the error + traceback with the password masked."""
+                print(redact_secrets(message, credentials[1]))
+                print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
+```
+
+2. **🟢1 ส่งรหัสของ worker**: `:9612` →
+
+```python
+                self.root.after(
+                    0, lambda err=e, pw=credentials[1]: self.on_list_tables_error(
+                        err, loading_dialog, pw)
+                )
+```
+
+3. `on_list_tables_error(self, error, loading_dialog, password: Optional[str] = None)` (`:9724`):
+
+```python
+        # A driver error can echo the connection string (SQL Server: PWD=...):
+        # mask the password the worker used and the one stored for the engine
+        stored = getattr(self, "_connected_password", None)
+        message = redact_secrets(str(error), password, stored[1] if stored else None)
+```
+
+- ส่งทั้งสองค่า: ทาง `info` ที่ worker ไม่ถือรหัส (มี database / Oracle → `credentials[1] == ""` ตาม R12-6) ยัง fallback เป็นรหัสที่เก็บไว้เหมือนเดิม; การเรียก 2 argument เดิมได้ผลเดิม (R13-AC-8)
+- ทุกบรรทัดที่มี `redact_secrets(` ต้อง ≤ 95 ตัวอักษร (R13-AC-9) — รวมบรรทัดใหม่ใน R13-D3 / R13-D4
+
+## R13-D6. Load Preset filter (`:5692-5694`) — R13-AC-16
+
+```python
+                    self.saved_jobs = [
+                        job for job in self.saved_jobs
+                        if not isinstance(job, dict) or job.get("profile") != current_profile
+                    ]
+```
+
+ลำดับเดิมคงอยู่ (comprehension), element ที่ไม่ใช่ dict ถูกเก็บ (R13-Q-3)
+
+## R13-D7. ไม่แก้โค้ด (test / เอกสารเท่านั้น)
+
+- R13-AC-13 (`EXPORT_REPLACE_RETRY_DELAYS` `:230`), R13-AC-14 (`write_json_atomic` `:73-91` รองรับ 3 ทางอยู่แล้ว: `except BaseException` ลบ `.tmp` แล้ว `raise`) — ถ้า test ล้มให้แจ้งเป็น bug อย่าแก้ test ให้ผ่าน
+- R13-AC-15 comment `tests/test_r8_load_jobs_writeback.py:305` → `# sys.stdout really None (pythonw): print() returns silently, nothing to swallow`
+- R13-AC-11 PM ทำแล้วใน spec (3 จุด); หมายเหตุฝั่ง design ใส่แล้วใน Round 10 ข้างบน
+
+## R13-D8. Data model
+
+ไม่เปลี่ยน — `ConnectionInfo` / `RunTarget` ไม่มี field password (R13-AC-18); ไม่มีไฟล์ / key JSON ใหม่
+
+## R13-D9. แผน test (`tests/test_r13_*.py`)
+
+ค่าคงที่ร่วม: `PW = "S3cr;t}PW-13"`, `LEAKS = (PW, quote_plus(PW), "S3cr", "PW-13", "}}PW-13", "%7D%7DPW-13")`, error (1) / (2) / (3) ตามนิยาม spec — (1) สร้างจาก `app.build_sqlserver_odbc_connect(...)` + `";Encrypt=yes ... Login failed for user 'u'."`; stub แบบ `DatabaseConnectorGUI.__new__` + `_FakeEntry` + fake `results_text` (เก็บ `inserted`) ตาม `tests/test_r11_connection_target_snapshot.py::make_stub`; patch `builtins.print` ทุก test ที่เรียก worker (AC-18)
+
+| ไฟล์ | AC | วิธี |
+|---|---|---|
+| `test_r13_connect_redaction.py` | R13-AC-1 | `connect_database` จริง, patch `app.create_engine` → engine ที่ `connect.side_effect = RuntimeError(err)`, `app.messagebox`, `_show_connection_error` = Mock, `_track_engine_connections` / `_block_if_busy` stub; subTest (1)(2)(3): ทุก `inserted` ไม่มี LEAKS, มีบรรทัดขึ้นต้น `❌ Connection Error: `, ยังมี `Login failed for user 'u'` (หรือ `bad password` / `for u`) |
+| 〃 | R13-AC-2 | `_show_connection_error` จริง, patch `app.ui_dialog` (side_effect เรียก `build_body(frame ปลอม)` แล้วคืน `None`), `app.ui_round_frame` คืน `(Mock, Mock)`, `app.tk.Label` จับ kwargs `text`; ตรวจ `message`, `subtitle`, Label ทุกตัวไม่รั่ว; case ยาว: `"x" * 380 + " " + err(1)` → Label ไม่มีชิ้นส่วนรหัส และลงท้าย `…` |
+| 〃 | R13-AC-3 | `get_connection_string` (Mock) หรือ `create_engine` raise err(1); ตรวจผลเหมือน AC-1/2 + `engine is None`, `status_label` = `❌ Connection Failed`, ปุ่ม disabled |
+| 〃 | R13-AC-4 | Password `"pw1"`, err `...PWD={pw1};... pw1x table` → `PWD=***`, คำ `pw1x` คงอยู่ |
+| 〃 | R13-AC-5 | `GUI._run_connection_test(stub, ...)` กับ `create_engine` raise / `connect` raise × (1)(2)(3) → `ok is False`, ขึ้นต้น `✕  เชื่อมต่อไม่สำเร็จ: `, ไม่รั่ว, `len <= 300`; case error หลายบรรทัดที่บรรทัดแรกว่าง + case ยาว > 300 ที่รหัสอยู่ช่วงท้าย; สำเร็จ → `assertRegex(r"^✓  ทดสอบเชื่อมต่อสำเร็จ · PostgreSQL · \d+ ms$")` และ `dispose` ถูกเรียก |
+| 〃 | R13-AC-6 | ข้อความ 3 แบบใน spec ผ่าน AC-1 (`❌ Connection Error: <เดิม>`) และ AC-5 (`✕  เชื่อมต่อไม่สำเร็จ: <เดิม>`) เท่ากันทุกตัวอักษร |
+| `test_r13_tables_and_patterns.py` | R13-AC-7 | `_run_target = RunTarget(engine, None)`, ช่อง Password = PW; `threading.Thread` แบบจับ target/args แล้ว `run()` เอง; `root.after` เรียก callback ทันที; ช่อง Database มีค่า + patch `app.inspect` raise err(3) (หลุดถึง except นอกสุด `:9610`); `messagebox` patch → `results_text` + `showerror` ไม่รั่ว |
+| 〃 | R13-AC-8 | snapshot `info` (database `""`, PostgreSQL) + `_replace_engine(engine, info, password=PW)`; ให้ worker raise err(3) โดยที่ก่อน `root.after` callback รัน ตั้ง `stub._connected_password = (engine, "Other-pass-99")` → ไม่รั่ว; และเรียก `GUI.on_list_tables_error(stub, err, dlg)` แบบ 2 argument ยังทำงาน |
+| 〃 | R13-AC-9 | อ่าน `database_connect_gui.py` (utf-8) ทุกบรรทัดที่มี `redact_secrets(` → `len <= 95`; `"import" not in inspect.getsource(app.redact_secrets)`; `app.quote_plus is urllib.parse.quote_plus` |
+| 〃 | R13-AC-10 | `assertEqual` ทุก case ใน spec (subTest) |
+| 〃 | R13-AC-12 | 3 assertion ตาม spec (pin known limit) |
+| `test_r13_persistence.py` | R13-AC-13 | `assertEqual(app.EXPORT_REPLACE_RETRY_DELAYS, (0.2, 0.5, 1.0))`, `sum <= 2.0` |
+| 〃 | R13-AC-14 | temp dir, ไฟล์เดิม bytes X; subTest (ก) data มี `object()` (TypeError จริง), (ข) patch `app.os.fsync` raise `OSError`, (ค) patch `app.os.fsync` raise `KeyboardInterrupt`; `assertRaises` + `is` instance เดียวกัน (ข/ค), bytes = X, ไม่มี `.tmp`, patch `app.os.replace` (wraps) ไม่ถูกเรียก |
+| 〃 | R13-AC-16 | ตาม harness ของ `tests/test_r9_load_preset_validation.py` (Load Preset + askyesno Yes + `save_jobs` คืน True): `saved_jobs = [job_P1_a, None, "junk", job_P2_b]` → ผล `[None, "junk", job_P2_b, <preset job>]`, ข้อความ askyesno มี `replace current 1 jobs`, ไม่มี `showerror` |
+
+R13-AC-15 / R13-AC-11 ตรวจด้วย `git diff` / review; R13-AC-17 / 18 = R13-T regression
+
+## R13-D10. ความเสี่ยงและผลกระทบ
+
+| # | ความเสี่ยง | การควบคุม |
+|---|---|---|
+| R13-R1 | pattern ใหม่ mask เกิน: quote ไม่ปิด (`password='abc ...`) mask ถึงท้ายบรรทัด; `DB_PASSWORD=` ทำให้คำที่ลงท้าย `_PWD=` ใน SQL / ข้อความ error ถูก mask | ฝั่งปลอดภัย, ใช้แค่ Connect / Tables; R13-AC-6 / AC-1 "ไม่ mask เกิน" ล็อกข้อความปกติ |
+| R13-R2 | วาง `(?!\s*['\"])` ผิดตำแหน่ง (หลัง `\s*`) → backtrack แล้วได้ `password =*** '***'` | ใช้ regex ตาม R13-D2 ตรง ๆ; R13-AC-10 เทียบทุกตัวอักษร |
+| R13-R3 | ลืมเปลี่ยน logic `pattern.groups == 3` → pattern ใหม่ที่มี group `q` ถูกแทนผิด | ใช้ `_mask_secret` ตัวเดียวกับทุก pattern; ทุก pattern ต้องมี group `secret` ที่ match เสมอ (ไม่อยู่ในส่วน optional) |
+| R13-R4 | Tables ทาง `info` ที่ worker ไม่ถือรหัส (มี database / Oracle, R12-6) → known secret มาจาก `_connected_password` ตอน error เท่านั้น ถ้ามันถูกเปลี่ยนกลางทาง รหัสแบบตรงตัว (3) ไม่ถูก mask | ไม่เพิ่มรหัสเข้า thread (คง R12-6); Connect ถูก `_block_if_busy` ระหว่าง Tables จึงแทบไม่เกิด; pattern ยังปิด `PWD=` / URL |
+| R13-R5 | ย้าย `work()` ไป `_run_connection_test` แล้วเปลี่ยนข้อความสำเร็จ / การตัด 300 โดยไม่ตั้งใจ | R13-AC-5 / AC-6 ตรวจข้อความ; `show()` ไม่ตัดซ้ำ |
+| R13-R6 | `log_error` เปลี่ยนข้อความ print ของ worker | ส่ง f-string เดิมทุกตัวอักษร; test เดิมของ R12-7 / R11 ต้องผ่านโดยไม่แก้ |
+| R13-R7 | Out of scope ตาม Q-2: error ตอนรัน / reconnect ยังแสดงดิบ | บันทึกเป็นงาน Round ถัดไปถ้าผู้ใช้ต้องการ |
+
+## R13-D11. AC → Task
+
+| AC | Task | AC | Task | AC | Task |
+|---|---|---|---|---|---|
+| R13-AC-1 | R13-T2, R13-T4 | R13-AC-2 | R13-T2, R13-T4 | R13-AC-3 | R13-T2, R13-T4 |
+| R13-AC-4 | R13-T1, R13-T2, R13-T4 | R13-AC-5 | R13-T2, R13-T4 | R13-AC-6 | R13-T1, R13-T2, R13-T4 |
+| R13-AC-7 | R13-T3, R13-T4 | R13-AC-8 | R13-T3, R13-T4 | R13-AC-9 | R13-T1, R13-T2, R13-T3, R13-T4 |
+| R13-AC-10 | R13-T1, R13-T4 | R13-AC-11 | R13-T4 (review) | R13-AC-12 | R13-T1, R13-T4 |
+| R13-AC-13 | R13-T4 | R13-AC-14 | R13-T4 | R13-AC-15 | R13-T4 |
+| R13-AC-16 | R13-T3, R13-T4 | R13-AC-17 | R13-T | R13-AC-18 | R13-T4, R13-T |

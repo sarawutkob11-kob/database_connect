@@ -15,6 +15,7 @@ import traceback
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, BinaryIO, Callable, Iterator, Optional, Tuple
+from urllib.parse import quote_plus
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -92,13 +93,33 @@ def write_json_atomic(path, data, indent=2):
 
 
 _SECRET_PATTERNS = (
+    # PWD / password with a quoted value: keep the quotes, mask what is inside
+    # (an unclosed quote masks to the end of the line). DB_PASSWORD= / MY_PWD= count.
+    re.compile(
+        r"(?i)(?<![a-z0-9])(?:PWD|PASSWORD)\s*=\s*(?P<q>['\"])"
+        r"(?P<secret>(?:(?!(?P=q)).)*)"
+    ),
     # ODBC connection string: PWD={...} (with }} escapes) or PWD=value
-    re.compile(r"(?i)(\b(?:PWD|PASSWORD)\s*=\s*)(\{(?:[^}]|\}\})*\}|[^;&\s'\"]*)"),
+    re.compile(
+        r"(?i)(?<![a-z0-9])(?:PWD|PASSWORD)\s*=(?!\s*['\"])\s*"
+        r"(?P<secret>\{(?:[^}]|\}\})*\}|[^;&\s'\"]*)"
+    ),
     # The same, URL-encoded inside odbc_connect=... (= %3D, ; %3B, { %7B, } %7D)
-    re.compile(r"(?i)((?:PWD|PASSWORD)%3D)(%7B(?:(?!%7D).|%7D%7D)*%7D|.*?(?=%3B|&|\s|['\"]|$))"),
-    # URL userinfo: scheme://user:password@host
-    re.compile(r"(://[^:/@\s'\"]*:)([^@\s'\"]+)(@)"),
+    re.compile(
+        r"(?i)(?:PWD|PASSWORD)%3D"
+        r"(?P<secret>%7B(?:(?!%7D).|%7D%7D)*%7D|.*?(?=%3B|&|\s|['\"]|$))"
+    ),
+    # URL userinfo: scheme://user:password@host (no "/" in the password:
+    # the app quote_plus-es it, and http://host:8080/a@b is not userinfo)
+    re.compile(r"://[^:/@\s'\"]*:(?P<secret>[^@/\s'\"]+)(?=@)"),
 )
+
+
+def _mask_secret(match: "re.Match[str]") -> str:
+    """The whole match with only its `secret` group replaced by ***."""
+    base = match.start()
+    whole = match.group(0)
+    return whole[: match.start("secret") - base] + "***" + whole[match.end("secret") - base:]
 
 
 def redact_secrets(text: str, *secrets: Optional[str]) -> str:
@@ -106,18 +127,13 @@ def redact_secrets(text: str, *secrets: Optional[str]) -> str:
     URL-encoded form), plus PWD= / password= values and URL userinfo.
     Secrets shorter than 4 characters are only masked by the patterns (a
     verbatim replace would mangle ordinary words)."""
-    from urllib.parse import quote_plus
-
     result = str(text)
     for secret in secrets:
         if secret and len(secret) >= 4:
             for form in {secret, quote_plus(secret)}:
                 result = result.replace(form, "***")
     for pattern in _SECRET_PATTERNS:
-        if pattern.groups == 3:
-            result = pattern.sub(lambda m: f"{m.group(1)}***{m.group(3)}", result)
-        else:
-            result = pattern.sub(lambda m: f"{m.group(1)}***", result)
+        result = pattern.sub(_mask_secret, result)
     return result
 
 
@@ -5690,7 +5706,8 @@ class DatabaseConnectorGUI:
                 try:
                     # ลบเฉพาะ Job ของ Profile ปัจจุบัน
                     self.saved_jobs = [
-                        job for job in self.saved_jobs if job.get("profile") != current_profile
+                        job for job in self.saved_jobs
+                        if not isinstance(job, dict) or job.get("profile") != current_profile
                     ]
 
                     # เพิ่ม Profile ให้ Job เก่า
@@ -7773,9 +7790,11 @@ class DatabaseConnectorGUI:
             self.execute_btn.config(state="disabled")
             self.inspect_btn.config(state="disabled")
             self.status_label.config(text="❌ Connection Failed", foreground="#e74c3c")
-            self.results_text.insert(tk.END, f"❌ Connection Error: {error}\n\n")
+            # A driver error can echo the connection string (SQL Server: PWD=...)
+            message = redact_secrets(str(error), password)
+            self.results_text.insert(tk.END, f"❌ Connection Error: {message}\n\n")
             self.results_text.see(tk.END)
-            self._show_connection_error(error)
+            self._show_connection_error(message)
             return
 
         info = ConnectionInfo(
@@ -7909,7 +7928,9 @@ class DatabaseConnectorGUI:
         return True
 
     def _show_connection_error(self, error):
-        """Connection failed: show the database message and what to check."""
+        """Connection failed: show the database message and what to check.
+        `error` is the message the caller already redacted (or an exception
+        that carries no password) — it is shown as-is."""
         profile = self.profile_combo.get() or "-"
 
         def body(frame):
@@ -9382,6 +9403,11 @@ class DatabaseConnectorGUI:
 
         # Execute in background thread
         def fetch_tables_in_background(credentials=connection_credentials):
+            def log_error(message: str) -> None:
+                """print the error + traceback with the password masked."""
+                print(redact_secrets(message, credentials[1]))
+                print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
+
             try:
                 table_list = []
 
@@ -9435,10 +9461,7 @@ class DatabaseConnectorGUI:
                                 )
                                 databases_to_check = [row[0] for row in result]
                     except Exception as e:
-                        print(redact_secrets(f"\n❌ ERROR getting database list for {db_type}: {e}", credentials[1]))
-                        import traceback
-
-                        print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
+                        log_error(f"\n❌ ERROR getting database list for {db_type}: {e}")
                         databases_to_check = []
 
                     # For each database, connect and get tables
@@ -9543,12 +9566,9 @@ class DatabaseConnectorGUI:
                                                     f"      ⚠️  Schema '{schema}': 0 tables (skipping)"
                                                 )
                                         except Exception as schema_err:
-                                            print(
-                                                redact_secrets(f"      ❌ Error reading schema '{schema}': {schema_err}", credentials[1])
+                                            log_error(
+                                                f"      ❌ Error reading schema '{schema}': {schema_err}"
                                             )
-                                            import traceback
-
-                                            print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
                                             # Skip this schema and continue with others
                                             continue
                                 finally:
@@ -9561,11 +9581,7 @@ class DatabaseConnectorGUI:
                                     f"   📊 Completed {database}: {schema_count} schemas, {total_tables} tables total"
                                 )
                         except Exception as e:
-                            print(redact_secrets(f"   ❌ ERROR accessing database {database}: {e}", credentials[1]))
-                            import traceback
-
-                            print(redact_secrets(traceback.format_exc(), credentials[1]), end="")
-                            pass
+                            log_error(f"   ❌ ERROR accessing database {database}: {e}")
                 else:
                     # List tables from currently connected database only
                     inspector = inspect(engine)
@@ -9609,7 +9625,10 @@ class DatabaseConnectorGUI:
 
             except Exception as e:
                 # Handle error in main thread
-                self.root.after(0, lambda err=e: self.on_list_tables_error(err, loading_dialog))
+                self.root.after(
+                    0, lambda err=e, pw=credentials[1]: self.on_list_tables_error(
+                        err, loading_dialog, pw)
+                )
 
         # Start background thread
         thread = threading.Thread(
@@ -9721,8 +9740,8 @@ class DatabaseConnectorGUI:
             messagebox.showerror("Error", f"Failed to display tables:\n{str(e)}")
             self.inspect_btn.config(state="normal", text="▦  Tables")
 
-    def on_list_tables_error(self, error, loading_dialog):
-        """Handle table listing error"""
+    def on_list_tables_error(self, error, loading_dialog, password: Optional[str] = None):
+        """Handle table listing error (`password` = the one the worker used)"""
         try:
             # Close loading dialog
             loading_dialog.destroy()
@@ -9732,9 +9751,10 @@ class DatabaseConnectorGUI:
         # Re-enable button
         self.inspect_btn.config(state="normal", text="▦  Tables")
 
-        # A driver error can echo the connection string (SQL Server: PWD=...)
+        # A driver error can echo the connection string (SQL Server: PWD=...):
+        # mask the password the worker used and the one stored for the engine
         stored = getattr(self, "_connected_password", None)
-        message = redact_secrets(str(error), stored[1] if stored else None)
+        message = redact_secrets(str(error), password, stored[1] if stored else None)
         self.results_text.insert(tk.END, f"❌ Error: {message}\n\n")
         self.results_text.see(tk.END)
         messagebox.showerror("Error", f"Failed to list tables:\n{message}")
@@ -11476,6 +11496,35 @@ class DatabaseConnectorGUI:
         ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
+    def _run_connection_test(
+        self, db_type: str, user: str, password: str, host: str, port: str, database: str
+    ) -> Tuple[bool, str]:
+        """Try the details with a throw-away engine (main one untouched).
+        Returns (ok, label text): redacted, first non-blank line, cut to 300."""
+        import time as _time
+
+        start = _time.perf_counter()
+        try:
+            engine = create_engine(
+                self.get_connection_string(db_type, user, password, host, port, database),
+                connect_args=self.get_connect_args(db_type),
+            )
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1 FROM DUAL" if db_type == "Oracle" else "SELECT 1"))
+            finally:
+                engine.dispose()
+            elapsed_ms = int((_time.perf_counter() - start) * 1000)
+            msg = f"✓  ทดสอบเชื่อมต่อสำเร็จ · {db_type} · {elapsed_ms} ms"
+            ok = True
+        except Exception as error:
+            # Redact before picking the line / cutting: a driver error can echo PWD=...
+            detail = redact_secrets(str(error), password)
+            first = next((ln for ln in detail.splitlines() if ln.strip()), detail)
+            msg = f"✕  เชื่อมต่อไม่สำเร็จ: {first.strip()}"
+            ok = False
+        return ok, msg if len(msg) <= 300 else msg[:299] + "…"
+
     def new_profile_dialog(self):
         """แสดง dialog สำหรับสร้าง Profile ใหม่ (กรอกข้อมูลการเชื่อมต่อทั้งหมด)"""
         if self._block_if_busy("สร้าง Profile"):
@@ -11640,22 +11689,7 @@ class DatabaseConnectorGUI:
             test_btn.config(state="disabled")
 
             def work():
-                import time as _time
-
-                start = _time.perf_counter()
-                try:
-                    engine = create_engine(
-                        self.get_connection_string(*args), connect_args=self.get_connect_args(db_type)
-                    )
-                    try:
-                        with engine.connect() as conn:
-                            conn.execute(text("SELECT 1 FROM DUAL" if db_type == "Oracle" else "SELECT 1"))
-                    finally:
-                        engine.dispose()
-                    outcome = (True, f"✓  ทดสอบเชื่อมต่อสำเร็จ · {db_type} · {int((_time.perf_counter() - start) * 1000)} ms")
-                except Exception as error:
-                    first = next((ln for ln in str(error).splitlines() if ln.strip()), str(error))
-                    outcome = (False, f"✕  เชื่อมต่อไม่สำเร็จ: {first.strip()}")
+                outcome = self._run_connection_test(*args)
 
                 def show():
                     if not dialog.winfo_exists():
@@ -11663,7 +11697,7 @@ class DatabaseConnectorGUI:
                     ok, msg = outcome
                     bg, fg = (UI["success_soft"], UI["success"]) if ok else (UI["danger_soft"], UI["danger"])
                     ui_round_frame_set(result_box, bg)
-                    result_label.config(text=msg if len(msg) <= 300 else msg[:299] + "…", bg=bg, fg=fg)
+                    result_label.config(text=msg, bg=bg, fg=fg)
                     test_btn.config(state="normal")
 
                 try:

@@ -302,7 +302,7 @@ class WriteBackFailureTests(unittest.TestCase):
                 self.assertNotIn("saved_jobs.json.tmp", listing)
 
     def test_ac7_stdout_none(self):
-        # sys.stdout really None (pythonw): print raises AttributeError, swallowed
+        # sys.stdout really None (pythonw): print() returns silently, nothing to swallow
         for mode in FAIL_MODES:
             with self.subTest(mode=mode):
                 with tempfile.TemporaryDirectory() as tmp:

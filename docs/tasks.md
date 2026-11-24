@@ -878,3 +878,51 @@
 - [x] R12-9 (R12 review 🟡1): `RedactSecretsTests.test_patterns_and_known_secret` เทียบผล `redact_secrets` ทั้งบรรทัด (ODBC / URL-encoded มี `;Encrypt=yes` ต่อท้าย) + ตรวจว่าชิ้นส่วนรหัสในรูปที่ปรากฏจริง (`p@ss`, `p%40ss`, `w}}rd`, `rd}`, `%7D%7Drd`) ไม่หลุด — ยืนยันแล้วว่า test ล้มเมื่อ regex ไม่รองรับ `}}` / `%7D%7D` (mask ได้ครึ่งเดียว)
   - QA: mutation เพิ่ม (patch `app._SECRET_PATTERNS` ใน process): ODBC แบบไม่หยุดที่ `;` (`[^&\s'\"]*` / ต่อท้ายปีกกาปิด) และ URL-encoded แบบไม่หยุดที่ `%3B` → test ล้มทุกแบบ (mask กิน `;Encrypt=yes`); pattern เดิม → ผ่าน. Regression 2 mode (utf-8 / cp874 redirect) → `Ran 1147 tests ... OK` ทั้งคู่
 - [x] R12-T: Regression ทั้งชุด สอง mode encoding → `Ran 1147 tests ... OK` ทั้งคู่
+
+---
+
+# Round 13 — Follow-up: ข้อเสนอแนะ 🟢 1-9 จาก Code Review Round 12
+
+> design: `docs/design.md` หัวข้อ Round 13 (R13-D1..D11); คำตอบผู้ใช้ R13-Q-1..3 (2026-11-23) ตามค่าแนะนำ; ห้าม commit; test เดิมห้ามแก้ ยกเว้น comment R13-AC-15
+
+- [x] R13-T1: ปรับ `_SECRET_PATTERNS` / `redact_secrets` + `quote_plus` ระดับ module
+  - ไฟล์: `database_connect_gui.py` (import ส่วนหัว `:17`, `:94-121`)
+  - ทำอะไร: ตาม R13-D2 ตรง ๆ — 4 pattern แบบ named group `secret`, `_mask_secret`, ลบ import ใน `redact_secrets`; รัน `python -m unittest tests.test_r11_connection_target_snapshot` ต้องผ่าน (`RedactSecretsTests` ไม่แก้)
+  - AC ที่ครอบคลุม: R13-AC-4 (ส่วน pattern), R13-AC-6 (ส่วน pattern), R13-AC-9 (import), R13-AC-10, R13-AC-12
+  - ขึ้นกับ: -
+  - บันทึก dev (2026-11-23): ทำตาม R13-D2 ตรง ๆ; probe R13-AC-10 / AC-12 ตรงทุกตัวอักษร; `tests.test_r11_connection_target_snapshot` ผ่าน (51 tests)
+- [x] R13-T2: redact error ของ Connect และ "ทดสอบการเชื่อมต่อ"
+  - ไฟล์: `database_connect_gui.py` — `connect_database` except (`:7764-7779`), docstring `_show_connection_error` (`:7911`), method ใหม่ `_run_connection_test` + `work()` ใน `new_profile_dialog` (`:11642-11672`)
+  - ทำอะไร: ตาม R13-D3 / R13-D4 — redact ด้วยรหัสจากช่อง Password ก่อน insert / dialog / เลือกบรรทัดแรก / ตัด 300; ข้อความอื่นคงเดิม; บรรทัด `redact_secrets(` ≤ 95
+  - AC ที่ครอบคลุม: R13-AC-1, R13-AC-2, R13-AC-3, R13-AC-4, R13-AC-5, R13-AC-6, R13-AC-9
+  - ขึ้นกับ: R13-T1
+  - บันทึก dev (2026-11-23): `connect_database` except redact ครั้งเดียวแล้วส่ง `message` ให้ insert + `_show_connection_error` (signature เดิม, แก้แค่ docstring); `_run_connection_test` วางก่อน `new_profile_dialog`, `work()` เรียก method นี้, `show()` ไม่ตัด 300 ซ้ำ
+- [x] R13-T3: Tables ใช้รหัสของ worker + แยกบรรทัดยาว + filter Load Preset
+  - ไฟล์: `database_connect_gui.py` — `list_tables` worker (`:9384`, `:9438-9441`, `:9546-9551`, `:9564-9567`, `:9612`), `on_list_tables_error` (`:9724-9740`), `load_preset_dialog` (`:5692-5694`)
+  - ทำอะไร: ตาม R13-D5 / R13-D6 — closure `log_error`, ส่ง `credentials[1]` เป็น argument ที่ 3, `on_list_tables_error(..., password: Optional[str] = None)` redact ด้วยรหัส worker + รหัสที่เก็บไว้; filter เก็บ element ที่ไม่ใช่ dict
+  - AC ที่ครอบคลุม: R13-AC-7, R13-AC-8, R13-AC-9, R13-AC-16
+  - ขึ้นกับ: R13-T1
+  - บันทึก dev (2026-11-23): ทำตาม R13-D5 / R13-D6; ลบ `import traceback` ภายใน 3 จุดและ `pass` ที่ไม่จำเป็นหลังจุดที่ 3; full suite 1147 tests OK
+- [x] R13-T4 (qa): เขียน `tests/test_r13_*.py` + แก้ comment + review เอกสาร
+  - ไฟล์: `tests/test_r13_connect_redaction.py`, `tests/test_r13_tables_and_patterns.py`, `tests/test_r13_persistence.py`, comment `tests/test_r8_load_jobs_writeback.py:305` (บรรทัดเดียว)
+  - ทำอะไร: ตามแผน R13-D9; patch `print` ทุก test ที่แตะ worker, ห้ามเขียนไฟล์นอก temp dir; ตรวจ `git diff` ว่า test เดิมเปลี่ยนแค่ comment; ตรวจหมายเหตุ R12-5 ใน spec (R10-AC-15 / R10-Q-3) และ design Round 10; รัน focused `python -m unittest tests.test_r13_connect_redaction tests.test_r13_tables_and_patterns tests.test_r13_persistence tests.test_r11_connection_target_snapshot tests.test_run_target tests.test_r8_load_jobs_writeback tests.test_r9_load_preset_validation`
+  - AC ที่ครอบคลุม: R13-AC-1..R13-AC-16 (ทดสอบ / review), R13-AC-18
+  - ขึ้นกับ: R13-T1, R13-T2, R13-T3
+  - บันทึก QA (2026-11-23): test ใหม่ 35 ตัว (`test_r13_connect_redaction.py` 15, `test_r13_tables_and_patterns.py` 13, `test_r13_persistence.py` 7) ครอบ R13-AC-1..10, 12..14, 16, 18; แก้ comment `tests/test_r8_load_jobs_writeback.py:305` บรรทัดเดียว (R13-AC-15, `git diff` ยืนยัน); R13-AC-11 ตรวจแล้ว (ข้อความเดิมของ R10-AC-15 / R10-Q-3 ครบ + หมายเหตุ R12-5; design Round 10 มีหมายเหตุ); รันกับโค้ด HEAD (สำเนาใน scratchpad, ไม่แตะ working tree) → 30 failures + 18 errors ครอบ AC-1..5, 7..10, 16 (ทาง log_error 3 จุดผ่านทั้งเก่าและใหม่ — เป็น test กัน NameError)
+- [x] R13-T: Regression ทั้งชุด สอง mode encoding
+  - ไฟล์: - (รันเท่านั้น)
+  - ทำอะไร: `python -m unittest discover -s tests -p "test_*.py"` (ก) `PYTHONIOENCODING=utf-8`, (ข) ไม่ตั้ง (cp874) + redirect stdout/stderr ไปไฟล์ → `OK` ทั้งคู่ จำนวนเท่ากัน ≥ 1147 + test ใหม่; ค้น `S3cr` / `PW-13` ใน output ทั้งสองไฟล์และ `logs/` ต้องไม่พบ; `tests/test_run_target.py` ผ่าน
+  - AC ที่ครอบคลุม: R13-AC-17, R13-AC-18
+  - ขึ้นกับ: R13-T4
+  - บันทึก QA (2026-11-23): (ก) `PYTHONIOENCODING=utf-8` → Ran 1182 tests OK; (ข) ไม่ตั้ง (cp874) + redirect stdout/stderr ไปไฟล์ → Ran 1182 tests OK (1147 + 35); ค้น `S3cr` / `PW-13` / `S3cr3t` ใน output ทั้งสองไฟล์และ `logs/` ไม่พบ, `logs/` ไม่เปลี่ยน
+
+## ตาราง R13-AC → Task
+
+| AC | Task | AC | Task | AC | Task |
+|---|---|---|---|---|---|
+| R13-AC-1 | R13-T2, R13-T4 | R13-AC-2 | R13-T2, R13-T4 | R13-AC-3 | R13-T2, R13-T4 |
+| R13-AC-4 | R13-T1, R13-T2, R13-T4 | R13-AC-5 | R13-T2, R13-T4 | R13-AC-6 | R13-T1, R13-T2, R13-T4 |
+| R13-AC-7 | R13-T3, R13-T4 | R13-AC-8 | R13-T3, R13-T4 | R13-AC-9 | R13-T1, R13-T2, R13-T3, R13-T4 |
+| R13-AC-10 | R13-T1, R13-T4 | R13-AC-11 | R13-T4 (review) | R13-AC-12 | R13-T1, R13-T4 |
+| R13-AC-13 | R13-T4 | R13-AC-14 | R13-T4 | R13-AC-15 | R13-T4 |
+| R13-AC-16 | R13-T3, R13-T4 | R13-AC-17 | R13-T | R13-AC-18 | R13-T4, R13-T |
