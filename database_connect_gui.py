@@ -1164,11 +1164,20 @@ def parse_script_groups_import(data: Any) -> list:
     """Importable groups from loaded JSON data (dict with 'groups' or a bare list).
 
     Invalid group entries are dropped; raises ValueError when there is no
-    groups list or a script has no SQL.
+    groups list or a script has no SQL. Raises ValueError when an item looks
+    like a Saved Job ('query' without 'scripts').
     """
     incoming = data.get("groups") if isinstance(data, dict) else data
     if not isinstance(incoming, list):
         raise ValueError("no 'groups' list in this file")
+    for position, item in enumerate(incoming, start=1):
+        if isinstance(item, dict) and "query" in item and "scripts" not in item:
+            name = item.get("name")
+            label = f"'{name}'" if isinstance(name, str) and name.strip() else f"item {position}"
+            raise ValueError(
+                f"{label} looks like a Saved Job, not a group "
+                "(it has 'query' but no 'scripts' list)"
+            )
     incoming = [
         g for g in incoming
         if isinstance(g, dict)
@@ -2599,6 +2608,7 @@ class DatabaseConnectorGUI:
         self._checked_job_ids = set()  # id() of jobs ticked in Saved Jobs list
         # Stop button: set while a stop was requested; DB connections in use
         self._stop_event = threading.Event()
+        self._stop_lines: List[str] = []  # Stop messages of the current run (R16)
         self._stop_buttons = []
         # Run All / Run Group: open one result window per job (remembered)
         self.open_result_popups = tk.BooleanVar(
@@ -3022,12 +3032,15 @@ class DatabaseConnectorGUI:
         def update_jobs_scroll_state():
             bounds = jobs_canvas.bbox("all")
             jobs_canvas.configure(scrollregion=bounds or (0, 0, 0, 0))
+            # winfo_manager() reflects pack state even while unmapped
+            # (withdrawn root / zero width); before=jobs_canvas keeps the
+            # scrollbar ahead of the expanding canvas so it gets real width.
             if jobs_content_overflows():
-                if not jobs_scrollbar.winfo_ismapped():
-                    jobs_scrollbar.pack(side="right", fill="y")
+                if jobs_scrollbar.winfo_manager() != "pack":
+                    jobs_scrollbar.pack(side="right", fill="y", before=jobs_canvas)
             else:
                 jobs_canvas.yview_moveto(0)
-                if jobs_scrollbar.winfo_ismapped():
+                if jobs_scrollbar.winfo_manager():
                     jobs_scrollbar.pack_forget()
 
         def configure_jobs_scroll(event):
@@ -3057,6 +3070,8 @@ class DatabaseConnectorGUI:
         )
         self.jobs_canvas = jobs_canvas
         self.jobs_list_frame = jobs_list_frame
+        self.jobs_scrollbar = jobs_scrollbar
+        self._update_jobs_scroll_state = update_jobs_scroll_state
 
         # ---- Workspace: editor card / results card (draggable divider) ----
         split = tk.PanedWindow(
@@ -3368,15 +3383,7 @@ class DatabaseConnectorGUI:
         # Everything written to the Execution Logs is also appended to
         # logs/run_YYYY-MM-DD.log (with a timestamp per line)
         self._init_run_log()
-        _log_insert = self.results_text.insert
-
-        def _insert_and_log(index, chars, *args):
-            result = _log_insert(index, chars, *args)
-            if isinstance(chars, str):
-                self._write_run_log(chars)
-            return result
-
-        self.results_text.insert = _insert_and_log
+        self._install_run_log_hook()
 
         # --- Tab 3: Error & Debug
         debug_tab = tk.Frame(self.results_notebook, bg=UI["card"])
@@ -7179,7 +7186,7 @@ class DatabaseConnectorGUI:
             ).pack(side="left", padx=5)
 
             # Update results text with error
-            self.results_text.delete("1.0", tk.END)
+            self._clear_results_keep_stop_lines()
             self.results_text.insert(tk.END, "❌ QUERY ERROR\n")
             self.results_text.insert(tk.END, "=" * 150 + "\n\n")
             self.results_text.insert(tk.END, f"Error Type: {error_details['type']}\n")
@@ -8368,8 +8375,39 @@ class DatabaseConnectorGUI:
 
     def _start_stoppable_run(self, target: Optional[RunTarget] = None) -> None:
         """Called when a run starts: forget any earlier Stop request."""
+        self._stop_lines = []
         self._stop_event.clear()
         self._log_run_context(target)
+
+    def _replay_stop_lines(self) -> None:
+        """Write the Stop lines of the current run again (Logs were just cleared
+        at the end of the run). Not written to the run log: it already has them."""
+        lines = getattr(self, "_stop_lines", None)
+        if not lines:
+            return
+        insert = getattr(self, "_results_text_raw_insert", None) or self.results_text.insert
+        for line in lines:
+            insert(tk.END, line)
+
+    def _clear_results_keep_stop_lines(self) -> None:
+        """End of a Job / SQL Editor / Tables run: clear Execution Logs, then put
+        back this run's Stop lines first (R16-Q-2)."""
+        self.results_text.delete("1.0", tk.END)
+        self._replay_stop_lines()
+
+    def _install_run_log_hook(self) -> None:
+        """Everything inserted into Execution Logs is also appended to the run
+        log; keep the unwrapped insert for text that must not be logged twice."""
+        raw_insert = self.results_text.insert
+
+        def _insert_and_log(index, chars, *args):
+            result = raw_insert(index, chars, *args)
+            if isinstance(chars, str):
+                self._write_run_log(chars)
+            return result
+
+        self._results_text_raw_insert = raw_insert
+        self.results_text.insert = _insert_and_log
 
     # ---------------------------------------------------------------
     # Run log file (logs/run_YYYY-MM-DD.log) — never contains passwords
@@ -8476,6 +8514,7 @@ class DatabaseConnectorGUI:
                 "This database driver cannot cancel a running query, so the current one finishes first.\n"
             )
         self.results_text.insert(tk.END, msg)
+        self.__dict__.setdefault("_stop_lines", []).append(msg)
         self.results_text.see(tk.END)
 
     def _register_stop_button(self, button):
@@ -8745,7 +8784,7 @@ class DatabaseConnectorGUI:
                 icon = "⚙️"
 
             # Update results text
-            self.results_text.delete("1.0", tk.END)
+            self._clear_results_keep_stop_lines()
             self.results_text.insert(tk.END, f"{'='*150}\n")
             self.results_text.insert(
                 tk.END, f"✅ {icon} {operation} Statement Executed Successfully!\n"
@@ -8775,7 +8814,7 @@ class DatabaseConnectorGUI:
             loading_dialog.destroy()
 
             # Update results text
-            self.results_text.delete("1.0", tk.END)
+            self._clear_results_keep_stop_lines()
             self.results_text.insert(tk.END, f"✅ Query executed successfully!\n")
             self.results_text.insert(tk.END, f"📊 Total Rows: {len(df):,}\n")
             self.results_text.insert(tk.END, f"📋 Total Columns: {df.shape[1]}\n\n")
@@ -8805,7 +8844,7 @@ class DatabaseConnectorGUI:
             pass
 
         # Update results text
-        self.results_text.delete("1.0", tk.END)
+        self._clear_results_keep_stop_lines()
         self.results_text.insert(tk.END, "❌ QUERY ERROR\n")
         self.results_text.insert(tk.END, "=" * 150 + "\n\n")
         self.results_text.insert(tk.END, f"Error: {error_text}\n\n")
@@ -9480,6 +9519,7 @@ class DatabaseConnectorGUI:
                 getattr(self, "db_port", None).get() if getattr(self, "db_port", None) else "",
             )
 
+        self._stop_lines = []
         self.results_text.insert(tk.END, "Fetching database schema information...\n\n")
         self.results_text.see(tk.END)
 
@@ -9782,7 +9822,7 @@ class DatabaseConnectorGUI:
                     )
 
                 # Update results text
-                self.results_text.delete("1.0", tk.END)
+                self._clear_results_keep_stop_lines()
                 self.results_text.insert(tk.END, summary)
                 self.results_text.insert(tk.END, "Opening results in new window...\n")
                 self.results_text.insert(
@@ -10057,8 +10097,11 @@ class DatabaseConnectorGUI:
 
         cancel_btn.pack(side="left", padx=5)
 
-    def _start_job_result_report(self):
-        self.results_text.delete("1.0", tk.END)
+    def _start_job_result_report(self, keep_stop_lines: bool = False) -> None:
+        if keep_stop_lines:
+            self._clear_results_keep_stop_lines()
+        else:
+            self.results_text.delete("1.0", tk.END)
 
     def _finish_job_result_report(self, processed_jobs, successes, failures):
         separator = "=" * 57
@@ -10151,7 +10194,7 @@ class DatabaseConnectorGUI:
                 self.execute_btn.config(state="normal")
                 self.inspect_btn.config(state="normal")
                 self.save_job_btn.config(state="normal")
-            self._start_job_result_report()
+            self._start_job_result_report(keep_stop_lines=True)
             self.update_job_status(
                 job_index,
                 job,
