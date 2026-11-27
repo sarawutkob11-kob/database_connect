@@ -1,6 +1,6 @@
 # Code Review — database_connect_gui
 
-> งานที่เสร็จแล้ว (Round 1–16) ถูกลบออกจากไฟล์นี้เพื่อลด token ตามคำสั่งผู้ใช้ — ดูย้อนหลังได้จาก git history (Round 1–15: `git show ef6d896:docs/<file>`, Round 16: `git show 1373c92:docs/<file>`)
+> งานที่เสร็จแล้ว (Round 1–17) ถูกลบออกจากไฟล์นี้เพื่อลด token ตามคำสั่งผู้ใช้ — ดูย้อนหลังได้จาก git history (Round 1–15: `git show ef6d896:docs/<file>`, Round 16: `git show 1373c92:docs/<file>`, Round 17: `git show b790c74:docs/<file>`)
 
 ## ข้อเสนอแนะที่ยังไม่ได้ทำ (จาก Code Review Round 15, 2026-11-24 — ผล Round 15: ผ่าน 🔴 0 🟡 0)
 
@@ -18,20 +18,6 @@
 - [database_connect_gui.py:8392-8396] `_stop_lines` ยังค้างอยู่หลังงานจบจนกว่างานถัดไปจะเริ่ม — ตอนนี้ถูกต้องเพราะผู้เรียก helper ทุกตัวเป็น callback ตอนจบของงานที่ล้างรายการตอนเริ่มแล้ว แต่ถ้าในอนาคตมีจุดใหม่เรียก `_clear_results_keep_stop_lines` นอกงานที่เริ่มผ่าน `_start_stoppable_run` / `list_tables` จะนำบรรทัด Stop ของงานเก่ากลับมา; อาจเพิ่มข้อความใน docstring ว่า "เรียกได้เฉพาะตอนจบงาน"
 - [tests/test_r16_import_saved_jobs.py:447-455] `TestSourceShape` ตรวจ source code / docstring (`inspect.getsource`, `"Saved Job" in __doc__`) แทนพฤติกรรม — พังได้เมื่อ refactor หรือแก้คำใน docstring แม้พฤติกรรมไม่เปลี่ยน; พฤติกรรมเดียวกันมี test แบบ dialog / sidebar ครอบอยู่แล้ว (:338-365) จึงลบหรือลดได้
 
-# Code Review — Round 17 — 2026-11-27
+## ข้อเสนอแนะที่ยังไม่ได้ทำ (จาก Code Review Round 17, 2026-11-27 — ผล Round 17: ผ่าน 🔴 0 🟡 0)
 
-## สรุป
-ผ่าน — 🔴 0, 🟡 0, 🟢 1 (diff: `database_connect_gui.py` :24, :985, :991 + `tests/test_r17_format_sql_value.py` ใหม่; รัน test R17 ได้ 12 OK)
-
-Verdict ราย AC: AC-1 ✅ · AC-2 ✅ · AC-3 ✅ (`str()` เหมือนเดิม) · AC-4 ✅ · AC-5 ✅ (bool เช็กก่อน float และ `np.bool_` ไม่ใช่ `np.floating`) · AC-6 ✅ · AC-7 ✅ (`inf.is_integer()` เป็น False จึงไม่ถึง `int()`) · AC-8 ✅ · AC-9 ✅ (test เดิมไม่ถูกแก้, ไม่ commit) · AC-10 ✅
-
-ผู้เรียก (`format_sql_value_list` :996 → :1070/:7644/:7725, และ :6534) ได้ผลเปลี่ยนเฉพาะค่า numpy float16/float32: integral → int literal, NaN → `NULL` (เดิม `nan` ซึ่งเป็น SQL ที่ผิด) — ค่าชนิดอื่นไม่เปลี่ยน, ไม่มีงานเกิน scope
-
-## 🔴 Critical
-- ไม่มี
-
-## 🟡 Warning
-- ไม่มี
-
-## 🟢 Suggestion
 - [database_connect_gui.py:984] docstring ยังเขียนแค่ "None/NaN as NULL" — อาจเติมว่าครอบ numpy float ทุกชนิด (float16/32/64) และ integral float → int เพื่อให้ผู้อ่านไม่ต้องดูโค้ด. ไม่กระทบผล
