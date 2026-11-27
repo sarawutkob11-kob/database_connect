@@ -21,6 +21,7 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 # --- Third-party ---
+import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, inspect, text
 
@@ -981,13 +982,13 @@ def table_variable_name(table_name, column_name):
 
 def format_sql_value(value):
     """One value as a SQL literal: strings quoted (' doubled once), None/NaN as NULL."""
-    if value is None or (isinstance(value, float) and value != value):
+    if value is None or (isinstance(value, (float, np.floating)) and value != value):
         return "NULL"
     if isinstance(value, str):
         return "'" + value.replace("'", "''") + "'"
     if pd.api.types.is_bool(value):  # bool and numpy.bool_ -> 1 / 0
         return "1" if value else "0"
-    if isinstance(value, float) and value.is_integer():  # 1001.0 -> 1001
+    if isinstance(value, (float, np.floating)) and value.is_integer():  # 1001.0 -> 1001
         return str(int(value))
     return str(value)
 
